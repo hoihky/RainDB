@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>RainDB.Linq</RootNamespace>
+    <AssemblyName>RainDB.Linq</AssemblyName>
+    <Description>LINQ IQueryable provider mapping to RainDB plans (ISP: separate from SQL).</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\RainDB.Abstractions\RainDB.Abstractions.csproj" />
+    <ProjectReference Include="..\RainDB.Query\RainDB.Query.csproj" />
+  </ItemGroup>
+</Project>

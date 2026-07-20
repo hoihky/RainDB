@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>RainDB.Core</RootNamespace>
+    <AssemblyName>RainDB.Core</AssemblyName>
+    <Description>Columnar storage, memory pools, catalog implementations.</Description>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\RainDB.Abstractions\RainDB.Abstractions.csproj" />
+  </ItemGroup>
+</Project>

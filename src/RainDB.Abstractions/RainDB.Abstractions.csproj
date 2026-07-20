@@ -1,0 +1,7 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>RainDB</RootNamespace>
+    <AssemblyName>RainDB.Abstractions</AssemblyName>
+    <Description>RainDB contracts: storage, catalog, query execution (DIP boundaries).</Description>
+  </PropertyGroup>
+</Project>

@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>RainDB.Query</RootNamespace>
+    <AssemblyName>RainDB.Query</AssemblyName>
+    <Description>Logical/physical plans and vectorized execution (OCP: swap operators).</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\RainDB.Abstractions\RainDB.Abstractions.csproj" />
+    <ProjectReference Include="..\RainDB.Core\RainDB.Core.csproj" />
+  </ItemGroup>
+</Project>

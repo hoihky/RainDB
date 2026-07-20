@@ -1,0 +1,74 @@
+## Build outputs
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+[Oo]utput/
+[Pp]ublish/
+[Aa]rtifacts/
+
+## .NET
+project.lock.json
+project.fragment.lock.json
+*.nupkg
+*.snupkg
+*.nuget.props
+*.nuget.targets
+.nuget/
+packages/
+*.cache
+
+## Test & coverage
+[Tt]est[Rr]esults/
+[Bb]uild[Ll]og.*
+*.trx
+*.coverage
+*.coveragexml
+coverage/
+.coverage
+.coverage.*
+
+## Visual Studio / VS Code / Rider
+.vs/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/launch.json
+!.vscode/tasks.json
+.idea/
+*.rsuser
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.DotSettings.user
+
+## OS
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+## Secrets & local config (do not commit)
+.env
+.env.*
+!.env.example
+*.pfx
+*.key
+secrets.json
+appsettings.*.local.json
+
+## Generated / local site output
+output/
+
+## Puppeteer / browser downloads (if cached in project)
+.local-chromium/
+.puppeteer/
+
+## Misc
+*.log
+*.tmp
+*.temp
+*~
+*.swp

@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>RainDB.Sql</RootNamespace>
+    <AssemblyName>RainDB.Sql</AssemblyName>
+    <Description>Strict SQL subset: parse → RainDB.Logical → VectorizedScanPhysicalPlan (ISP: separate from LINQ).</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\RainDB.Abstractions\RainDB.Abstractions.csproj" />
+    <ProjectReference Include="..\RainDB.Core\RainDB.Core.csproj" />
+    <ProjectReference Include="..\RainDB.Query\RainDB.Query.csproj" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>RainDB</RootNamespace>
+    <AssemblyName>RainDB</AssemblyName>
+    <Description>Embedded OLAP engine entry point: composition root and public API.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\RainDB.Abstractions\RainDB.Abstractions.csproj" />
+    <ProjectReference Include="..\RainDB.Core\RainDB.Core.csproj" />
+    <ProjectReference Include="..\RainDB.Query\RainDB.Query.csproj" />
+    <ProjectReference Include="..\RainDB.Sql\RainDB.Sql.csproj" />
+    <ProjectReference Include="..\RainDB.Linq\RainDB.Linq.csproj" />
+  </ItemGroup>
+</Project>

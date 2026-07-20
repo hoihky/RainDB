@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>RainDB.AnalyticsDemo</RootNamespace>
+    <AssemblyName>RainDB.AnalyticsDemo</AssemblyName>
+    <Description>Runnable sample: embedded RainDB for columnar scans, filters, and aggregates.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\RainDB.Driver\RainDB.Driver.csproj" />
+    <ProjectReference Include="..\..\src\RainDB.Sql\RainDB.Sql.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="..\..\samples\sql\01_select_star.sql" Link="sql\01_select_star.sql">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Include="..\..\samples\sql\02_where_project.sql" Link="sql\02_where_project.sql">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Include="..\..\samples\sql\03_sum_line_total.sql" Link="sql\03_sum_line_total.sql">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Include="..\..\samples\sql\04_max_line_total.sql" Link="sql\04_max_line_total.sql">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Include="..\..\samples\sql\05_utf8_where.sql" Link="sql\05_utf8_where.sql">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Include="..\..\samples\sql\06_where_and_chain.sql" Link="sql\06_where_and_chain.sql">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Include="..\..\samples\sql\07_join_select_list.sql" Link="sql\07_join_select_list.sql">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+</Project>

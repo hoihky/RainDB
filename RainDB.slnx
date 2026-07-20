@@ -1,0 +1,16 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/RainDB.Abstractions/RainDB.Abstractions.csproj" />
+    <Project Path="src/RainDB.Core/RainDB.Core.csproj" />
+    <Project Path="src/RainDB.Driver/RainDB.Driver.csproj" />
+    <Project Path="src/RainDB.Linq/RainDB.Linq.csproj" />
+    <Project Path="src/RainDB.Query/RainDB.Query.csproj" />
+    <Project Path="src/RainDB.Sql/RainDB.Sql.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/RainDB.Tests/RainDB.Tests.csproj" />
+  </Folder>
+  <Folder Name="/samples/">
+    <Project Path="samples/RainDB.AnalyticsDemo/RainDB.AnalyticsDemo.csproj" />
+  </Folder>
+</Solution>
