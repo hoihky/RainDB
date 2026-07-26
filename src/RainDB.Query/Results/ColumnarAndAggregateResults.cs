@@ -23,7 +23,19 @@ public sealed class ColumnarMaterializedQueryResult : IColumnarQueryResult
 
     public IReadOnlyList<IColumnarBatch> Batches => _batches;
 
-    public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    public ValueTask DisposeAsync()
+    {
+        foreach (var batch in _batches)
+        {
+            foreach (var col in batch.Columns)
+            {
+                if (col is IDisposable d)
+                    d.Dispose();
+            }
+        }
+
+        return ValueTask.CompletedTask;
+    }
 }
 
 public sealed class AggregateQueryResult : IAggregateQueryResult

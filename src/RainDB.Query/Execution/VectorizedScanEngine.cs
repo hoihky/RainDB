@@ -95,14 +95,14 @@ public static class VectorizedScanEngine
         if (dop <= 1 || n == 1)
         {
             for (var i = 0; i < n; i++)
-                outArr[i] = ProcessOneBatch(plan, batches[i], ct);
+                outArr[i] = ProcessOneBatch(plan, batches[i], context);
         }
         else if (plan.Options.UseChannelScheduler)
         {
             await RunChannelMorselsAsync(
                 n,
                 dop,
-                i => outArr[i] = ProcessOneBatch(plan, batches[i], ct),
+                i => outArr[i] = ProcessOneBatch(plan, batches[i], context),
                 ct).ConfigureAwait(false);
         }
         else
@@ -111,7 +111,7 @@ public static class VectorizedScanEngine
                 0,
                 n,
                 new ParallelOptions { MaxDegreeOfParallelism = dop, CancellationToken = ct },
-                i => outArr[i] = ProcessOneBatch(plan, batches[i], ct));
+                i => outArr[i] = ProcessOneBatch(plan, batches[i], context));
         }
 
         return outArr;
@@ -155,25 +155,28 @@ public static class VectorizedScanEngine
     private static IColumnarBatch ProcessOneBatch(
         VectorizedScanPhysicalPlan plan,
         IColumnarBatch batch,
-        CancellationToken cancellationToken)
+        IExecutionContext context)
     {
-        cancellationToken.ThrowIfCancellationRequested();
+        context.CancellationToken.ThrowIfCancellationRequested();
         var rent = ArrayPool<int>.Shared.Rent(batch.RowCount);
         try
         {
             var span = rent.AsSpan(0, batch.RowCount);
             int selected;
-            if (plan.Filters is { Length: > 0 } filters)
-                selected = SelectionEvaluator.FillSelectedRowsConjunctive(batch, filters, span);
+            var hasFilters = plan.Filters is { Length: > 0 };
+            if (hasFilters)
+                selected = SelectionEvaluator.FillSelectedRowsConjunctive(batch, plan.Filters!, span);
             else
                 selected = batch.RowCount;
 
             return ProjectGather.Project(
                 batch,
                 plan.OutputColumnIndices.AsSpan(),
-                useRowSelection: plan.Filters is { Length: > 0 },
-                selectedRows: plan.Filters is { Length: > 0 } ? span[..selected] : ReadOnlySpan<int>.Empty,
-                selected);
+                useRowSelection: hasFilters,
+                selectedRows: hasFilters ? span[..selected] : ReadOnlySpan<int>.Empty,
+                selected,
+                context.BufferPool,
+                context.AlignedBufferPool);
         }
         finally
         {

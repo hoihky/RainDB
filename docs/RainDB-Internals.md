@@ -1,188 +1,396 @@
 # RainDB internals
 
-This document describes how RainDB is structured, how the OLAP-style execution path works, how SQL is parsed and lowered to physical plans, and how applications typically use the public API. It reflects the codebase as of the current repository layout.
+This document explains RainDB’s architecture, core data structures, and execution algorithms. It is written for contributors and advanced integrators who need to reason about behavior beyond the public API.
 
-## Goals and design stance
+For hands-on usage, see **[Programming Guide](Programming-Guide.md)**. For release status and SQL surface area, see the root **[README](../README.md)**.
 
-RainDB is an **embedded**, **single-process**, **column-oriented** analytics engine for .NET. The design favors:
+---
 
-- **Clear layering (SRP)**: abstractions (contracts), core storage, query execution, SQL and LINQ front ends, and a small driver that wires defaults.
-- **A single physical-plan IR** shared by SQL and (eventually) LINQ, so optimization and execution stay **DRY**.
-- **Vectorized execution** over `IColumnarBatch` / `IColumnChunk` segments rather than row iterators on hot paths.
-- **Deterministic OLAP ordering**: parallel work is partitioned by source batch index and merged in stable order where it matters.
+## 1. Design goals
 
-The repository README’s solution table remains the high-level map of projects and responsibilities.
+RainDB is an **embedded**, **single-process**, **column-oriented** OLAP engine for .NET:
 
-## Architecture (projects and dependencies)
+| Principle | Meaning in code |
+|-----------|-----------------|
+| Layered modules | Abstractions → Core → Query → Sql/Linq → Driver; dependencies point inward. |
+| One physical IR | SQL and (future) LINQ lower to the same `IPhysicalPlan` types. |
+| Vectorized batches | Hot paths iterate `IColumnarBatch` / `IColumnChunk`, not row objects. |
+| Deterministic OLAP order | Parallel morsels merge by **source batch index**; grouped keys are sorted for stable output where applicable. |
+| Testable contracts | `tests/RainDB.Tests` and README SQL subset define expected behavior. |
 
-| Layer | Project | Role |
-|--------|---------|------|
-| Contracts | `RainDB.Abstractions` | Catalog (`ICatalog`, `ITableSource`, `IColumnarTableSource`, `TableId`), columnar model (`IColumnarBatch`, `IColumnChunk`), buffers, execution context, `IPhysicalPlan`, logical IR (`RainDB.Logical`), SQL compiler interface (`ISqlCompiler`), optional persistence hook (`IRainDbBatchPersistence`). |
-| Storage & I/O | `RainDB.Core` | `InMemoryCatalog`, `MemoryTable`, column chunks (`FixedWidthColumnChunk`, `Utf8ColumnChunk`, `Utf8LengthPrefixedColumnChunk`), pools (`HybridBufferPool`), mmap helpers, **`RainDbFileDatabase`** and **`RainDbBatchBinaryCodec`** for on-disk batch snapshots. |
-| Execution | `RainDB.Query` | Physical plan types (`RainDB.Query.Plans`), **`DefaultQueryExecutor`**, vectorized operators (`VectorizedScanEngine`, `HashAggregateEngine`, `JoinExecutionEngine`, `SortTopNEngine`, …), result materialization. |
-| SQL | `RainDB.Sql` | **`SqlLexer`**, **`SqlParser`** (internal `SelectParser`), **`DefaultSqlCompiler`**, binders (**`LogicalTableScanBinder`**, **`LogicalJoinBinder`**), **`StrictSqlSubset`** (parse → bind without going through `ISqlCompiler` if desired). |
-| LINQ | `RainDB.Linq` | **`DefaultLinqCompiler`** (currently returns a stub **`ExplainOnlyPhysicalPlan`**; expression translation is roadmap work). |
-| Host | `RainDB` (driver) | **`RainDbEngine`**: composition root, `CreateDefault`, `CreateDefault(ICatalog)`, **`OpenPersistent`**, `ExecuteSqlAsync`, `ExecutePhysicalAsync`, session factory. |
+---
 
-Dependency flow is **inward**: Driver → Sql / Linq / Query → Core → Abstractions. Query references Core for concrete column types used when building or interpreting plans at execution time.
+## 2. Solution architecture
 
-## Data model
-
-### Columnar batches
-
-A table’s storage (for scans) is exposed as an ordered list of **`IColumnarBatch`** instances. Each batch has a row count and one **`IColumnChunk`** per column. Chunks carry:
-
-- **`RainDbType`** (fixed-width primitives or `Utf8`),
-- optional **null bitmap** (packed bits; semantics documented on `IColumnChunk`),
-- **`Values`** (packed fixed-width bytes, or UTF-8 payload depending on chunk kind).
-
-Concrete chunk types in **`RainDB.Core.Columnar`** include fixed-width vectors, Arrow-style UTF-8 (`offsets[rowCount+1]` + blob), and length-prefixed UTF-8 per row. **`MemoryTable`** owns an append-only list of batches and validates appends against its **`TableSchema`**.
-
-### Catalog
-
-**`ICatalog`** maps table **names** and **`TableId`** values to **`ITableSource`**. Scans and plans refer to **`TableId`** after binding. **`IColumnarTableSource`** extends **`ITableSource`** with **`Batches`** for columnar execution.
-
-### Execution context
-
-**`IExecutionContext`** (created by **`RainDbEngine.CreateSession`**) carries the catalog, buffer pools, spill writer, and cancellation token. Operators rent memory from pools and respect cancellation where async paths exist.
-
-## OLAP engine (physical plans and execution)
-
-### Physical plan as the execution contract
-
-**`IPhysicalPlan`** (`RainDB.Execution`) is the root of what **`IQueryExecutor`** runs. Implementations live under **`RainDB.Query.Plans`** and include, among others:
-
-- **`VectorizedScanPhysicalPlan`** — single-table scan with optional column filters, projection indices, optional **global** aggregate, and **`VectorizedScanExecutionOptions`** (parallelism, channel-based scheduling, etc.).
-- **`HashAggregatePhysicalPlan`** — grouped aggregation over one **`IColumnarTableSource`** (single-table `GROUP BY` or an **ephemeral** columnar source wrapping join output).
-- **`JoinPhysicalPlan`** — inner equi-join (build/probe; hash or sort-merge per plan configuration from the binder).
-- **`SortTopNPhysicalPlan`** / **`JoinSortTopNPhysicalPlan`** — `ORDER BY` / `LIMIT` over one table or over join output.
-- **`GroupedJoinPhysicalPlan`** — join then hash-aggregate over the materialized join rowset.
-
-Each plan type’s **`Explain`** method is used for lightweight introspection (the default executor calls **`plan.Explain()`** before dispatch).
-
-### Default executor dispatch
-
-**`DefaultQueryExecutor`** (`RainDB.Query.Execution`) pattern-matches on **`IPhysicalPlan`** and delegates to the matching **engine** static class. It resolves **`TableId`** from **`context.Catalog`** and requires **`IColumnarTableSource`** for storage-backed operators. For **`GroupedJoinPhysicalPlan`**, it runs the join engine, wraps the columnar result in **`EphemeralColumnarTableSource`**, then runs **`HashAggregateEngine`** on that ephemeral table.
-
-This keeps **join** and **aggregate** concerns separated while still supporting SQL shapes that combine them.
-
-### Vectorized scan engine (representative OLAP path)
-
-**`VectorizedScanEngine`** processes each source batch (filter → project → optional scalar aggregate). For **non-aggregating** queries it can parallelize across batches using either **`Parallel.For`** or a **channel scheduler** (`UseChannelScheduler` in options), then **reassembles outputs by batch index** so order stays stable for analytics.
-
-Global aggregates (`SELECT SUM(x) FROM t`) use a dedicated path inside the same engine that combines partials deterministically.
-
-### Other engines (brief)
-
-- **`HashAggregateEngine`** — partial maps per batch (optionally parallel), merge into global grouped results; supports spill hooks via **`ISpillWriter`** for large partials (full external aggregation is future work).
-- **`JoinExecutionEngine`** — validates equi-keys and executes hash or sort-merge join plans.
-- **`SortTopNEngine`** — comparison-based sort keys with null-aware ordering for supported types; top-N pruning when `LIMIT` is present.
-
-### Query results
-
-Engines return **`IQueryResult`** implementations such as **`IColumnarQueryResult`** (materialized batches) or **`IAggregateQueryResult`** (single scalar bucket for global aggregates, including SQL NULL semantics via **`ValueIsNull`**).
-
-## SQL parser and compiler
-
-### Lexer
-
-**`SqlLexer`** (`RainDB.Sql.Parsing`) tokenizes the **strict subset** dialect: ASCII identifiers, punctuation, string/number literals, and a **small set** of hard-coded keywords (`SELECT`, `FROM`, `WHERE`, `INNER`, `JOIN`, `ON`, `AND`) returned as dedicated **`SqlTokenKind`** values. Other spellings (including `GROUP`, `BY`, `ORDER`, `LIMIT`, aggregate names, and table/column names) are emitted as **`Identifier`** tokens; the parser recognizes multi-token clauses such as **`GROUP BY`**, **`ORDER BY`**, and **`LIMIT`** by context. The lexer skips whitespace and **`--`** line comments.
-
-### Parser
-
-**`SqlParser.Parse`** constructs a **`SqlLexer`**, then an internal **`SelectParser`** that consumes tokens and builds a **`LogicalPlan`** whose **`Root`** is either:
-
-- **`LogicalTableScan`** — single table, optional `WHERE` conjuncts, optional global aggregate, optional `GROUP BY` + select list, optional `ORDER BY` / `LIMIT` (where allowed by subset rules), or
-- **`LogicalInnerJoin`** — `INNER JOIN` … `ON` equi-predicates (and optional `WHERE`, optional `GROUP BY`, optional `ORDER BY` / `LIMIT` for non-grouped joins).
-
-The parser enforces subset constraints (for example, rejecting `SELECT *` with `GROUP BY`, or disallowing `ORDER BY` in certain grouped shapes) by throwing **`SqlCompileException`** with parser-oriented messages.
-
-### Logical IR
-
-Logical nodes live in **`RainDB.Logical`** (Abstractions). They are **relational-shaped** but still close to SQL: table names, qualified columns, simple `WHERE` comparisons, aggregate calls, sort keys, and limits. They intentionally **do not** carry buffer pointers or SIMD details.
-
-### Compilation pipeline
-
-1. **`DefaultSqlCompiler.CompileAsync`** (`RainDB.Sql.Compilation`) calls **`SqlParser.Parse`**, then switches on **`logical.Root`**:
-   - **`LogicalTableScan`** → **`LogicalTableScanBinder.BindAndLower`**
-   - **`LogicalInnerJoin`** → **`LogicalJoinBinder.BindAndLower`** (join algorithm argument, e.g. hash join)
-
-2. **Binders** resolve names against **`ICatalog`**, map column names to ordinals, validate types for aggregates and predicates, and emit a concrete **`IPhysicalPlan`** (e.g. **`VectorizedScanPhysicalPlan`**, **`HashAggregatePhysicalPlan`**, **`SortTopNPhysicalPlan`**, **`JoinPhysicalPlan`**, **`JoinSortTopNPhysicalPlan`**, **`GroupedJoinPhysicalPlan`**).
-
-3. **`StrictSqlSubset`** exposes the same binding path for tools and tests: **`ParseLogicalPlan`** (parse only) and **`CompilePhysicalPlan`** (parse + bind), without allocating a compiler instance.
-
-There is **no separate optimizer pass** yet; lowering is largely **rule-shaped** inside the binders (single-pass from logical to physical).
-
-### What SQL is supported today
-
-The strict subset is documented in the root **`README.md`** (predicates, joins, `GROUP BY`, global aggregates, `ORDER BY` / `LIMIT` combinations, and explicit non-goals). If behavior differs between docs and code, treat the README and tests under **`tests/RainDB.Tests`** as the contract.
-
-## LINQ
-
-**`DefaultLinqCompiler`** currently does **not** translate expression trees into the same logical IR as SQL; it returns **`ExplainOnlyPhysicalPlan`**. The architectural intent is documented in the roadmap: LINQ and SQL should converge on **`IPhysicalPlan`**.
-
-## Public API usage (typical flows)
-
-### In-memory engine
-
-```csharp
-var engine = RainDbEngine.CreateDefault();
-// Register RainDB.Core.Tables.MemoryTable (or another IColumnarTableSource) on engine.Catalog.
-await using var result = await engine.ExecuteSqlAsync("SELECT ...");
+```mermaid
+flowchart TB
+  subgraph host [RainDB.Driver]
+    Engine[RainDbEngine]
+  end
+  subgraph frontends [Front ends]
+    SQL[RainDB.Sql]
+    LINQ[RainDB.Linq]
+  end
+  subgraph exec [RainDB.Query]
+    Executor[DefaultQueryExecutor]
+    Plans[Physical plans]
+    Engines[VectorizedScanEngine HashAggregateEngine JoinExecutionEngine SortTopNEngine]
+  end
+  subgraph storage [RainDB.Core]
+    Catalog[InMemoryCatalog MemoryTable]
+    Chunks[Column chunks]
+    Persist[RainDbFileDatabase]
+  end
+  subgraph contracts [RainDB.Abstractions]
+    IR[ICatalog IColumnChunk IPhysicalPlan IExecutionContext]
+  end
+  Engine --> SQL
+  Engine --> LINQ
+  Engine --> Executor
+  SQL --> Plans
+  LINQ --> Plans
+  Executor --> Engines
+  Engines --> Chunks
+  Engines --> Catalog
+  Catalog --> IR
+  Chunks --> IR
+  Persist --> Catalog
 ```
 
-### Physical plan directly
+### 2.1 Project responsibilities
 
-For benchmarks or custom planners, compile or build an **`IPhysicalPlan`**, then:
+| Project | Namespace roots | Responsibility |
+|---------|-----------------|----------------|
+| **RainDB.Abstractions** | `RainDB.*` contracts | Catalog, columnar model, execution interfaces, logical IR (`RainDB.Logical`), SQL/LINQ compiler interfaces. |
+| **RainDB.Core** | `RainDB.Core.*` | `MemoryTable`, chunk implementations, `HybridBufferPool`, mmap I/O, `RainDbFileDatabase` + batch codec. |
+| **RainDB.Query** | `RainDB.Query.*` | Physical plans, engines, vectorized selection/projection, query results. |
+| **RainDB.Sql** | `RainDB.Sql.*` | Lexer, parser, binders, `DefaultSqlCompiler`, `StrictSqlSubset`. |
+| **RainDB.Linq** | `RainDB.Linq.*` | Stub `DefaultLinqCompiler` → `ExplainOnlyPhysicalPlan` (roadmap). |
+| **RainDB** (driver) | `RainDB` | `RainDbEngine` composition root. |
 
-```csharp
-await using var rows = await engine.ExecutePhysicalAsync(plan);
+### 2.2 Key class relationships
+
+```text
+RainDbEngine
+  ├── ICatalog (InMemoryCatalog)
+  ├── IQueryExecutor (DefaultQueryExecutor)
+  ├── ISqlCompiler (DefaultSqlCompiler)
+  ├── IBufferPool / IAlignedBufferPool (HybridBufferPool)
+  └── ISpillWriter (NoOpSpillWriter by default)
+
+DefaultQueryExecutor
+  └── pattern match on IPhysicalPlan → static *Engine.ExecuteAsync
+
+IColumnarTableSource (MemoryTable)
+  └── IReadOnlyList<IColumnarBatch> Batches
+        └── IColumnChunk[] per column
 ```
 
-### SQL without the compiler service
+**Extension point:** inject custom `IQueryExecutor`, `ISqlCompiler`, pools, or `ISpillWriter` via `RainDbEngine` constructor for benchmarks or alternate planners.
 
-```csharp
-using RainDB.Sql;
-var plan = StrictSqlSubset.CompilePhysicalPlan("SELECT ...", catalog);
+---
+
+## 3. Columnar storage model
+
+### 3.1 Batch and chunk invariants
+
+- A **batch** (`IColumnarBatch`) has one `RowCount` and one **chunk per table column** (same order as `TableSchema.Columns`).
+- A **chunk** (`IColumnChunk`) exposes:
+  - `PhysicalType` (`RainDbType`)
+  - `Values` — packed fixed-width little-endian bytes, or UTF-8 blob (layout depends on chunk class)
+  - Optional **null bitmap**: bit `1` = NULL at row `i`, byte `i >> 3`, mask `1 << (i & 7)`
+
+### 3.2 Chunk implementations (`RainDB.Core.Columnar`)
+
+| Type | Class | Layout |
+|------|--------|--------|
+| Fixed-width | `FixedWidthColumnChunk` | `rowCount × width` bytes; boolean stored as one byte per row (0/1). |
+| UTF-8 (Arrow) | `Utf8ColumnChunk` | `offsets[rowCount+1]` + contiguous UTF-8 blob. |
+| UTF-8 (length-prefixed) | `Utf8LengthPrefixedColumnChunk` | Per row: `int32` LE length + payload; index built at construction. |
+| Projected (query) | `PooledFixedWidthColumnChunk` | Fixed-width gather output; buffers from pool; `IDisposable`. |
+
+### 3.3 `MemoryTable`
+
+- Append-only list of batches; `AppendBatch` validates schema/types/row counts.
+- Optional `MemoryTableOptions.StrictVectorChunkRows`: enforces `VectorChunkLimits` (64K–1M rows per non-empty batch).
+- `SchemaVersion` + `BumpSchemaVersion()` + event for future plan cache invalidation.
+- `IRainDbBatchPersistence.OnBatchAppended` hook when wired through `RainDbFileDatabase`.
+
+### 3.4 Catalog
+
+- `TableId` (stable GUID) + name → `ITableSource`.
+- Execution resolves `TableId` after SQL binding; `IColumnarTableSource` adds `Batches` for scans.
+
+---
+
+## 4. Buffer and memory management
+
+### 4.1 `HybridBufferPool`
+
+- Implements both `IBufferPool` (`ArrayPool<byte>.Shared`) and `IAlignedBufferPool`.
+- **Aligned rent:** allocates extra padding, returns `IMemoryOwner<byte>` sub-slice with ≥32-byte alignment (AVX2-friendly).
+- **LOH guidance:** prefer rents under ~85KB when possible (documented on `IBufferPool`).
+
+### 4.2 Query result memory
+
+- `ProjectGather` writes fixed-width output into **pooled** buffers (`PooledFixedWidthColumnChunk`).
+- `ColumnarMaterializedQueryResult.DisposeAsync` disposes `IDisposable` columns to return pool memory.
+- **Always** `await using` query results when using default scan/project paths.
+
+---
+
+## 5. Execution pipeline
+
+### 5.1 Session context
+
+`IExecutionContext` (`RainDbExecutionContext`) carries:
+
+- `ICatalog`, `IBufferPool`, `IAlignedBufferPool`, `ISpillWriter`, `CancellationToken`
+
+Each `ExecuteSqlAsync` / `ExecutePhysicalAsync` call creates a fresh session.
+
+### 5.2 Physical plans (`RainDB.Query.Plans`)
+
+| Plan | Engine | Purpose |
+|------|--------|---------|
+| `VectorizedScanPhysicalPlan` | `VectorizedScanEngine` | Scan, `WHERE`, project, optional **global** aggregate. |
+| `HashAggregatePhysicalPlan` | `HashAggregateEngine` | `GROUP BY` on one table (or ephemeral source). |
+| `JoinPhysicalPlan` | `JoinExecutionEngine` | Inner equi-join (hash or sort-merge). |
+| `SortTopNPhysicalPlan` | `SortTopNEngine` | `ORDER BY` / `LIMIT` on one table. |
+| `JoinSortTopNPhysicalPlan` | `SortTopNEngine` | Join then sort/limit. |
+| `GroupedJoinPhysicalPlan` | Join + `HashAggregateEngine` | Join materialized rowset, then hash agg. |
+
+`IPhysicalPlan.Explain()` returns a short text description; `DefaultQueryExecutor` invokes it before dispatch (lightweight tracing hook).
+
+There is **no separate optimizer** today: binders emit one physical shape per logical node (join algorithm fixed to **hash** in `DefaultSqlCompiler`).
+
+---
+
+## 6. Selection and projection (vectorized scan path)
+
+### 6.1 Data structure: dense selection vector
+
+A **selection vector** is a dense `int[]` of **source row indices** that survive predicates, in increasing row order within the batch.
+
+- Capacity: up to `batch.RowCount` (rented from `ArrayPool<int>.Shared` in engines).
+- **No filter:** logical selection is `0..n-1` without materializing indices (`useRowSelection: false` in `ProjectGather`).
+
+### 6.2 Conjunctive `WHERE` (`SelectionEvaluator`)
+
+Algorithm for `filter₁ AND filter₂ AND …`:
+
+1. Evaluate **first** predicate into `dest[0..count)` using column-specific kernels (`FixedWidthSelectionKernels` or UTF-8 path).
+2. For each subsequent predicate, **intersect in place**: compact `dest` to rows that also pass the next filter (`IntersectSelectedIndices` or UTF-8 `IntersectUtf8`).
+
+Complexity: O(n) for the first predicate + O(kᵢ) per additional predicate, where kᵢ is the current selection size (beneficial at 10–30% selectivity).
+
+**UTF-8 semantics** (dedicated path, documented on `SelectionEvaluator`):
+
+- Only `=`, `!=`, `<>` with a single-quoted literal.
+- Byte-wise equality on cell payload (Arrow slice or length-prefixed payload).
+- NULL cells never match.
+
+### 6.3 Fixed-width compare kernels
+
+`FixedWidthSelectionKernels`:
+
+- Uses `MemoryMarshal.Cast<byte, T>` for typed scans over column values.
+- Skips null rows via bitmap checks before compare.
+- **Fast path:** null-free `Int32` equality may use `Vector128` compares (hardware accelerated when available).
+
+`RowMatchesFilter` remains the semantic reference for joins and row-wise fallbacks.
+
+### 6.4 Projection (`ProjectGather`)
+
+| Case | Behavior |
+|------|----------|
+| No row selection, full batch | Single `CopyTo` of entire column (`CopyEntireFixedWidthColumn`). |
+| Row selection | Gather per selected index into aligned value buffer; optional null bitmap in `IBufferPool`. |
+| UTF-8 | Still allocates new Arrow/LP chunks (not pooled in Phase A1). |
+
+Output: `ColumnarBatch` with `PooledFixedWidthColumnChunk` or UTF-8 chunk types.
+
+### 6.5 Morsel parallelism (`VectorizedScanEngine`)
+
+- **Morsel** = one source batch index.
+- `MaxDegreeOfParallelism`: `-1` → `Environment.ProcessorCount`, `0` → 1, else explicit cap.
+- Schedulers: `Parallel.For` or `Channel<int>` worker pool (`UseChannelScheduler`).
+- Output array indexed by batch index → **stable batch order** in `IColumnarQueryResult.Batches`.
+
+### 6.6 Global aggregates in scan engine
+
+- Per-batch **partial** accumulators (`PartialAgg` struct).
+- Deterministic combine across batches.
+- `COUNT(*)`: filtered row count; `COUNT(col)`: non-null among selected rows.
+- `SUM` / `MIN` / `MAX`: `IAggregateQueryResult.ValueIsNull` when no contributing non-null values.
+- Optional AVX2 `SumFloat64` when `UseAvx2DoubleSum`, no nulls, full-column scan without selection.
+
+---
+
+## 7. Hash aggregation (`HashAggregateEngine`)
+
+### 7.1 Algorithm
+
+1. **Per source batch** (optionally parallel): build a `Dictionary<GroupKey, AggregateAccumulator[]>` (or composite UTF-8 key variant).
+2. Apply `WHERE` via same selection vector as scan.
+3. For each selected row: build group key → update accumulators.
+4. **Merge** partial dictionaries across batches.
+5. **Sort keys** (`GroupKeyComparer`) for deterministic output order.
+6. **Materialize** one output `ColumnarBatch` with grouping columns + aggregate columns (null bits on aggregate outputs per SQL rules).
+
+### 7.2 Group keys
+
+**Fixed-width keys** — `GroupKey`:
+
+- `ulong[] Parts` — one part per key column (encoded fixed-width values).
+- `uint NullMask` — bit set if any key part is NULL; such rows are typically skipped for equi-join; aggregation uses key nullability per engine rules.
+
+**UTF-8 / mixed keys** — `CompositeJoinKey` / composite hash path in `HashAggregateEngine.ExecuteWithCompositeKeysAsync`.
+
+### 7.3 Spill hook
+
+If `ISpillWriter.IsEnabled` and `SpillPartialEntryThreshold` exceeded, engine writes a **metrics JSON line** via `SpillChunkAsync`. Full external aggregation is not implemented; interface is reserved for Phase E.
+
+---
+
+## 8. Join execution (`JoinExecutionEngine`)
+
+### 8.1 Supported join
+
+- **Inner equi-join** only; keys must match types (fixed-width or `Utf8`).
+- Optional `WHERE` filters pushed to probe/build sides (`ColumnCompareFilter[]` per side).
+
+### 8.2 Hash join
+
+1. **Build phase:** scan right (build) batches; insert `(GroupKey or CompositeJoinKey) → List<RowRef(batchIdx, rowIdx)>` skipping null keys.
+2. **Probe phase:** scan left batches; for each probe row, lookup key and emit `(probe, build)` pairs into `List<RowRefMatch>`.
+3. **Materialize** wide output batch (left columns then right, or explicit `JoinOutputColumnRef` order).
+
+### 8.3 Sort-merge join
+
+1. Collect keyed row references from each side; sort by key (`SortEntryFixed` + `GroupKeyComparer`).
+2. Merge-like walk on sorted keys to emit matches (duplicate key handling: nested loop on equal key runs).
+
+### 8.4 Grouped join plan
+
+`GroupedJoinPhysicalPlan`: run join → wrap result in `EphemeralColumnarTableSource` → `HashAggregateEngine` on ephemeral table. Full join rowset is materialized in memory.
+
+---
+
+## 9. Sort and limit (`SortTopNEngine`)
+
+1. Collect row locations `(batchIdx, rowIdx)` from all batches (apply `WHERE` if present).
+2. If sort keys present: `Array.Sort` with `RowLocComparer` (null-aware, type-specific compare for Int32/Int64/Float64/Boolean/Utf8).
+3. Apply `LIMIT` by truncating sorted row list (full sort today; heap top-N is roadmap Phase A2).
+4. Materialize projected columns into output batch.
+
+Join variant: execute join first, then sort/limit on join output schema.
+
+---
+
+## 10. SQL compilation
+
+### 10.1 Pipeline
+
+```text
+SQL text
+  → SqlLexer (tokens)
+  → SqlParser / SelectParser → LogicalPlan (LogicalTableScan | LogicalInnerJoin)
+  → Binder (LogicalTableScanBinder | LogicalJoinBinder)
+  → IPhysicalPlan
+  → DefaultQueryExecutor
 ```
 
-### Custom catalog with default collaborators
+`StrictSqlSubset.ParseLogicalPlan` / `CompilePhysicalPlan` expose parse and parse+bind without `RainDbEngine`.
 
-```csharp
-var engine = RainDbEngine.CreateDefault(myCatalog);
+### 10.2 Logical IR (`RainDB.Logical`)
+
+Relational-shaped, SQL-close: table names, `SimpleWhereClause`, `LogicalAggregate`, sort keys, limits. No buffer or execution details.
+
+### 10.3 Binding rules (high level)
+
+- Resolve table/column names against `ICatalog`; map to column ordinals.
+- Validate aggregate types (e.g. `MIN`/`MAX` only `Float64` today).
+- Emit filters as `ColumnCompareFilter` (column index, op, immediate bits or UTF-8 literal bytes).
+- Choose plan shape: scan vs `HashAggregatePhysicalPlan` vs join variants vs sort/top-N wrappers.
+
+Parser rejects unsupported constructs with `SqlCompileException` (e.g. `HAVING`, `SELECT *` with `GROUP BY`).
+
+---
+
+## 11. Persistence (`RainDbFileDatabase`)
+
+### 11.1 On-disk layout
+
+```text
+dataDir/
+  catalog.json          # table ids, names, column types (formatVersion: 1)
+  tables/
+    {tableId}/
+      000000.batch
+      000001.batch
+      ...
 ```
 
-### File-backed persistence (MVP)
+### 11.2 Lifecycle
 
-```csharp
-var engine = RainDbEngine.OpenPersistent("/path/to/dbdir");
-// engine.FileDatabase is non-null; use FileDatabase.CreateMemoryTable(...) so AppendBatch mirrors new batches to disk.
-// Export / import snapshots: RainDbFileDatabase.ExportCatalog(...), ImportCatalog(...).
-```
+- **Open:** hydrate `MemoryTable` instances + register persistence hook on created tables.
+- **Append:** `MemoryTable.AppendBatch` → encode batch → write `######.batch` (locked I/O).
+- **FlushCatalog:** rewrite `catalog.json` (MemoryTable entries only).
+- **ExportCatalog / ImportCatalog:** snapshot or cold load without live append hook.
 
-See **`RainDB.Core.Persistence.RainDbFileDatabase`** and the README **Phase 2b** section for format and limitations (not a WAL; tables are still executed from in-memory batches after load).
+### 11.3 Codec (`RainDbBatchBinaryCodec` v1)
 
-### Sessions
+Self-describing per-batch binary; supports fixed-width, Arrow UTF-8, length-prefixed UTF-8.
 
-**`RainDbEngine.CreateSession`** returns **`IExecutionContext`** used by **`ExecuteSqlAsync`** / **`ExecutePhysicalAsync`** internally. Custom hosts can construct **`RainDbEngine`** with injected **`IQueryExecutor`**, **`ISqlCompiler`**, buffer pools, and spill writer if they outgrow defaults.
+**Durability note:** not a WAL; crash between catalog and batch write can leave inconsistency until future journaling (see roadmap).
 
-## Where to read next
+### 11.4 mmap (`ColumnarFixedWidthMmapReader`)
 
-| Topic | Primary locations |
-|--------|-------------------|
-| Physical plan shapes | `src/RainDB.Query/Plans/` |
-| Operator implementations | `src/RainDB.Query/Execution/` |
-| SQL parse + bind | `src/RainDB.Sql/Parsing/`, `src/RainDB.Sql/Compilation/` |
-| Logical IR types | `src/RainDB.Abstractions/Logical/` |
-| Columnar storage | `src/RainDB.Core/Columnar/`, `src/RainDB.Core/Tables/` |
-| Driver entry | `src/RainDB.Driver/RainDbEngine.cs` |
-| Behavioral tests | `tests/RainDB.Tests/` |
+Optional zero-copy read path for **fixed-width column files** on disk; not yet wired as default `MemoryTable` storage (queries still run on in-memory batches after load).
 
-## Glossary
+---
 
-| Term | Meaning |
-|------|---------|
-| **Morsel / batch** | A columnar chunk spanning many rows; unit of parallel work and cache-friendly scanning. |
-| **Binding** | Resolving SQL names to catalog objects and column ordinals, and emitting a physical plan. |
-| **Lowering** | Translating logical operators into executable physical operators (here, mostly in binders). |
-| **Strict subset** | The hand-written SQL surface the lexer/parser/compiler implement today; not general SQL. |
+## 12. Threading and cancellation
+
+- Parallel engines use `ParallelOptions.CancellationToken` or cooperative checks in loops.
+- Catalog mutations are not synchronized for multi-writer scenarios; assume **single-writer** host process.
+- File I/O under `RainDbFileDatabase` uses an instance lock.
+
+---
+
+## 13. Testing map
+
+| Area | Test classes |
+|------|----------------|
+| Columnar / catalog | `ColumnarAndCatalogTests` |
+| Scan / filter / agg | `Phase1ReadPathTests`, `VectorizedSelectionPerformanceTests` |
+| SQL correctness | `SqlFeatureCorrectnessTests`, `SqlStrictSubsetCompilerTests`, `SqlGroupByTests`, `SqlOrderByLimitTests` |
+| Joins | `JoinExecutionTests` |
+| Hash agg | `HashAggregatePhysicalTests` |
+| Physical plans | `PhysicalPlanCorrectnessTests` |
+| Persistence | `RainDbPersistenceTests` |
+
+When documentation and code disagree, **tests + README** win.
+
+---
+
+## 14. Glossary
+
+| Term | Definition |
+|------|------------|
+| **Morsel** | One `IColumnarBatch` in a table; unit of parallel scan work. |
+| **Selection vector** | Dense array of source row indices passing predicates. |
+| **Binding** | Name resolution + type checks + physical plan emission. |
+| **Lowering** | Logical IR → physical plan (in binders today). |
+| **Strict subset** | Implemented SQL dialect; not ANSI-complete. |
+
+---
+
+## 15. Related documents
+
+| Document | Audience |
+|----------|----------|
+| [Programming Guide](Programming-Guide.md) | Application developers using `RainDbEngine` |
+| [Development Roadmap](Development-Roadmap.md) | Planned phases and exit criteria |
+| [README](../README.md) | Feature list and SQL reference |

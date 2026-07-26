@@ -7,6 +7,15 @@ using RainDB.Schema;
 
 namespace RainDB.Query.Vectorized;
 
+/// <summary>
+/// Builds dense selection vectors (matching row indices) for filters.
+/// Fixed-width predicates use column-wise compare kernels; conjunctive <c>AND</c> intersects successive selections in-place.
+/// </summary>
+/// <remarks>
+/// <para><b>UTF-8 predicates</b> (dedicated path): only <c>=</c>, <c>!=</c>, and <c>&lt;&gt;</c> with a single-quoted literal are supported.
+/// Comparison is raw UTF-8 byte equality against the cell payload (Arrow blob slice or length-prefixed payload).
+/// SQL NULL cells do not match. Range, <c>LIKE</c>, and collation are not implemented.</para>
+/// </remarks>
 internal static class SelectionEvaluator
 {
     internal static bool IsNull(ReadOnlySpan<byte> nullBitmap, int row, bool hasNulls)
@@ -29,21 +38,16 @@ internal static class SelectionEvaluator
             return n;
         }
 
-        var count = 0;
-        for (var r = 0; r < n; r++)
-        {
-            var ok = true;
-            foreach (var f in filters)
-            {
-                if (!RowMatchesFilter(batch.Columns[f.ColumnIndex], f, r))
-                {
-                    ok = false;
-                    break;
-                }
-            }
+        if (dest.Length < n)
+            throw new ArgumentException("Selection buffer too small.", nameof(dest));
 
-            if (ok)
-                dest[count++] = r;
+        var count = FillSelectedRows(batch.Columns[filters[0].ColumnIndex], filters[0], dest);
+        for (var f = 1; f < filters.Length; f++)
+        {
+            var col = batch.Columns[filters[f].ColumnIndex];
+            count = filters[f].Utf8LiteralBytes is not null || col.PhysicalType == RainDbType.Utf8
+                ? IntersectUtf8(col, filters[f], dest, count)
+                : FixedWidthSelectionKernels.IntersectSelectedIndices(col, filters[f], dest, count);
         }
 
         return count;
@@ -55,10 +59,6 @@ internal static class SelectionEvaluator
         if (filter.ColumnIndex < 0)
             throw new ArgumentOutOfRangeException(nameof(filter));
 
-        var n = column.RowCount;
-        if (dest.Length < n)
-            throw new ArgumentException("Selection buffer too small.", nameof(dest));
-
         if (filter.Utf8LiteralBytes is not null)
         {
             if (column.PhysicalType != RainDbType.Utf8)
@@ -69,28 +69,7 @@ internal static class SelectionEvaluator
         if (column.PhysicalType == RainDbType.Utf8)
             throw new NotSupportedException("UTF-8 column requires a string literal predicate.");
 
-        var nb = column.HasNulls ? column.NullBitmap.Span : ReadOnlySpan<byte>.Empty;
-        var values = column.Values.Span;
-        var count = 0;
-        switch (column.PhysicalType)
-        {
-            case RainDbType.Int32:
-                FillInt32(values, nb, column.HasNulls, filter.Op, (int)filter.ImmediateBits, dest, ref count);
-                break;
-            case RainDbType.Int64:
-                FillInt64(values, nb, column.HasNulls, filter.Op, filter.ImmediateBits, dest, ref count);
-                break;
-            case RainDbType.Float64:
-                FillFloat64(values, nb, column.HasNulls, filter.Op, BitConverter.Int64BitsToDouble(filter.ImmediateBits), dest, ref count);
-                break;
-            case RainDbType.Boolean:
-                FillBool(values, nb, column.HasNulls, filter.Op, filter.ImmediateBits != 0, dest, ref count);
-                break;
-            default:
-                throw new ArgumentOutOfRangeException(nameof(column), column.PhysicalType, "Unsupported physical type.");
-        }
-
-        return count;
+        return FixedWidthSelectionKernels.FillSelectedIndices(column, filter, dest);
     }
 
     internal static bool RowMatchesFilter(IColumnChunk column, ColumnCompareFilter filter, int row)
@@ -146,6 +125,19 @@ internal static class SelectionEvaluator
         }
     }
 
+    private static int IntersectUtf8(IColumnChunk column, ColumnCompareFilter filter, Span<int> selectedRows, int count)
+    {
+        var write = 0;
+        for (var r = 0; r < count; r++)
+        {
+            var row = selectedRows[r];
+            if (RowMatchesFilter(column, filter, row))
+                selectedRows[write++] = row;
+        }
+
+        return write;
+    }
+
     private static int FillUtf8Selected(IColumnChunk column, ColumnCompareFilter filter, Span<int> dest)
     {
         var n = column.RowCount;
@@ -175,86 +167,6 @@ internal static class SelectionEvaluator
         var start = off[row];
         var end = off[row + 1];
         return src.Values.Span.Slice(start, end - start).SequenceEqual(literal);
-    }
-
-    private static void FillInt32(
-        ReadOnlySpan<byte> values,
-        ReadOnlySpan<byte> nb,
-        bool hasNulls,
-        ScalarCompareOp op,
-        int imm,
-        Span<int> dest,
-        ref int count)
-    {
-        var n = values.Length / sizeof(int);
-        for (var i = 0; i < n; i++)
-        {
-            if (IsNull(nb, i, hasNulls))
-                continue;
-            var v = BinaryPrimitives.ReadInt32LittleEndian(values.Slice(i * sizeof(int), sizeof(int)));
-            if (CompareInt32(v, imm, op))
-                dest[count++] = i;
-        }
-    }
-
-    private static void FillInt64(
-        ReadOnlySpan<byte> values,
-        ReadOnlySpan<byte> nb,
-        bool hasNulls,
-        ScalarCompareOp op,
-        long imm,
-        Span<int> dest,
-        ref int count)
-    {
-        var n = values.Length / sizeof(long);
-        for (var i = 0; i < n; i++)
-        {
-            if (IsNull(nb, i, hasNulls))
-                continue;
-            var v = BinaryPrimitives.ReadInt64LittleEndian(values.Slice(i * sizeof(long), sizeof(long)));
-            if (CompareInt64(v, imm, op))
-                dest[count++] = i;
-        }
-    }
-
-    private static void FillFloat64(
-        ReadOnlySpan<byte> values,
-        ReadOnlySpan<byte> nb,
-        bool hasNulls,
-        ScalarCompareOp op,
-        double imm,
-        Span<int> dest,
-        ref int count)
-    {
-        var n = values.Length / sizeof(double);
-        for (var i = 0; i < n; i++)
-        {
-            if (IsNull(nb, i, hasNulls))
-                continue;
-            var v = BitConverter.Int64BitsToDouble(BinaryPrimitives.ReadInt64LittleEndian(values.Slice(i * sizeof(double), sizeof(double))));
-            if (CompareDouble(v, imm, op))
-                dest[count++] = i;
-        }
-    }
-
-    private static void FillBool(
-        ReadOnlySpan<byte> values,
-        ReadOnlySpan<byte> nb,
-        bool hasNulls,
-        ScalarCompareOp op,
-        bool imm,
-        Span<int> dest,
-        ref int count)
-    {
-        var n = values.Length;
-        for (var i = 0; i < n; i++)
-        {
-            if (IsNull(nb, i, hasNulls))
-                continue;
-            var v = values[i] != 0;
-            if (CompareBool(v, imm, op))
-                dest[count++] = i;
-        }
     }
 
     private static bool CompareInt32(int v, int imm, ScalarCompareOp op) =>

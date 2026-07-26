@@ -178,3 +178,11 @@ await using var viaSql = await engine.ExecuteSqlAsync(
 ## License
 
 Specify your license in this folder when you productize RainDB.
+
+## Documentation
+
+| Guide | Description |
+|-------|-------------|
+| [Programming Guide](docs/Programming-Guide.md) | How to use `RainDbEngine`, tables, SQL, results, and persistence |
+| [RainDB Internals](docs/RainDB-Internals.md) | Architecture, algorithms, and data structures |
+| [Development Roadmap](docs/Development-Roadmap.md) | Phased implementation plan |

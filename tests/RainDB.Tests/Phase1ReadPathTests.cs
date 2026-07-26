@@ -48,7 +48,7 @@ public class Phase1ReadPathTests
         var col = Assert.IsAssignableFrom<IColumnarQueryResult>(result);
         Assert.Single(col.Batches);
         Assert.Equal(2, col.Batches[0].RowCount);
-        var outAmt = Assert.IsType<FixedWidthColumnChunk>(col.Batches[0].Columns[0]);
+        var outAmt = col.Batches[0].Columns[0];
         Assert.Equal(BitConverter.ToDouble(outAmt.Values.Span[..8]), BitConverter.ToDouble(amt.Values.Span.Slice(8, 8)));
         Assert.Equal(BitConverter.ToDouble(outAmt.Values.Span.Slice(8, 8)), BitConverter.ToDouble(amt.Values.Span.Slice(16, 8)));
     }
@@ -92,7 +92,7 @@ public class Phase1ReadPathTests
         var col = Assert.IsAssignableFrom<IColumnarQueryResult>(result);
         Assert.Single(col.Batches);
         Assert.Equal(1, col.Batches[0].RowCount);
-        var outAmt = Assert.IsType<FixedWidthColumnChunk>(col.Batches[0].Columns[0]);
+        var outAmt = col.Batches[0].Columns[0];
         Assert.Equal(20d, BitConverter.ToDouble(outAmt.Values.Span[..8]));
     }
 

@@ -1,5 +1,7 @@
+using System.Buffers;
 using RainDB.Columnar;
 using RainDB.Core.Columnar;
+using RainDB.Memory;
 using RainDB.Schema;
 
 namespace RainDB.Query.Vectorized;
@@ -11,8 +13,12 @@ internal static class ProjectGather
         ReadOnlySpan<int> outputColumnIndices,
         bool useRowSelection,
         ReadOnlySpan<int> selectedRows,
-        int selectedCount)
+        int selectedCount,
+        IBufferPool bufferPool,
+        IAlignedBufferPool alignedBufferPool)
     {
+        ArgumentNullException.ThrowIfNull(bufferPool);
+        ArgumentNullException.ThrowIfNull(alignedBufferPool);
         if (useRowSelection && selectedRows.Length < selectedCount)
             throw new ArgumentException(nameof(selectedCount));
 
@@ -22,7 +28,13 @@ internal static class ProjectGather
             var colIdx = outputColumnIndices[c];
             if ((uint)colIdx >= (uint)batch.Columns.Count)
                 throw new ArgumentOutOfRangeException(nameof(outputColumnIndices));
-            cols[c] = GatherColumn(batch.Columns[colIdx], useRowSelection, selectedRows, selectedCount);
+            cols[c] = GatherColumn(
+                batch.Columns[colIdx],
+                useRowSelection,
+                selectedRows,
+                selectedCount,
+                bufferPool,
+                alignedBufferPool);
         }
 
         return new ColumnarBatch(selectedCount, cols);
@@ -32,7 +44,9 @@ internal static class ProjectGather
         IColumnChunk source,
         bool useRowSelection,
         ReadOnlySpan<int> selectedRows,
-        int selectedCount)
+        int selectedCount,
+        IBufferPool bufferPool,
+        IAlignedBufferPool alignedBufferPool)
     {
         if (source.PhysicalType == RainDbType.Utf8)
         {
@@ -43,25 +57,36 @@ internal static class ProjectGather
             throw new NotSupportedException("Unknown UTF-8 chunk implementation.");
         }
 
-        return GatherFixedWidth(source, useRowSelection, selectedRows, selectedCount);
+        return GatherFixedWidth(source, useRowSelection, selectedRows, selectedCount, bufferPool, alignedBufferPool);
     }
 
     private static IColumnChunk GatherFixedWidth(
         IColumnChunk source,
         bool useRowSelection,
         ReadOnlySpan<int> selectedRows,
-        int selectedCount)
+        int selectedCount,
+        IBufferPool bufferPool,
+        IAlignedBufferPool alignedBufferPool)
     {
         var type = source.PhysicalType;
         var w = ColumnTypeSizes.FixedWidthBytes(type);
         var srcValues = source.Values.Span;
         var srcNb = source.HasNulls ? source.NullBitmap.Span : ReadOnlySpan<byte>.Empty;
-        var outValues = new byte[checked(selectedCount * w)];
-        var anyNull = false;
+
+        if (!useRowSelection && selectedCount == source.RowCount)
+            return CopyEntireFixedWidthColumn(source, type, w, srcValues, srcNb, alignedBufferPool, bufferPool);
+
+        var valueBytes = checked(selectedCount * w);
+        var valuesOwner = alignedBufferPool.RentAligned(valueBytes);
+        var outValues = valuesOwner.Memory.Span[..valueBytes];
+
         if (source.HasNulls)
         {
             var nbBytes = ColumnTypeSizes.NullBitmapBytes(selectedCount);
-            var outNb = new byte[nbBytes];
+            var nullOwner = CreateNullOwner(bufferPool, bufferPool.Rent(nbBytes), nbBytes);
+            var outNb = nullOwner.Memory.Span[..nbBytes];
+            outNb.Clear();
+            var anyNull = false;
             for (var o = 0; o < selectedCount; o++)
             {
                 var r = RowAt(useRowSelection, selectedRows, o);
@@ -72,20 +97,85 @@ internal static class ProjectGather
                 }
                 else
                 {
-                    srcValues.Slice(r * w, w).CopyTo(outValues.AsSpan(o * w, w));
+                    srcValues.Slice(r * w, w).CopyTo(outValues.Slice(o * w, w));
                 }
             }
 
-            return new FixedWidthColumnChunk(type, selectedCount, outValues, outNb, anyNull);
+            return new PooledFixedWidthColumnChunk(type, selectedCount, valuesOwner, valueBytes, nullOwner, nbBytes, anyNull);
         }
 
         for (var o = 0; o < selectedCount; o++)
         {
             var r = RowAt(useRowSelection, selectedRows, o);
-            srcValues.Slice(r * w, w).CopyTo(outValues.AsSpan(o * w, w));
+            srcValues.Slice(r * w, w).CopyTo(outValues.Slice(o * w, w));
         }
 
-        return new FixedWidthColumnChunk(type, selectedCount, outValues, ReadOnlyMemory<byte>.Empty, hasNulls: false);
+        return new PooledFixedWidthColumnChunk(type, selectedCount, valuesOwner, valueBytes, nullBitmapOwner: null, nullBitmapBytes: 0, hasNulls: false);
+    }
+
+    private static IColumnChunk CopyEntireFixedWidthColumn(
+        IColumnChunk source,
+        RainDbType type,
+        int w,
+        ReadOnlySpan<byte> srcValues,
+        ReadOnlySpan<byte> srcNb,
+        IAlignedBufferPool alignedBufferPool,
+        IBufferPool bufferPool)
+    {
+        var rowCount = source.RowCount;
+        var valueBytes = checked(rowCount * w);
+        var valuesOwner = alignedBufferPool.RentAligned(valueBytes);
+        srcValues.CopyTo(valuesOwner.Memory.Span[..valueBytes]);
+
+        if (!source.HasNulls)
+        {
+            return new PooledFixedWidthColumnChunk(
+                type,
+                rowCount,
+                valuesOwner,
+                valueBytes,
+                nullBitmapOwner: null,
+                nullBitmapBytes: 0,
+                hasNulls: false);
+        }
+
+        var nbBytes = ColumnTypeSizes.NullBitmapBytes(rowCount);
+        var nullOwner = CreateNullOwner(bufferPool, bufferPool.Rent(nbBytes), nbBytes);
+        srcNb[..nbBytes].CopyTo(nullOwner.Memory.Span[..nbBytes]);
+        return new PooledFixedWidthColumnChunk(type, rowCount, valuesOwner, valueBytes, nullOwner, nbBytes, hasNulls: true);
+    }
+
+    private static PooledBufferOwner CreateNullOwner(IBufferPool bufferPool, byte[] rented, int length) =>
+        new(bufferPool, rented, length);
+
+    private sealed class PooledBufferOwner : IMemoryOwner<byte>
+    {
+        private readonly IBufferPool _pool;
+        private byte[]? _buffer;
+        private readonly int _length;
+
+        public PooledBufferOwner(IBufferPool pool, byte[] buffer, int length)
+        {
+            _pool = pool;
+            _buffer = buffer;
+            _length = length;
+        }
+
+        public Memory<byte> Memory
+        {
+            get
+            {
+                var b = _buffer ?? throw new ObjectDisposedException(nameof(PooledBufferOwner));
+                return new Memory<byte>(b, 0, _length);
+            }
+        }
+
+        public void Dispose()
+        {
+            var b = Interlocked.Exchange(ref _buffer, null);
+            if (b is not null)
+                _pool.Return(b);
+        }
     }
 
     private static void SetNullBit(Span<byte> nb, int row) => nb[row >> 3] |= (byte)(1 << (row & 7));
