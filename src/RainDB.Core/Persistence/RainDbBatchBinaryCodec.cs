@@ -52,6 +52,8 @@ public static class RainDbBatchBinaryCodec
         var cols = new IColumnChunk[colCount];
         for (var i = 0; i < colCount; i++)
             cols[i] = ReadColumn(data, ref o, rowCount);
+        if (o != data.Length)
+            throw new InvalidDataException($"Batch buffer has {data.Length - o} trailing byte(s) after column data.");
         return new ColumnarBatch(rowCount, cols);
     }
 

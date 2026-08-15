@@ -541,31 +541,16 @@ public static class JoinExecutionEngine
         List<RowRefMatch> matches,
         bool useProbeSide)
     {
-        var m0 = matches[0];
-        var bi0 = useProbeSide ? m0.LeftBatchIdx : m0.RightBatchIdx;
-        return batches[bi0].Columns[colIndex] switch
-        {
-            Utf8ColumnChunk => MaterializeUtf8ArrowColumn(batches, colIndex, matches, useProbeSide),
-            Utf8LengthPrefixedColumnChunk => MaterializeUtf8LengthPrefixedColumn(batches, colIndex, matches, useProbeSide),
-            var o => throw new NotSupportedException($"Unexpected UTF-8 chunk type {o.GetType().Name}."),
-        };
-    }
-
-    private static IColumnChunk MaterializeUtf8ArrowColumn(
-        IReadOnlyList<IColumnarBatch> batches,
-        int colIndex,
-        List<RowRefMatch> matches,
-        bool useProbeSide)
-    {
         var n = matches.Count;
+        if (n == 0)
+            return new Utf8ColumnChunk(0, new[] { 0 }, Array.Empty<byte>(), ReadOnlyMemory<byte>.Empty, hasNulls: false);
+
         var offsetsMem = new int[n + 1];
         var offsets = offsetsMem.AsSpan();
         var blob = new List<byte>(Math.Max(0, n * 4));
-        byte[]? nbBuf = null;
         var anyNull = false;
-        var m0 = matches[0];
-        var bi0 = useProbeSide ? m0.LeftBatchIdx : m0.RightBatchIdx;
-        if (batches[bi0].Columns[colIndex] is Utf8ColumnChunk { HasNulls: true })
+        byte[]? nbBuf = null;
+        if (Utf8ColumnMayHaveNulls(batches, colIndex, matches, useProbeSide))
             nbBuf = new byte[ColumnTypeSizes.NullBitmapBytes(n)];
 
         for (var o = 0; o < n; o++)
@@ -574,9 +559,9 @@ public static class JoinExecutionEngine
             var m = matches[o];
             var bi = useProbeSide ? m.LeftBatchIdx : m.RightBatchIdx;
             var ri = useProbeSide ? m.LeftRow : m.RightRow;
-            var src = (Utf8ColumnChunk)batches[bi].Columns[colIndex];
-            var srcNb = src.HasNulls ? src.NullBitmap.Span : ReadOnlySpan<byte>.Empty;
-            if (SelectionEvaluator.IsNull(srcNb, ri, src.HasNulls))
+            var col = batches[bi].Columns[colIndex];
+            var srcNb = col.HasNulls ? col.NullBitmap.Span : ReadOnlySpan<byte>.Empty;
+            if (SelectionEvaluator.IsNull(srcNb, ri, col.HasNulls))
             {
                 anyNull = true;
                 if (nbBuf != null)
@@ -584,10 +569,7 @@ public static class JoinExecutionEngine
                 continue;
             }
 
-            var srcOffsets = src.Offsets.Span;
-            var start = srcOffsets[ri];
-            var end = srcOffsets[ri + 1];
-            foreach (var b in src.Values.Span.Slice(start, end - start))
+            foreach (var b in ReadUtf8Payload(col, ri))
                 blob.Add(b);
         }
 
@@ -596,47 +578,38 @@ public static class JoinExecutionEngine
         return new Utf8ColumnChunk(n, offsetsMem, blob.ToArray(), nbOut, anyNull);
     }
 
-    private static IColumnChunk MaterializeUtf8LengthPrefixedColumn(
+    private static bool Utf8ColumnMayHaveNulls(
         IReadOnlyList<IColumnarBatch> batches,
         int colIndex,
         List<RowRefMatch> matches,
         bool useProbeSide)
     {
-        var n = matches.Count;
-        var blob = new List<byte>(Math.Max(0, n * 6));
-        byte[]? nbBuf = null;
-        var anyNull = false;
-        var m0 = matches[0];
-        var bi0 = useProbeSide ? m0.LeftBatchIdx : m0.RightBatchIdx;
-        if (batches[bi0].Columns[colIndex] is Utf8LengthPrefixedColumnChunk { HasNulls: true })
-            nbBuf = new byte[ColumnTypeSizes.NullBitmapBytes(n)];
-
-        for (var o = 0; o < n; o++)
+        foreach (var m in matches)
         {
-            var m = matches[o];
             var bi = useProbeSide ? m.LeftBatchIdx : m.RightBatchIdx;
-            var ri = useProbeSide ? m.LeftRow : m.RightRow;
-            var src = (Utf8LengthPrefixedColumnChunk)batches[bi].Columns[colIndex];
-            var srcNb = src.HasNulls ? src.NullBitmap.Span : ReadOnlySpan<byte>.Empty;
-            if (SelectionEvaluator.IsNull(srcNb, ri, src.HasNulls))
-            {
-                anyNull = true;
-                if (nbBuf != null)
-                    SetNullBit(nbBuf.AsSpan(), o);
-                foreach (var z in BitConverter.GetBytes(0))
-                    blob.Add(z);
-                continue;
-            }
-
-            var payload = src.GetPayloadSpan(ri);
-            foreach (var b in BitConverter.GetBytes(payload.Length))
-                blob.Add(b);
-            foreach (var b in payload)
-                blob.Add(b);
+            if (batches[bi].Columns[colIndex].HasNulls)
+                return true;
         }
 
-        ReadOnlyMemory<byte> nbOut = nbBuf != null ? nbBuf : ReadOnlyMemory<byte>.Empty;
-        return new Utf8LengthPrefixedColumnChunk(n, blob.ToArray(), nbOut, anyNull);
+        return false;
+    }
+
+    private static ReadOnlySpan<byte> ReadUtf8Payload(IColumnChunk col, int row)
+    {
+        return col switch
+        {
+            Utf8ColumnChunk utf8 => ReadUtf8ArrowPayload(utf8, row),
+            Utf8LengthPrefixedColumnChunk lp => lp.GetPayloadSpan(row),
+            _ => throw new NotSupportedException($"Unexpected UTF-8 chunk type {col.GetType().Name}."),
+        };
+    }
+
+    private static ReadOnlySpan<byte> ReadUtf8ArrowPayload(Utf8ColumnChunk src, int row)
+    {
+        var off = src.Offsets.Span;
+        var start = off[row];
+        var end = off[row + 1];
+        return src.Values.Span.Slice(start, end - start);
     }
 
     private static void SetNullBit(Span<byte> nb, int row) => nb[row >> 3] |= (byte)(1 << (row & 7));

@@ -66,14 +66,21 @@ public sealed class DefaultQueryExecutor : IQueryExecutor
                 || buildTs2 is not IColumnarTableSource buildCols2)
                 throw new InvalidOperationException($"Columnar build table {grouped.Join.BuildTableId} was not found in the catalog.");
             var joinResult = await JoinExecutionEngine.ExecuteAsync(grouped.Join, probeCols2, buildCols2, context).ConfigureAwait(false);
-            if (joinResult is not IColumnarQueryResult colResult)
-                throw new InvalidOperationException("Join execution must return a columnar result for grouped join.");
-            var ephemeral = new EphemeralColumnarTableSource(
-                grouped.Aggregate.TableId,
-                "_grouped_join_",
-                grouped.Join.OutputSchema,
-                colResult.Batches);
-            return await HashAggregateEngine.ExecuteAsync(grouped.Aggregate, ephemeral, context).ConfigureAwait(false);
+            try
+            {
+                if (joinResult is not IColumnarQueryResult colResult)
+                    throw new InvalidOperationException("Join execution must return a columnar result for grouped join.");
+                var ephemeral = new EphemeralColumnarTableSource(
+                    grouped.Aggregate.TableId,
+                    "_grouped_join_",
+                    grouped.Join.OutputSchema,
+                    colResult.Batches);
+                return await HashAggregateEngine.ExecuteAsync(grouped.Aggregate, ephemeral, context).ConfigureAwait(false);
+            }
+            finally
+            {
+                await joinResult.DisposeAsync().ConfigureAwait(false);
+            }
         }
 
         IQueryResult r = new EmptyQueryResult(0);

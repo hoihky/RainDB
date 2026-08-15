@@ -50,13 +50,27 @@ internal sealed class PooledFixedWidthColumnChunk : IColumnChunk, IDisposable
 
     public bool HasNulls { get; }
 
-    public ReadOnlyMemory<byte> NullBitmap =>
-        HasNulls && _nullBitmapOwner is not null
-            ? _nullBitmapOwner.Memory[.._nullBitmapBytes]
-            : ReadOnlyMemory<byte>.Empty;
+    public ReadOnlyMemory<byte> NullBitmap
+    {
+        get
+        {
+            if (!HasNulls)
+                return ReadOnlyMemory<byte>.Empty;
+            if (_nullBitmapOwner is null)
+                throw new ObjectDisposedException(nameof(PooledFixedWidthColumnChunk));
+            return _nullBitmapOwner.Memory[.._nullBitmapBytes];
+        }
+    }
 
-    public ReadOnlyMemory<byte> Values =>
-        _valuesOwner is not null ? _valuesOwner.Memory[.._valueBytes] : ReadOnlyMemory<byte>.Empty;
+    public ReadOnlyMemory<byte> Values
+    {
+        get
+        {
+            if (_valuesOwner is null)
+                throw new ObjectDisposedException(nameof(PooledFixedWidthColumnChunk));
+            return _valuesOwner.Memory[.._valueBytes];
+        }
+    }
 
     public void Dispose()
     {

@@ -62,8 +62,18 @@ public sealed class MemoryTable : ITableSource, IColumnarTableSource
             throw new ArgumentException("Batch does not match this table's schema.", nameof(batch));
         VectorChunkLimits.ValidateRowCount(batch.RowCount, Options.StrictVectorChunkRows);
         _batches.Add(batch);
-        if (notifyPersistence)
-            Options.BatchPersistence?.OnBatchAppended(Id, Name, _batches.Count - 1, batch);
+        if (notifyPersistence && Options.BatchPersistence is { } persistence)
+        {
+            try
+            {
+                persistence.OnBatchAppended(Id, Name, _batches.Count - 1, batch);
+            }
+            catch
+            {
+                _batches.RemoveAt(_batches.Count - 1);
+                throw;
+            }
+        }
     }
 
     /// <summary>Reserved for ALTER / schema migration; bumps version so planners invalidate caches.</summary>

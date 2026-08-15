@@ -131,14 +131,7 @@ internal sealed class CompositeJoinKeyComparer : IComparer<CompositeJoinKey>
     }
 
     private static int CompareFixedPart(RainDbType type, ulong xa, ulong xb) =>
-        type switch
-        {
-            RainDbType.Int32 => ((int)(uint)xa).CompareTo((int)(uint)xb),
-            RainDbType.Int64 => ((long)xa).CompareTo((long)xb),
-            RainDbType.Float64 => xa.CompareTo(xb),
-            RainDbType.Boolean => xa.CompareTo(xb),
-            _ => xa.CompareTo(xb),
-        };
+        FixedWidthKeyCompare.ComparePart(type, xa, xb);
 }
 
 internal static class CompositeJoinKeyBuilder
