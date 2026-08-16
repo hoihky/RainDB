@@ -2,7 +2,7 @@
 
 This document explains RainDB’s architecture, core data structures, and execution algorithms. It is written for contributors and advanced integrators who need to reason about behavior beyond the public API.
 
-For hands-on usage, see **[Programming Guide](Programming-Guide.md)**. For release status and SQL surface area, see the root **[README](../README.md)**.
+For hands-on usage, see **[Programming Guide](Programming-Guide.md)**. For release status, see **[Implementation Status](Implementation-Status.md)**. For project overview and vision, see the root **[README](../README.md)**.
 
 ---
 
@@ -16,7 +16,7 @@ RainDB is an **embedded**, **single-process**, **column-oriented** OLAP engine f
 | One physical IR | SQL and (future) LINQ lower to the same `IPhysicalPlan` types. |
 | Vectorized batches | Hot paths iterate `IColumnarBatch` / `IColumnChunk`, not row objects. |
 | Deterministic OLAP order | Parallel morsels merge by **source batch index**; grouped keys are sorted for stable output where applicable. |
-| Testable contracts | `tests/RainDB.Tests` and README SQL subset define expected behavior. |
+| Testable contracts | `tests/RainDB.Tests` and the Programming Guide SQL subset define expected behavior. |
 
 ---
 

@@ -176,7 +176,7 @@ Sequence inside Phase D is suggested; each slice should ship with parser, logica
 - `DATE` / `TIMESTAMP` (store as Int64 epoch or dedicated physical type).
 - Common functions: `COALESCE`, string `LIKE` / `SUBSTRING` as needed for real workloads.
 
-**Phase D exit criteria:** README “strict subset” section updated; sample SQL under `samples/sql/` grows per milestone; test count scales with features.
+**Phase D exit criteria:** Programming Guide section 5.1.1 (strict SQL subset) updated; sample SQL under `samples/sql/` grows per milestone; test count scales with features.
 
 **Phase D out of scope:** Window functions (Phase E), nested struct/array types.
 
@@ -258,7 +258,7 @@ Sequence inside Phase D is suggested; each slice should ship with parser, logica
 | Track | Intent |
 |--------|--------|
 | **Testing** | Golden SQL files, property tests for optimizer rules, larger integration tests for spill and persistence. |
-| **Documentation** | Keep `README.md`, `RainDB-Internals.md`, and this roadmap aligned when phases complete. |
+| **Documentation** | Keep `README.md`, `Implementation-Status.md`, `RainDB-Internals.md`, and this roadmap aligned when phases complete. |
 | **Security** | Fuzz SQL parser; bound work for user SQL in hosted scenarios. |
 
 ---
@@ -292,10 +292,12 @@ Phases **A** and **C** can overlap lightly (mmap helps A on file-backed data), b
 
 ---
 
-## Relationship to existing README phases
+## Relationship to phased implementation plan
 
-| README phase | Roadmap mapping |
-|--------------|-----------------|
+See **[Implementation Status](Implementation-Status.md)** for what is built today and the original Phase 0–5 plan. Mapping:
+
+| Implementation phase | Roadmap mapping |
+|----------------------|-----------------|
 | Phase 0–1 (foundations, read path) | Largely **complete**; Phase A extends Phase 1 |
 | Phase 2 (agg, join, sort) | **Complete** in-memory; Phase A + E2 mature it |
 | Phase 2b (directory persistence) | **MVP complete**; Phase C + F harden it |
@@ -303,4 +305,4 @@ Phases **A** and **C** can overlap lightly (mmap helps A on file-backed data), b
 | Phase 4 (LINQ) | Phase G1 |
 | Phase 5 (durability & stats) | Phase C4, E3, F |
 
-This roadmap does not replace the README; it sequences the next layers of work toward a DuckDB-class *embedded OLAP* engine on .NET, with explicit stopping points so each phase delivers a coherent increment.
+This roadmap sequences the next layers of work toward a DuckDB-class *embedded OLAP* engine on .NET, with explicit stopping points so each phase delivers a coherent increment.

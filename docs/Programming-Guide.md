@@ -2,7 +2,7 @@
 
 This guide teaches how to embed RainDB in a .NET application: create tables, load data, run SQL, read results, use physical plans, and persist data. It assumes .NET 10 and a local clone or project reference to the RainDB solution.
 
-**See also:** [RainDB internals](RainDB-Internals.md) (algorithms and architecture), [README](../README.md) (full SQL subset reference).
+**See also:** [RainDB internals](RainDB-Internals.md) (algorithms and architecture), [README](../README.md) (project overview), this guide (full SQL subset reference below).
 
 ---
 
@@ -193,7 +193,23 @@ await using var result = await engine.ExecuteSqlAsync(
     "SELECT region, amount FROM sales WHERE amount > 0.5");
 ```
 
-RainDB accepts a **single statement** per call (strict subset). See README for full grammar.
+RainDB accepts a **single statement** per call (strict subset). Full grammar:
+
+### 5.1.1 Strict SQL subset (supported today)
+
+Single statement; ASCII identifiers; `SELECT` / `FROM` / optional `WHERE` / optional **`GROUP BY`** / optional **`ORDER BY`** / optional **`LIMIT`**; line comments `--`.
+
+- **Row query**: `SELECT * FROM table` **or** `SELECT col [, col …] FROM table` **[WHERE col op literal]** (conjuncts with **`AND`**). Optional **`ORDER BY col [ASC | DESC] [, …]`** and **`LIMIT n`** (positive integer). **`ORDER BY`** keys: **fixed-width** types or **`Utf8`**. Without **`ORDER BY`**, **`LIMIT`** applies in stable batch/row order. **`ORDER BY` / `LIMIT`** are **not** supported with **`GROUP BY`** or global aggregates in this subset. Table-qualified columns allowed where documented below.
+- **Compare ops**: `=`, `!=` or `<>`, `<`, `<=`, `>`, `>=`.
+- **Literals**: integers, decimals (must include `.` for float literal), `TRUE` / `FALSE` for boolean columns, **single-quoted strings** (escape `''` inside the string) for **UTF-8 column** predicates.
+- **Global aggregate** (single grouping bucket): `SELECT SUM(col) FROM table [WHERE ...]`; `MIN` / `MAX` on **`Float64`** only; **`SUM`** on `Int32` / `Int64` / `Float64`; **`COUNT(*)`** and **`COUNT(col)`** (non-null rows only for `COUNT(col)`). **`SUM` / `MIN` / `MAX`**: when there are **no non-null values** (including **no rows after `WHERE`**), the scalar result is **SQL NULL**, surfaced as **`IAggregateQueryResult.ValueIsNull == true`**. **`COUNT(*)`** on an empty table returns **0**, not NULL.
+- **`GROUP BY`** (single-table): `SELECT … FROM table [WHERE …] GROUP BY col [, col …]` where the **`SELECT`** list may mix **grouping columns** (each must appear in **`GROUP BY`**, matching optional table qualifier against the scanned table) and aggregates (`SUM`, `MIN`, `MAX`, `COUNT`). **`SUM(tbl.col)`**-style qualified arguments are accepted when the qualifier matches the **`FROM`** table. Output column order matches **`SELECT`**. Grouping keys may be **fixed-width** (`Int32`, `Int64`, `Float64`, `Boolean`) or **`Utf8`**. **`COUNT(col)`** allows **`Utf8`** (null-bitmap only). **`SUM`/`MIN`/`MAX`** null semantics per group match SQL (null bits on result columns where applicable).
+- **`INNER JOIN`**: `SELECT … FROM left INNER JOIN right ON left.col = right.col [AND …]` (equi-join keys: same type, **fixed-width or `Utf8`**). Row query: **`SELECT *`** (all left columns then all right, output names `LeftName_col`) **or** explicit **`SELECT L.c, R.d`** with optional qualifiers; ambiguous bare names are rejected.
+- **`INNER JOIN` + `GROUP BY`**: `SELECT … FROM … INNER JOIN … ON … GROUP BY …` is supported. **`GROUP BY`** and non-aggregated **`SELECT`** columns must use **qualified** `table.column` (parser rule). Aggregates may use **`SUM(R.amt)`** or an **unambiguous** bare column name if it appears on only one side. The executor runs the join, then hash-aggregates over the **materialized join rowset** (`GroupedJoinPhysicalPlan`).
+- **`INNER JOIN` + sort / limit**: non-grouped joins may end with **`ORDER BY`** (qualified `table.column`; with an explicit **`SELECT`** list, each sort key must appear in **`SELECT`**) and **`LIMIT`** (`JoinSortTopNPhysicalPlan`).
+- **Not supported**: `HAVING`, subqueries, `DISTINCT`, outer joins, quoted identifiers, expressions in `SELECT`/`WHERE`/`GROUP BY`, **`ORDER BY` / `LIMIT` with `GROUP BY`**, grouping by types other than fixed-width + **`Utf8`**.
+
+**API**: `StrictSqlSubset.ParseLogicalPlan(sql)` and **`StrictSqlSubset.CompilePhysicalPlan(sql, catalog) → IPhysicalPlan`** (scan, sort/top-N, hash aggregate, join, join+sort, or grouped join) for debugging / tools without going through `ISqlCompiler`.
 
 ### 5.2 Examples by result shape
 
@@ -441,7 +457,7 @@ Example scripts: `samples/sql/*.sql` and `samples/RainDB.AnalyticsDemo`.
 | Pitfall | Guidance |
 |---------|----------|
 | Forgetting `await using` on results | Pooled scan output may leak array pool slots. |
-| Expecting full SQL | Use README strict subset; unsupported syntax throws at compile time. |
+| Expecting full SQL | Use section 5.1.1 strict subset; unsupported syntax throws at compile time. |
 | LINQ provider | `DefaultLinqCompiler` is a stub; use SQL or physical plans. |
 | Huge single batch + strict mode | Stay within 64K–1M rows per append when strict is on. |
 | Crash-safe durability | Batch + catalog writes are not WAL-journaled yet; plan for export snapshots. |
