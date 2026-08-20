@@ -2,7 +2,7 @@
 
 This document explains RainDB’s architecture, core data structures, and execution algorithms. It is written for contributors and advanced integrators who need to reason about behavior beyond the public API.
 
-For hands-on usage, see **[Programming Guide](Programming-Guide.md)**. For release status, see **[Implementation Status](Implementation-Status.md)**. For project overview and vision, see the root **[README](../README.md)**.
+For hands-on usage, see **[Programming Guide](Programming-Guide.md)**. For release status, see **[Implementation Status](Implementation-Status.md)**. For project overview and vision, see **[RainDB overview](index.html)**.
 
 ---
 

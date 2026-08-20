@@ -1,0 +1,569 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Development Roadmap · RainDB</title>
+  <meta name="description" content="Embedded columnar OLAP database engine for .NET">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/css/site.css">
+  <link rel="stylesheet" href="assets/vendor/atom-one-dark.min.css">
+</head>
+<body>
+  <div class="site">
+    <header class="topbar">
+      <button class="sidebar-toggle" id="sidebar-toggle" aria-label="Toggle navigation">☰</button>
+      <a href="index.html" class="brand">RainDB</a>
+      <nav class="topbar-nav" aria-label="Primary">
+        <a href="index.html">Overview</a>
+        <a href="Programming-Guide.html">Programming Guide</a>
+        <a href="RainDB-Internals.html">Internals</a>
+        <a href="https://github.com/hoihky/RainDB" target="_blank" rel="noopener">GitHub</a>
+      </nav>
+      <div class="search-wrap">
+        <input type="search" id="search" placeholder="Search docs…" autocomplete="off">
+      </div>
+    </header>
+
+    <div class="layout">
+      <aside class="sidebar" id="sidebar">
+        <nav class="nav" aria-label="Documentation">
+          <ul class="nav-list">
+            <li class="nav-item depth-0">
+              <a href="index.html" class="nav-link">Overview</a>
+            </li>
+            <li class="nav-item depth-0 is-active">
+                          
+                            <a href="Development-Roadmap.html" class="nav-link">Development Roadmap</a>
+                            
+                        </li>
+                        
+                        <li class="nav-item depth-0">
+                          
+                            <a href="Implementation-Status.html" class="nav-link">Implementation Status</a>
+                            
+                        </li>
+                        
+                        <li class="nav-item depth-0">
+                          
+                            <a href="Programming-Guide.html" class="nav-link">Programming Guide</a>
+                            
+                        </li>
+                        
+                        <li class="nav-item depth-0">
+                          
+                            <a href="RainDB-Internals.html" class="nav-link">RainDB Internals</a>
+                            
+                        </li>
+                        
+          </ul>
+        </nav>
+      </aside>
+
+      <main class="content">
+        <article class="doc">
+          <header class="doc-header">
+            <h1>Development Roadmap</h1>
+          </header>
+          <div class="doc-body"><h1 id="raindb-development-roadmap">RainDB development roadmap</h1>
+<p>This roadmap turns the DuckDB-class gap analysis into a sequenced plan for RainDB. It assumes the current baseline: columnar in-memory storage, strict SQL subset, vectorized scan, hash aggregation, inner joins, sort/limit, and directory-backed batch persistence (hydrate-to-RAM).</p>
+<p><strong>Guiding principles</strong> (unchanged from the product direction):</p>
+<ul>
+<li>One physical-plan IR for SQL, LINQ, and programmatic planners.</li>
+<li>Columnar batches as the unit of parallel work (morsels).</li>
+<li>Deterministic OLAP ordering where semantics require it.</li>
+<li>Minimize allocations and copies on hot paths; isolate unsafe SIMD behind clear boundaries.</li>
+<li>Expand SQL and storage only when execution and durability foundations can support them.</li>
+</ul>
+<p><strong>How to read this document</strong></p>
+<ul>
+<li><strong>Phases</strong> are ordered by dependency, not calendar time.</li>
+<li><strong>Exit criteria</strong> describe when a phase is “done enough” to start the next without rework.</li>
+<li><strong>Out of scope</strong> for a phase is explicit so scope does not creep.</li>
+</ul>
+<hr>
+<h2 id="phase-a-execution-efficiency-in-memory-core">Phase A — Execution efficiency (in-memory core)</h2>
+<p><strong>Goal:</strong> Make the existing operators fast and memory-safe at scale <em>before</em> adding much new SQL. This is the largest gap versus DuckDB throughput on workloads RainDB already supports.</p>
+<h3 id="a1.vectorized-selection-and-projection-implemented">A1. Vectorized selection and projection — <strong>implemented</strong></h3>
+<ul>
+<li><strong>Selection</strong>: conjunctive <code>WHERE</code> applies the first predicate with fixed-width compare kernels (optional <code>Vector128</code> fast path for null-free <code>Int32</code> equality), then <strong>intersects</strong> dense row-index selection vectors for remaining predicates; UTF-8 literals stay on a dedicated equality path (documented on <code>SelectionEvaluator</code>).</li>
+<li><strong>Projection</strong>: <code>ProjectGather</code> uses <code>IAlignedBufferPool</code> / <code>IBufferPool</code> for fixed-width gathers via <code>PooledFixedWidthColumnChunk</code> (returned on <code>IColumnarQueryResult</code> dispose); full-column copies use a single block copy when no row selection is applied.</li>
+<li><strong>Tests</strong>: <code>VectorizedSelectionPerformanceTests</code> (1M-row correctness + time budget).</li>
+</ul>
+<h3 id="a2.true-top-n-and-sort-discipline">A2. True top-N and sort discipline</h3>
+<ul>
+<li>When <code>ORDER BY</code> + <code>LIMIT</code> are present, use <strong>partial sort / heap top-N</strong> instead of full <code>Array.Sort</code> over all rows.</li>
+<li>Retain full sort only when required (no limit, or sort keys need global order without a small k).</li>
+<li>Document memory bounds: O(n) vs O(k) for limited queries.</li>
+</ul>
+<p><strong>Exit criteria:</strong> <code>ORDER BY … LIMIT k</code> on large tables stays bounded by k and key width, not full row count.</p>
+<h3 id="a3.join-and-grouped-join-memory-model">A3. Join and grouped-join memory model</h3>
+<ul>
+<li>Stream join output where possible (probe-driven batches) instead of materializing <code>List&lt;RowRefMatch&gt;</code> for all matches up front.</li>
+<li>For <code>GroupedJoinPhysicalPlan</code>, prefer <strong>pipeline or single-pass</strong> strategies (join batches fed into hash agg) before falling back to full ephemeral tables.</li>
+<li>Preserve correct inner-join NULL-key behavior.</li>
+</ul>
+<p><strong>Exit criteria:</strong> Join + <code>GROUP BY</code> workloads on medium cardinality complete without proportional spike in peak RSS vs output size.</p>
+<h3 id="a4.simd-and-native-boundaries">A4. SIMD and native boundaries</h3>
+<ul>
+<li>Extend intrinsics beyond <code>SumFloat64</code>: min/max on <code>Float64</code>, optional integer sum paths, hash combine helpers for fixed-width keys.</li>
+<li>Introduce optional <strong><code>RainDB.Native</code></strong> (or similar) only when C# intrinsics are insufficient; keep <code>AggregateIntrinsics</code>-style entry points in Core.</li>
+</ul>
+<p><strong>Exit criteria:</strong> AVX2 paths are opt-in and tested; scalar fallbacks always available.</p>
+<h3 id="a5.micro-benchmarks">A5. Micro-benchmarks</h3>
+<ul>
+<li>Add <strong>BenchmarkDotNet</strong> projects for scan, filter+project, hash agg, hash join, sort/top-N.</li>
+<li>Record baseline numbers in CI or a documented manual run (no need for perf gates in CI initially).</li>
+</ul>
+<p><strong>Exit criteria:</strong> Repeatable benchmarks exist; at least one “before/after” comparison per A1–A3 change.</p>
+<p><strong>Phase A out of scope:</strong> New SQL constructs, WAL, Parquet, optimizer cost model.</p>
+<hr>
+<h2 id="phase-b-planning-and-compile-once-semantics">Phase B — Planning and compile-once semantics</h2>
+<p><strong>Goal:</strong> Reduce per-query overhead and improve plan quality without a full cost-based optimizer.</p>
+<h3 id="b1.logical-rewrite-rule-based-optimizer-v0">B1. Logical rewrite (rule-based optimizer v0)</h3>
+<ul>
+<li>Single pass (or fixed-point small set) over logical IR:
+<ul>
+<li>Predicate pushdown to scan/join sides.</li>
+<li>Projection pruning (drop unreferenced columns early).</li>
+<li>Limit pushdown where semantics allow.</li>
+</ul>
+</li>
+<li>Keep rules <strong>testable in isolation</strong> (golden logical plans before/after).</li>
+</ul>
+<p><strong>Exit criteria:</strong> Rewrites are applied before binders emit physical plans; tests cover pushdown and pruning.</p>
+<h3 id="b2.physical-choices-heuristics-not-dp">B2. Physical choices (heuristics, not DP)</h3>
+<ul>
+<li>Choose hash vs sort-merge join using simple rules (sorted inputs hint, estimated row counts when stats exist).</li>
+<li>Expose join algorithm in <code>EXPLAIN</code> output.</li>
+</ul>
+<p><strong>Exit criteria:</strong> <code>DefaultSqlCompiler</code> no longer hard-codes hash join only; explain shows the choice.</p>
+<h3 id="b3.prepared-execution">B3. Prepared execution</h3>
+<ul>
+<li><strong>Compile once:</strong> parse + bind + optional rewrite → cached <code>IPhysicalPlan</code> (keyed by SQL text or plan handle).</li>
+<li><strong>Parameter binding:</strong> typed parameters for literals in <code>WHERE</code> (and later expressions).</li>
+<li>Invalidate cache on <code>SchemaVersion</code> / catalog changes.</li>
+</ul>
+<p><strong>Exit criteria:</strong> Second execution of the same prepared statement avoids parse/bind; parameters change results correctly.</p>
+<h3 id="b4.explain-and-introspection">B4. Explain and introspection</h3>
+<ul>
+<li>Structured <code>EXPLAIN</code> (logical + physical) via SQL or API.</li>
+<li>Optional <code>EXPLAIN ANALYZE</code> later hooks into operator timings (can start as no-op timers).</li>
+</ul>
+<p><strong>Exit criteria:</strong> Developers can see physical plan shape and join algorithm without reading binder code.</p>
+<p><strong>Phase B out of scope:</strong> Histogram-based join ordering, adaptive re-optimization mid-query.</p>
+<hr>
+<h2 id="phase-c-storage-io-and-memory-budget">Phase C — Storage, I/O, and memory budget</h2>
+<p><strong>Goal:</strong> Stop treating durability and analytics storage as “load everything into <code>MemoryTable</code> byte arrays.”</p>
+<h3 id="c1.mmap-first-column-segments">C1. mmap-first column segments</h3>
+<ul>
+<li>Wire <strong><code>ColumnarFixedWidthMmapReader</code></strong> (and file format writers) into table storage as first-class <code>IColumnChunk</code> implementations.</li>
+<li>Hydration path: map batch files instead of <code>File.ReadAllBytes</code> where format allows.</li>
+<li>Scan engine reads through mapped spans without an extra copy.</li>
+</ul>
+<p><strong>Exit criteria:</strong> File-backed tables query with mmap chunks; persistence round-trip tests pass.</p>
+<h3 id="c2.buffer-manager-v0">C2. Buffer manager v0</h3>
+<ul>
+<li>Central policy for mapped regions, pin/unpin, and optional memory cap.</li>
+<li>Eviction policy can be naive (LRU per table) initially.</li>
+</ul>
+<p><strong>Exit criteria:</strong> Configurable memory budget; behavior documented when exceeded (fail or evict cold batches).</p>
+<h3 id="c3.column-encodings-read-path-first">C3. Column encodings (read path first)</h3>
+<ul>
+<li>Dictionary encoding and/or lightweight integer compression for suitable columns on <strong>write</strong>.</li>
+<li>Transparent decode in scan or lazy decode per vector.</li>
+</ul>
+<p><strong>Exit criteria:</strong> At least one encoding round-trips through batch codec; scan correctness tests green.</p>
+<h3 id="c4.durability-hardening-pre-wal">C4. Durability hardening (pre-WAL)</h3>
+<ul>
+<li>Atomic catalog updates (write temp + rename).</li>
+<li>Defined ordering: batch durable before catalog references it (or reverse with recovery rules).</li>
+<li>Document crash recovery behavior.</li>
+</ul>
+<p><strong>Exit criteria:</strong> Documented recovery story; tests simulate crash between catalog and batch writes.</p>
+<p><strong>Phase C out of scope:</strong> Full WAL/MVCC (Phase F).</p>
+<hr>
+<h2 id="phase-d-sql-and-analytics-surface">Phase D — SQL and analytics surface</h2>
+<p><strong>Goal:</strong> Cover common BI/OLAP queries while execution can handle them efficiently (Phases A–B).</p>
+<p>Sequence inside Phase D is suggested; each slice should ship with parser, logical IR, binder, physical plan, and tests.</p>
+<h3 id="d1.scalar-expressions">D1. Scalar expressions</h3>
+<ul>
+<li>Arithmetic, comparisons, <code>CASE</code>, casts between supported types in <code>SELECT</code>, <code>WHERE</code>, and eventually <code>GROUP BY</code> keys.</li>
+</ul>
+<h3 id="d2.aggregates-and-grouping-polish">D2. Aggregates and grouping polish</h3>
+<ul>
+<li><code>MIN</code> / <code>MAX</code> on all numeric types and UTF-8 (with defined ordering).</li>
+<li><code>AVG</code>, <code>SUM</code> null semantics already partially there — align with SQL for grouped queries.</li>
+<li><code>HAVING</code> (filter after aggregation).</li>
+<li><code>SELECT DISTINCT</code> / <code>COUNT(DISTINCT)</code> (may require new physical operators).</li>
+</ul>
+<h3 id="d3.joins-and-set-operations">D3. Joins and set operations</h3>
+<ul>
+<li><code>LEFT</code> / <code>RIGHT</code> / <code>FULL</code> outer joins (null-padding semantics).</li>
+<li><code>UNION ALL</code> / <code>UNION</code> (distinct union needs extra operator).</li>
+</ul>
+<h3 id="d4.subqueries">D4. Subqueries</h3>
+<ul>
+<li><code>IN</code>, <code>EXISTS</code>, correlated patterns — start with uncorrelated subqueries in <code>WHERE</code> and <code>FROM</code>.</li>
+</ul>
+<h3 id="d5.sortgroup-interactions">D5. Sort/group interactions</h3>
+<ul>
+<li><code>ORDER BY</code> / <code>LIMIT</code> with <code>GROUP BY</code> (legal SQL shapes only after semantics are clear).</li>
+</ul>
+<h3 id="d6.types-and-functions">D6. Types and functions</h3>
+<ul>
+<li><code>DATE</code> / <code>TIMESTAMP</code> (store as Int64 epoch or dedicated physical type).</li>
+<li>Common functions: <code>COALESCE</code>, string <code>LIKE</code> / <code>SUBSTRING</code> as needed for real workloads.</li>
+</ul>
+<p><strong>Phase D exit criteria:</strong> Programming Guide section 5.1.1 (strict SQL subset) updated; sample SQL under <code>samples/sql/</code> grows per milestone; test count scales with features.</p>
+<p><strong>Phase D out of scope:</strong> Window functions (Phase E), nested struct/array types.</p>
+<hr>
+<h2 id="phase-e-advanced-analytics-operators">Phase E — Advanced analytics operators</h2>
+<p><strong>Goal:</strong> Features that define “serious OLAP” after the SQL core is usable.</p>
+<h3 id="e1.window-functions">E1. Window functions</h3>
+<ul>
+<li><code>ROW_NUMBER</code>, <code>RANK</code>, <code>SUM() OVER (PARTITION BY … ORDER BY …)</code> with framing rules (start with default frame).</li>
+</ul>
+<h3 id="e2.external-spill-real">E2. External spill (real)</h3>
+<ul>
+<li>Extend <code>ISpillWriter</code> to partition and merge <strong>aggregate and join</strong> state, not only metrics JSON.</li>
+<li>Grace hash join and external hash aggregation under memory pressure.</li>
+</ul>
+<h3 id="e3.statistics">E3. Statistics</h3>
+<ul>
+<li><code>ANALYZE table</code>: row counts, NDV, min/max per column; optional histograms.</li>
+<li>Feed Phase B heuristics and join ordering improvements.</li>
+</ul>
+<h3 id="e4.adaptive-execution-optional">E4. Adaptive execution (optional)</h3>
+<ul>
+<li>Runtime feedback (cardinality mis-estimates) to pick spill or join strategy on retry — only after E2 and E3 exist.</li>
+</ul>
+<p><strong>Phase E exit criteria:</strong> Queries that exceed RAM complete via spill with correct results; analyze improves plans on skewed join tests.</p>
+<hr>
+<h2 id="phase-f-production-durability-and-concurrency">Phase F — Production durability and concurrency</h2>
+<p><strong>Goal:</strong> Embedded database semantics suitable for long-lived processes and concurrent readers.</p>
+<h3 id="f1.wal-checkpoint">F1. WAL + checkpoint</h3>
+<ul>
+<li>Append-only log for batch/catalog changes; periodic checkpoint to segment files.</li>
+<li>Recovery on open.</li>
+</ul>
+<h3 id="f2.mvcc-or-snapshot-reads-analytics-oriented">F2. MVCC or snapshot reads (analytics-oriented)</h3>
+<ul>
+<li>Readers see consistent snapshot; writers append new versions without blocking long scans (scope TBD: single-writer multi-reader is a reasonable first target).</li>
+</ul>
+<h3 id="f3.observability">F3. Observability</h3>
+<ul>
+<li><code>ActivitySource</code> for compile and execute.</li>
+<li>Slow-query threshold, structured plan logging.</li>
+</ul>
+<p><strong>Phase F exit criteria:</strong> Crash during write recovers to last committed state; documented concurrency model.</p>
+<hr>
+<h2 id="phase-g-ecosystem-and-host-integration">Phase G — Ecosystem and host integration</h2>
+<p><strong>Goal:</strong> Meet .NET developers where they work.</p>
+<h3 id="g1.linq-provider">G1. LINQ provider</h3>
+<ul>
+<li><code>DefaultLinqCompiler</code> lowers <code>IQueryable</code> to the <strong>same logical IR</strong> as SQL (Where, Select, GroupBy, Join).</li>
+<li>Clear <code>LinqCompileException</code> for unsupported patterns.</li>
+</ul>
+<h3 id="g2.ingest-and-interchange">G2. Ingest and interchange</h3>
+<ul>
+<li><strong>CSV</strong> and <strong>Parquet</strong> table functions or <code>COPY</code>-style load into <code>MemoryTable</code> / persistent tables.</li>
+<li>Arrow IPC interop (optional; aligns with UTF-8 chunk layouts).</li>
+</ul>
+<h3 id="g3.api-stability">G3. API stability</h3>
+<ul>
+<li>Version physical plan and on-disk formats once logical IR stabilizes after Phase D.</li>
+<li>Migration notes between format versions.</li>
+</ul>
+<p><strong>Phase G exit criteria:</strong> End-to-end demo: load Parquet → SQL aggregate → persistent store → reopen.</p>
+<hr>
+<h2 id="cross-cutting-work-all-phases">Cross-cutting work (all phases)</h2>
+<table class="table">
+<thead>
+<tr>
+<th>Track</th>
+<th>Intent</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Testing</strong></td>
+<td>Golden SQL files, property tests for optimizer rules, larger integration tests for spill and persistence.</td>
+</tr>
+<tr>
+<td><strong>Documentation</strong></td>
+<td>Keep <code>README.md</code>, <code>Implementation-Status.md</code>, <code>RainDB-Internals.md</code>, and this roadmap aligned when phases complete.</td>
+</tr>
+<tr>
+<td><strong>Security</strong></td>
+<td>Fuzz SQL parser; bound work for user SQL in hosted scenarios.</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="dependency-overview">Dependency overview</h2>
+<pre><code class="language-text">Phase A (fast in-memory ops)
+    ↓
+Phase B (rewrite + prepared plans) ──→ Phase D (more SQL) ──→ Phase E (windows + spill + stats)
+    ↓                                      ↑
+Phase C (mmap + encodings + durability) ───┘
+    ↓
+Phase F (WAL / MVCC)
+    ↓
+Phase G (LINQ + formats + API stability)
+</code></pre>
+<p>Phases <strong>A</strong> and <strong>C</strong> can overlap lightly (mmap helps A on file-backed data), but <strong>D</strong> should not run far ahead of <strong>A</strong> for heavy operators (join/sort/agg), or new SQL will only expose performance debt.</p>
+<hr>
+<h2 id="suggested-success-metrics-product-level">Suggested success metrics (product-level)</h2>
+<table class="table">
+<thead>
+<tr>
+<th>Milestone</th>
+<th>Indicator</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Embedded analytics MVP</td>
+<td>Prepared SQL + top-N + mmap scans on 100M rows within a configurable RAM budget</td>
+</tr>
+<tr>
+<td>BI-shaped SQL</td>
+<td>Expressions, <code>HAVING</code>, outer joins, <code>UNION ALL</code> with tests</td>
+</tr>
+<tr>
+<td>Large RAM exceedance</td>
+<td>Spilling hash agg/join passes correctness suite on synthetic “bigger than RAM” cases</td>
+</tr>
+<tr>
+<td>Production embed</td>
+<td>WAL recovery + single-writer / multi-reader documented and tested</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="relationship-to-phased-implementation-plan">Relationship to phased implementation plan</h2>
+<p>See <strong><a href="Implementation-Status.html">Implementation Status</a></strong> for what is built today and the original Phase 0–5 plan. Mapping:</p>
+<table class="table">
+<thead>
+<tr>
+<th>Implementation phase</th>
+<th>Roadmap mapping</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Phase 0–1 (foundations, read path)</td>
+<td>Largely <strong>complete</strong>; Phase A extends Phase 1</td>
+</tr>
+<tr>
+<td>Phase 2 (agg, join, sort)</td>
+<td><strong>Complete</strong> in-memory; Phase A + E2 mature it</td>
+</tr>
+<tr>
+<td>Phase 2b (directory persistence)</td>
+<td><strong>MVP complete</strong>; Phase C + F harden it</td>
+</tr>
+<tr>
+<td>Phase 3 (planning &amp; SQL)</td>
+<td>Phase B + D</td>
+</tr>
+<tr>
+<td>Phase 4 (LINQ)</td>
+<td>Phase G1</td>
+</tr>
+<tr>
+<td>Phase 5 (durability &amp; stats)</td>
+<td>Phase C4, E3, F</td>
+</tr>
+</tbody>
+</table>
+<p>This roadmap sequences the next layers of work toward a DuckDB-class <em>embedded OLAP</em> engine on .NET, with explicit stopping points so each phase delivers a coherent increment.</p>
+</div>
+          <footer class="doc-footer">
+            <p><a href="index.html">RainDB home</a> · <a href="https://github.com/hoihky/RainDB" target="_blank" rel="noopener">GitHub</a> · MIT License</p>
+          </footer>
+        </article>
+
+        
+                <aside class="toc" aria-label="On this page">
+                  <p class="toc-title">On this page</p>
+                  <ul>
+                    
+                        <li class="toc-h1">
+                          <a href="#raindb-development-roadmap">RainDB development roadmap</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#phase-a-execution-efficiency-in-memory-core">Phase A — Execution efficiency (in-memory core)</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#a1-vectorized-selection-and-projection-implemented">A1. Vectorized selection and projection — implemented</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#a2-true-top-n-and-sort-discipline">A2. True top-N and sort discipline</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#a3-join-and-grouped-join-memory-model">A3. Join and grouped-join memory model</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#a4-simd-and-native-boundaries">A4. SIMD and native boundaries</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#a5-micro-benchmarks">A5. Micro-benchmarks</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#phase-b-planning-and-compile-once-semantics">Phase B — Planning and compile-once semantics</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#b1-logical-rewrite-rule-based-optimizer-v0">B1. Logical rewrite (rule-based optimizer v0)</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#b2-physical-choices-heuristics-not-dp">B2. Physical choices (heuristics, not DP)</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#b3-prepared-execution">B3. Prepared execution</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#b4-explain-and-introspection">B4. Explain and introspection</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#phase-c-storage-io-and-memory-budget">Phase C — Storage, I/O, and memory budget</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#c1-mmap-first-column-segments">C1. mmap-first column segments</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#c2-buffer-manager-v0">C2. Buffer manager v0</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#c3-column-encodings-read-path-first">C3. Column encodings (read path first)</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#c4-durability-hardening-pre-wal">C4. Durability hardening (pre-WAL)</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#phase-d-sql-and-analytics-surface">Phase D — SQL and analytics surface</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#d1-scalar-expressions">D1. Scalar expressions</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#d2-aggregates-and-grouping-polish">D2. Aggregates and grouping polish</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#d3-joins-and-set-operations">D3. Joins and set operations</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#d4-subqueries">D4. Subqueries</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#d5-sortgroup-interactions">D5. Sort/group interactions</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#d6-types-and-functions">D6. Types and functions</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#phase-e-advanced-analytics-operators">Phase E — Advanced analytics operators</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#e1-window-functions">E1. Window functions</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#e2-external-spill-real">E2. External spill (real)</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#e3-statistics">E3. Statistics</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#e4-adaptive-execution-optional">E4. Adaptive execution (optional)</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#phase-f-production-durability-and-concurrency">Phase F — Production durability and concurrency</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#f1-wal-checkpoint">F1. WAL + checkpoint</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#f2-mvcc-or-snapshot-reads-analytics-oriented">F2. MVCC or snapshot reads (analytics-oriented)</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#f3-observability">F3. Observability</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#phase-g-ecosystem-and-host-integration">Phase G — Ecosystem and host integration</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#g1-linq-provider">G1. LINQ provider</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#g2-ingest-and-interchange">G2. Ingest and interchange</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#g3-api-stability">G3. API stability</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#cross-cutting-work-all-phases">Cross-cutting work (all phases)</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#dependency-overview">Dependency overview</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#suggested-success-metrics-product-level">Suggested success metrics (product-level)</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#relationship-to-phased-implementation-plan">Relationship to phased implementation plan</a>
+                        </li>
+                        
+                  </ul>
+                </aside>
+                
+      </main>
+    </div>
+  </div>
+  <script src="assets/vendor/mermaid.min.js"></script>
+  <script src="assets/vendor/highlight.min.js"></script>
+  <script src="assets/js/site.js"></script>
+</body>
+</html>

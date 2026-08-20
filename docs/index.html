@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RainDB — Embedded columnar OLAP for .NET</title>
+  <meta name="description" content="RainDB is an embedded columnar analytics database engine for .NET — vectorized execution, SQL over a shared physical-plan IR, DuckDB-inspired goals without leaving the runtime.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/css/site.css">
+</head>
+<body>
+  <div class="site">
+    <header class="topbar">
+      <a href="index.html" class="brand">RainDB</a>
+      <nav class="topbar-nav" aria-label="Primary">
+        <a href="index.html" class="is-active">Overview</a>
+        <a href="Programming-Guide.html">Programming Guide</a>
+        <a href="RainDB-Internals.html">Internals</a>
+        <a href="https://github.com/hoihky/RainDB" target="_blank" rel="noopener">GitHub</a>
+      </nav>
+    </header>
+
+    <main class="portfolio-layout">
+      <div class="portfolio-main">
+        
+
+        <section class="hero" id="top">
+          <div class="docs-hero-icon" aria-hidden="true">RD</div>
+          <div class="hero-text">
+            <h1>RainDB</h1>
+            <p class="hero-tagline">
+              Embedded <strong>OLAP-oriented</strong> database engine for .NET — columnar analytics,
+              single-process, low latency. SQL (and planned LINQ) compile to a shared physical-plan
+              intermediate representation, inspired by DuckDB’s embedded analytics model without
+              leaving the .NET ecosystem.
+            </p>
+            <div class="hero-links">
+              <a href="Programming-Guide.html">Programming Guide →</a>
+              <a href="#architecture">Architecture</a>
+              <a href="#features">Features</a>
+              <a href="https://github.com/hoihky/RainDB" target="_blank" rel="noopener">GitHub ↗</a>
+            </div>
+          </div>
+        </section>
+        <div class="disclaimer-banner" role="note">
+          <strong>Disclaimer</strong>
+          RainDB is an experimental, work-in-progress prototype built with the help of “vibe coding”.
+          Things will break. Features are missing, build scripts may not work, and the engine is
+          <strong>not stable enough for production use</strong> today. Treat APIs, on-disk formats,
+          and SQL semantics as subject to change.
+        </div>
+
+        <section id="purpose">
+          <h2 class="section-title">Purpose &amp; objectives</h2>
+          <p class="about-body">
+            .NET has excellent row-oriented databases and cloud analytics platforms, but no mature
+            <strong>embedded columnar OLAP engine</strong> that feels native to the runtime.
+            RainDB fills that gap for services that aggregate telemetry, desktop tools that crunch
+            local datasets, edge nodes that summarize events, and prototypes that should not depend
+            on an external database server.
+          </p>
+          <div class="career-grid">
+            <article class="career-card">
+              <h3>Why columnar?</h3>
+              <p>
+                Analytical workloads dominate memory bandwidth and CPU vector units. RainDB keeps
+                hot paths on columnar batches and chunks — not row objects — so scans, filters, and
+                aggregates can be vectorized and parallelized at morsel granularity.
+              </p>
+            </article>
+            <article class="career-card">
+              <h3>One query IR</h3>
+              <p>
+                SQL and (roadmap) LINQ lower to the same logical and physical plans. Application
+                developers, SQL authors, and contributors optimizing operators all share one
+                execution model instead of divergent translation paths.
+              </p>
+            </article>
+            <article class="career-card">
+              <h3>Production vision</h3>
+              <p>
+                The target end state is a DuckDB-class embedded OLAP engine: prepared SQL, spill
+                when RAM is exceeded, mmap-first storage, WAL + checkpoint, statistics-informed
+                plans, and enough observability to run inside a real .NET service.
+              </p>
+            </article>
+          </div>
+        </section>
+
+        <section id="architecture">
+          <h2 class="section-title">High-level architecture</h2>
+          <p class="section-lead">
+            RainDB follows layered modules with dependencies pointing inward — contracts at the
+            center, storage and execution in the middle, SQL/LINQ front ends and the driver on top.
+          </p>
+          <div class="arch-stack" aria-label="Solution layers">
+            <div class="arch-layer">
+              <strong>RainDB (Driver)</strong>
+              <span><code>RainDbEngine</code> composition root — catalog, pools, compilers, executor</span>
+            </div>
+            <div class="arch-arrow" aria-hidden="true">▼</div>
+            <div class="arch-layer">
+              <strong>Front ends</strong>
+              <span><code>RainDB.Sql</code> · <code>RainDB.Linq</code> (stub) → <code>IPhysicalPlan</code></span>
+            </div>
+            <div class="arch-arrow" aria-hidden="true">▼</div>
+            <div class="arch-layer">
+              <strong>RainDB.Query</strong>
+              <span>Physical plans · vectorized engines · <code>DefaultQueryExecutor</code></span>
+            </div>
+            <div class="arch-arrow" aria-hidden="true">▼</div>
+            <div class="arch-layer">
+              <strong>RainDB.Core</strong>
+              <span><code>MemoryTable</code> · column chunks · buffer pools · <code>RainDbFileDatabase</code></span>
+            </div>
+            <div class="arch-arrow" aria-hidden="true">▲ implements</div>
+            <div class="arch-layer">
+              <strong>RainDB.Abstractions</strong>
+              <span><code>ICatalog</code> · <code>IColumnChunk</code> · logical IR · execution contracts</span>
+            </div>
+          </div>
+          <table class="ebook-table">
+            <thead>
+              <tr>
+                <th>Project</th>
+                <th>Responsibility</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><strong>RainDB.Abstractions</strong></td>
+                <td>Catalog, columnar model, execution interfaces, logical IR, SQL/LINQ compiler contracts</td>
+              </tr>
+              <tr>
+                <td><strong>RainDB.Core</strong></td>
+                <td><code>MemoryTable</code>, chunk implementations, aligned buffers, mmap I/O, file persistence</td>
+              </tr>
+              <tr>
+                <td><strong>RainDB.Query</strong></td>
+                <td>Physical plans, vectorized scan/filter/project, hash agg, joins, sort/top-N, query results</td>
+              </tr>
+              <tr>
+                <td><strong>RainDB.Sql</strong></td>
+                <td>Lexer, parser, binders, <code>DefaultSqlCompiler</code>, strict SQL subset</td>
+              </tr>
+              <tr>
+                <td><strong>RainDB.Linq</strong></td>
+                <td>Expression trees → physical plans (stub today; shared IR on roadmap)</td>
+              </tr>
+              <tr>
+                <td><strong>RainDB (Driver)</strong></td>
+                <td><code>RainDbEngine.CreateDefault</code>, <code>OpenPersistent</code>, <code>ExecuteSqlAsync</code></td>
+              </tr>
+            </tbody>
+          </table>
+        </section>
+
+        <section id="mechanism">
+          <h2 class="section-title">Query execution mechanism</h2>
+          <p class="section-lead">
+            A query moves through compile-time lowering and runtime vectorized execution. Parallel
+            work is scheduled per <strong>morsel</strong> (one source batch); results merge in
+            deterministic batch order for OLAP semantics.
+          </p>
+          <ol class="pipeline-list">
+            <li>
+              <strong>SQL text</strong>
+              <span>Hand-written lexer/parser accepts a strict subset (SELECT, FROM, WHERE, GROUP BY, JOIN, ORDER BY, LIMIT).</span>
+            </li>
+            <li>
+              <strong>Logical IR</strong>
+              <span>Relational-shaped plan: table scans, filters, aggregates, join keys — no buffer or execution details.</span>
+            </li>
+            <li>
+              <strong>Binding</strong>
+              <span>Resolve catalog names to column ordinals; validate types; emit <code>ColumnCompareFilter</code> and plan shape.</span>
+            </li>
+            <li>
+              <strong>Physical plan</strong>
+              <span><code>VectorizedScanPhysicalPlan</code>, <code>HashAggregatePhysicalPlan</code>, <code>JoinPhysicalPlan</code>, <code>SortTopNPhysicalPlan</code>, …</span>
+            </li>
+            <li>
+              <strong>Vectorized engines</strong>
+              <span>Selection vectors + gather projection; hash aggregation; hash/sort-merge join; sort/limit over row locations.</span>
+            </li>
+            <li>
+              <strong>Columnar results</strong>
+              <span><code>IColumnarQueryResult</code> or <code>IAggregateQueryResult</code>; pooled buffers returned on dispose.</span>
+            </li>
+          </ol>
+          <p class="about-body">
+            Storage is column-oriented: each batch holds one chunk per table column (fixed-width
+            little-endian values or UTF-8 Arrow/length-prefixed layouts). Optional directory-backed
+            persistence writes <code>catalog.json</code> and <code>tables/{id}/*.batch</code> segments
+            on append — an MVP snapshot model, not yet a WAL.
+          </p>
+        </section>
+
+        <section id="features">
+          <h2 class="section-title">Features (today)</h2>
+          <p class="section-lead">
+            Early prototype on the path to production embedded OLAP. See
+            <a href="Implementation-Status.html">Implementation Status</a> and
+            <a href="Development-Roadmap.html">Development Roadmap</a> for detail.
+          </p>
+          <div class="feature-grid">
+            <article class="feature-card">
+              <h3>Columnar storage</h3>
+              <p>Fixed-width and UTF-8 chunks, nullable bitmaps, 64K–1M row batch sizing, in-memory <code>MemoryTable</code> and catalog with schema versioning.</p>
+            </article>
+            <article class="feature-card">
+              <h3>Vectorized read path</h3>
+              <p>Scan, filter, project, global and grouped aggregates, inner equi-joins (hash and sort-merge), ORDER BY / LIMIT on supported shapes.</p>
+            </article>
+            <article class="feature-card">
+              <h3>Strict SQL subset</h3>
+              <p>Parser/compiler for SELECT / FROM / WHERE / GROUP BY / INNER JOIN / ORDER BY / LIMIT with documented limits — full grammar in the Programming Guide.</p>
+            </article>
+            <article class="feature-card">
+              <h3>Morsel parallelism</h3>
+              <p><code>Parallel.For</code> or channel-scheduled workers over batches; deterministic merge by source batch index.</p>
+            </article>
+            <article class="feature-card">
+              <h3>Persistence MVP</h3>
+              <p><code>RainDbEngine.OpenPersistent</code>, export/import catalog snapshots, replace-on-write batch files under a data directory.</p>
+            </article>
+            <article class="feature-card">
+              <h3>SIMD hooks</h3>
+              <p>Optional AVX2 double sum; aligned buffer pool (32-byte) for gather projection; mmap reader for fixed-width column files.</p>
+            </article>
+          </div>
+        </section>
+
+        <section id="docs">
+          <h2 class="section-title">Documentation</h2>
+          <p class="section-lead">
+            Markdown sources live alongside these HTML pages in the repository <code>docs/</code> folder.
+          </p>
+          <table class="ebook-table doc-links-table">
+            <thead>
+              <tr>
+                <th>Guide</th>
+                <th>Description</th>
+                <th>Read</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Programming Guide</td>
+                <td>Embed <code>RainDbEngine</code>, create tables, run SQL, read results, persistence workflows</td>
+                <td><a href="Programming-Guide.html">Read online</a></td>
+              </tr>
+              <tr>
+                <td>RainDB Internals</td>
+                <td>Architecture, columnar model, selection vectors, hash agg, joins, SQL compilation pipeline</td>
+                <td><a href="RainDB-Internals.html">Read online</a></td>
+              </tr>
+              <tr>
+                <td>Implementation Status</td>
+                <td>What is implemented today and the phased delivery plan (Phases 0–5)</td>
+                <td><a href="Implementation-Status.html">Read online</a></td>
+              </tr>
+              <tr>
+                <td>Development Roadmap</td>
+                <td>Forward-looking sequencing toward production (execution, SQL, storage, WAL, LINQ)</td>
+                <td><a href="Development-Roadmap.html">Read online</a></td>
+              </tr>
+            </tbody>
+          </table>
+
+          <div class="cta-card">
+            <h3>Quick start</h3>
+            <p>Build the solution, run tests, and try the analytics demo:</p>
+            <pre><code>cd RainDB
+dotnet build RainDB.slnx
+dotnet test RainDB.slnx
+dotnet run --project samples/RainDB.AnalyticsDemo</code></pre>
+            <p><a href="Programming-Guide.html">Continue with the Programming Guide →</a></p>
+          </div>
+        </section>
+
+        <footer class="site-footer">
+          <p>
+            <a href="https://github.com/hoihky/RainDB" target="_blank" rel="noopener">GitHub</a>
+            · MIT License
+            · Docs generated with <a href="https://github.com/hoihky/MDWeb" target="_blank" rel="noopener">MDWeb</a>
+          </p>
+        </footer>
+      </div>
+
+      <aside class="toc" aria-label="On this page">
+        <p class="toc-title">On this page</p>
+        <ul>
+          <li><a href="#top">Overview</a></li>
+          <li><a href="#purpose">Purpose</a></li>
+          <li><a href="#architecture">Architecture</a></li>
+          <li><a href="#mechanism">Execution</a></li>
+          <li><a href="#features">Features</a></li>
+          <li><a href="#docs">Documentation</a></li>
+        </ul>
+      </aside>
+    </main>
+  </div>
+</body>
+</html>

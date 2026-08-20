@@ -117,6 +117,7 @@ Architecture and algorithms are documented in **[RainDB Internals](docs/RainDB-I
 
 | Guide | Description |
 |-------|-------------|
+| [RainDB docs site](docs/index.html) | Web overview, architecture intro, and HTML documentation |
 | [Programming Guide](docs/Programming-Guide.md) | Using `RainDbEngine`, tables, SQL, results, and persistence |
 | [RainDB Internals](docs/RainDB-Internals.md) | Architecture, algorithms, and data structures |
 | [Implementation Status](docs/Implementation-Status.md) | What is implemented and the phased delivery plan |

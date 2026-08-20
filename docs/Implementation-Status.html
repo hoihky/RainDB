@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Implementation Status · RainDB</title>
+  <meta name="description" content="Embedded columnar OLAP database engine for .NET">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/css/site.css">
+  <link rel="stylesheet" href="assets/vendor/atom-one-dark.min.css">
+</head>
+<body>
+  <div class="site">
+    <header class="topbar">
+      <button class="sidebar-toggle" id="sidebar-toggle" aria-label="Toggle navigation">☰</button>
+      <a href="index.html" class="brand">RainDB</a>
+      <nav class="topbar-nav" aria-label="Primary">
+        <a href="index.html">Overview</a>
+        <a href="Programming-Guide.html">Programming Guide</a>
+        <a href="RainDB-Internals.html">Internals</a>
+        <a href="https://github.com/hoihky/RainDB" target="_blank" rel="noopener">GitHub</a>
+      </nav>
+      <div class="search-wrap">
+        <input type="search" id="search" placeholder="Search docs…" autocomplete="off">
+      </div>
+    </header>
+
+    <div class="layout">
+      <aside class="sidebar" id="sidebar">
+        <nav class="nav" aria-label="Documentation">
+          <ul class="nav-list">
+            <li class="nav-item depth-0">
+              <a href="index.html" class="nav-link">Overview</a>
+            </li>
+            <li class="nav-item depth-0">
+                          
+                            <a href="Development-Roadmap.html" class="nav-link">Development Roadmap</a>
+                            
+                        </li>
+                        
+                        <li class="nav-item depth-0 is-active">
+                          
+                            <a href="Implementation-Status.html" class="nav-link">Implementation Status</a>
+                            
+                        </li>
+                        
+                        <li class="nav-item depth-0">
+                          
+                            <a href="Programming-Guide.html" class="nav-link">Programming Guide</a>
+                            
+                        </li>
+                        
+                        <li class="nav-item depth-0">
+                          
+                            <a href="RainDB-Internals.html" class="nav-link">RainDB Internals</a>
+                            
+                        </li>
+                        
+          </ul>
+        </nav>
+      </aside>
+
+      <main class="content">
+        <article class="doc">
+          <header class="doc-header">
+            <h1>Implementation Status</h1>
+          </header>
+          <div class="doc-body"><h1 id="implementation-status-and-phased-plan">Implementation status and phased plan</h1>
+<p>This document tracks what RainDB implements today and the original phased delivery plan. For forward-looking sequencing and exit criteria, see <strong><a href="Development-Roadmap.html">Development Roadmap</a></strong>.</p>
+<hr>
+<h2 id="phase-0-foundations-implemented">Phase 0 — Foundations (implemented)</h2>
+<ul>
+<li><strong>Columnar storage model</strong>
+<ul>
+<li>Fixed-width: <code>FixedWidthColumnChunk</code> for <code>Int32</code>, <code>Int64</code>, <code>Float64</code>, <code>Boolean</code> (one byte per bool in P0) with optional packed null bitmap (<code>IColumnChunk</code>).</li>
+<li>UTF-8: <strong><code>Utf8ColumnChunk</code></strong> (Arrow-style <code>offsets[rowCount+1]</code> + blob) <strong>or</strong> <strong><code>Utf8LengthPrefixedColumnChunk</code></strong> (<code>int32</code> little-endian length + UTF-8 bytes per row, prefix index built at construction).</li>
+<li><strong>Vector sizing</strong>: <code>VectorChunkLimits.MinRows</code> = <strong>64K</strong>, <code>MaxRows</code> = <strong>1M</strong>. <code>MemoryTableOptions.StrictVectorChunkRows</code> enforces that every non-empty batch lies in that range (default <strong>off</strong> for small tests / dev).</li>
+</ul>
+</li>
+<li><strong>Buffers</strong>
+<ul>
+<li><code>IBufferPool</code> + <code>ArrayPool&lt;byte&gt;</code> for general rent/return (documented: keep under LOH when possible).</li>
+<li><code>IAlignedBufferPool.RentAligned</code> default alignment <strong><code>SimdAlignment.Vector256</code> (32 bytes)</strong>; minimum accepted alignment is <strong>32</strong> (reject 16). <code>SimdAlignment.CacheLine128</code> (128) available for wider alignment. <code>HybridBufferPool</code> sub-slices a pooled array with <code>Unsafe</code> so the exposed <code>Memory&lt;byte&gt;</code> is aligned.</li>
+</ul>
+</li>
+<li><strong>Catalog + table metadata</strong>
+<ul>
+<li>Stable <strong><code>TableId</code></strong>, <code>ICatalog</code> / <code>InMemoryCatalog</code> resolve by <strong>name</strong> and <strong><code>TableId</code></strong>.</li>
+<li><strong><code>MemoryTable.SchemaVersion</code></strong>, <strong><code>BumpSchemaVersion()</code></strong> (returns new version), and <strong><code>SchemaVersionChanged</code></strong> event (<code>SchemaVersionChangedEventArgs</code>) for planner cache invalidation.</li>
+</ul>
+</li>
+<li><strong>File-backed persistence (MVP)</strong>
+<ul>
+<li>On-disk layout: <strong><code>catalog.json</code></strong> (table ids, names, column types) plus <strong><code>tables/{tableId}/######.batch</code></strong> binary segments (<code>RainDbBatchBinaryCodec</code> v1: fixed-width, Arrow-style UTF-8, length-prefixed UTF-8).</li>
+<li><strong><code>RainDbFileDatabase.Open</code></strong>: hydrates <strong><code>InMemoryCatalog</code></strong>; <strong><code>CreateMemoryTable</code></strong> registers a <strong><code>MemoryTable</code></strong> whose <strong><code>AppendBatch</code></strong> calls mirror each new batch to disk (replace-on-write per file).</li>
+<li><strong><code>RainDbFileDatabase.ExportCatalog</code> / <code>ImportCatalog</code></strong>: snapshot any <strong><code>IColumnarTableSource</code></strong> to a directory, or load into a fresh in-memory catalog (no automatic append mirroring after import).</li>
+<li><strong><code>RainDbEngine.OpenPersistent(path)</code></strong> keeps a live <strong><code>RainDbFileDatabase</code></strong> handle on <strong><code>RainDbEngine.FileDatabase</code></strong> so the sink is not collected. <strong><code>RainDbEngine.CreateDefault(ICatalog)</code></strong> composes the default executor/compiler over an existing catalog (e.g. after import).</li>
+</ul>
+</li>
+</ul>
+<p><strong>Tests</strong>: <code>tests/RainDB.Tests</code> — Phase 0–2 coverage, <strong>hash aggregate / GROUP BY</strong> (<code>SqlGroupByTests</code>, <code>HashAggregatePhysicalTests</code>), <strong>joins</strong> (<code>JoinExecutionTests</code>), <strong>ORDER BY / LIMIT</strong> (<code>SqlOrderByLimitTests</code>), plus <strong>strict SQL subset</strong> (<code>SqlStrictSubsetCompilerTests</code>).</p>
+<hr>
+<h2 id="phase-1-read-path-latency-implemented">Phase 1 — Read path &amp; latency (implemented)</h2>
+<ul>
+<li><strong>Vectorized scan + filter + project</strong>: <code>VectorizedScanPhysicalPlan</code> + <code>VectorizedScanEngine</code> (<code>SelectionEvaluator</code>, <code>ProjectGather</code>), executed by <code>DefaultQueryExecutor</code> when the catalog table implements <code>IColumnarTableSource</code> (e.g. <code>MemoryTable</code>). UTF-8 columns can be projected; <strong><code>WHERE</code></strong> supports UTF-8 columns with <strong><code>=</code> / <code>!=</code> / <code>&lt;&gt;</code></strong> and a <strong>single-quoted string literal</strong> (UTF-8 bytes compared to cell payload).</li>
+<li><strong>Morsel parallelism</strong>: per-batch <code>Parallel.For</code>, or <code>Channel&lt;int&gt;</code>-scheduled workers (<code>UseChannelScheduler</code>); results merged by <strong>batch index</strong> (deterministic OLAP order).</li>
+<li><strong>Aggregates</strong>: <code>AggregateSpec</code> with <code>AggregateKind</code> (<code>Sum</code> on <code>Int32</code>/<code>Int64</code>/<code>Float64</code>; <code>Min</code>/<code>Max</code> on <strong><code>Float64</code></strong> only; <strong><code>Count</code></strong> for <code>COUNT(*)</code> / <code>COUNT(col)</code>). <strong><code>SUM</code>/<code>MIN</code>/<code>MAX</code> SQL NULL</strong>: global aggregate exposed via <code>IAggregateQueryResult.ValueIsNull</code> when no non-null inputs; grouped aggregates use null bits on output chunks. <code>AggregateIntrinsics.SumFloat64</code> supports optional <strong>AVX2</strong> (<code>UseAvx2DoubleSum</code>, no nulls, full column).</li>
+<li><strong>Zero-copy mmap</strong>: <code>ColumnarFixedWidthFileFormat.WriteFile</code> / <code>ColumnarFixedWidthMmapReader</code> — <code>IColumnChunk</code> backed by mapped memory (<code>ReadOnlySpan</code>/<code>ReadOnlyMemory</code> over the file view). Dictionary / RLE / compression called out as later work.</li>
+<li><strong>Strict SQL subset</strong>: hand-written lexer/parser (<code>RainDB.Sql/Parsing</code>), logical IR (<code>RainDB.Logical</code>), binders → <strong><code>IPhysicalPlan</code></strong>: <code>VectorizedScanPhysicalPlan</code>, <strong><code>SortTopNPhysicalPlan</code></strong> (scan + optional <strong><code>ORDER BY</code></strong> / <strong><code>LIMIT</code></strong>), <strong><code>HashAggregatePhysicalPlan</code></strong>, <strong><code>JoinPhysicalPlan</code></strong>, <strong><code>JoinSortTopNPhysicalPlan</code></strong>, <strong><code>GroupedJoinPhysicalPlan</code></strong>. <code>ISqlCompiler.CompileAsync(sql, ICatalog, ...)</code>; <code>RainDbEngine.ExecuteSqlAsync</code>. Example scripts: <code>samples/sql/*.sql</code> (UTF-8 <code>WHERE</code>, <code>AND</code> conjuncts, joins in <code>05_*</code>–<code>07_*</code>; also run from <code>RainDB.AnalyticsDemo</code> via copied <code>sql/</code> folder).</li>
+<li><strong>Driver</strong>: <code>RainDbEngine.ExecutePhysicalAsync(IPhysicalPlan, ...)</code> and <strong><code>ExecuteSqlAsync</code></strong>; <strong><code>OpenPersistent(directory)</code></strong> for file-backed <strong><code>MemoryTable</code></strong> appends; <strong><code>CreateDefault(ICatalog)</code></strong> after <strong><code>RainDbFileDatabase.ImportCatalog</code></strong>.</li>
+</ul>
+<hr>
+<h2 id="phase-2-analytics-operators-implemented-in-memory-olap">Phase 2 — Analytics operators (implemented, in-memory OLAP)</h2>
+<ol start="7">
+<li><strong>Hash aggregation</strong> — Per-batch partial hash maps (<code>Parallel.For</code> / optional channel scheduler), deterministic global merge, sorted key materialization. <strong><code>Utf8</code></strong> and mixed fixed-width group keys use composite keys. <strong><code>ISpillWriter</code></strong>: when enabled and <code>SpillPartialEntryThreshold</code> is set, large partial maps emit UTF-8 <strong>metrics</strong> chunks via <code>SpillChunkAsync</code> (operator still completes in-memory). <strong>Full spill/repartition of partial aggregates</strong> remains a future extension of the same hook.</li>
+<li><strong>Hash / sort-merge join</strong> — <code>PhysicalJoinAlgorithm.Hash</code> (build/probe) and <strong><code>SortMerge</code></strong> over equi-keys (fixed-width and <strong><code>Utf8</code></strong>). Predicate pushdown to probe/build filters. <strong>Grace/partitioned spill join</strong> is not implemented; the spill interface above is shared for future work.</li>
+<li><strong>Sort + Top-N</strong> — <code>SortTopNEngine</code>: <strong><code>Array.Sort</code></strong> over row locations with null-aware comparators for <strong><code>Int32</code></strong>, <strong><code>Int64</code></strong>, <strong><code>Float64</code></strong>, <strong><code>Boolean</code></strong>, <strong><code>Utf8</code></strong> (Arrow + length-prefixed chunks). <strong><code>SortTopNPhysicalPlan</code></strong> (single-table) and <strong><code>JoinSortTopNPhysicalPlan</code></strong> (post-join). SQL: <strong><code>ORDER BY</code></strong> / <strong><code>LIMIT</code></strong> as in the strict SQL subset section of the <a href="Programming-Guide.html">Programming Guide</a>.</li>
+</ol>
+<hr>
+<h2 id="phase-2b-durable-catalog-snapshot-mvp-implemented">Phase 2b — Durable catalog snapshot (MVP implemented)</h2>
+<ol start="10">
+<li><strong>Directory-backed database</strong> — <code>RainDbFileDatabase.Open(directory)</code> loads <strong><code>catalog.json</code></strong> + batch files into <strong><code>MemoryTable</code></strong> instances wired with <strong><code>IRainDbBatchPersistence</code></strong>; each <strong><code>AppendBatch</code></strong> persists <strong><code>######.batch</code></strong> (not a WAL: crash between catalog write and batch write can leave inconsistency until we add journaling).</li>
+<li><strong>Save / load in-memory</strong> — <code>RainDbFileDatabase.ExportCatalog(catalog, dir)</code> writes a full snapshot from any <strong><code>IColumnarTableSource</code></strong> tables; <code>ImportCatalog(dir)</code> rebuilds <strong><code>InMemoryCatalog</code></strong> without auto-persist. <strong><code>FlushCatalog()</code></strong> rewrites <strong><code>catalog.json</code></strong> for <strong><code>MemoryTable</code></strong> entries only (other <strong><code>ITableSource</code></strong> implementations are skipped until typed export is extended).</li>
+</ol>
+<hr>
+<h2 id="phase-3-planning-sql-not-started">Phase 3 — Planning &amp; SQL (not started)</h2>
+<ol start="12">
+<li><strong>Logical plan IR</strong> — relational algebra nodes (scan, filter, project, join, agg, sort).</li>
+<li><strong>Rule-based optimizer</strong> — predicate pushdown, projection pruning, join reordering heuristics.</li>
+<li><strong>Cost model v0</strong> — row counts + distinct counts from statistics; <strong>histograms</strong> optional.</li>
+<li><strong>SQL parser</strong> — start with <strong>subset</strong> (SELECT, FROM, WHERE, GROUP BY, ORDER BY, JOIN); ANTLR or hand-written recursive descent; errors with source locations.</li>
+<li><strong><code>ISqlCompiler</code></strong> — parse → logical → physical; single pipeline shared with LINQ.</li>
+</ol>
+<blockquote class="blockquote">
+<p><strong>Note:</strong> Much of Phase 3 is partially delivered (logical IR, strict SQL subset, <code>ISqlCompiler</code>). Remaining work is optimizer, broader SQL, and compile-once semantics — see <a href="Development-Roadmap.html">Development Roadmap</a> Phases B and D.</p>
+</blockquote>
+<hr>
+<h2 id="phase-4-linq-stub-only">Phase 4 — LINQ (stub only)</h2>
+<ol start="17">
+<li><strong><code>IQueryable</code> provider</strong> — visit <code>MethodCallExpression</code> (Where, Select, GroupBy, Join); map to same logical IR as SQL (<strong>DRY</strong>).</li>
+<li><strong>Translation limits</strong> — document unsupported patterns; throw <code>LinqCompileException</code> with clear messages.</li>
+</ol>
+<hr>
+<h2 id="phase-5-durability-production-hardening-not-started">Phase 5 — Durability &amp; production hardening (not started)</h2>
+<ol start="19">
+<li><strong>WAL + snapshot</strong> — append-only log, checkpoint; optional MVCC read snapshots for long scans (Phase 2b batch files are <strong>not</strong> a WAL; they are replace-on-write segment snapshots plus a catalog sidecar).</li>
+<li><strong>Statistics + adaptive execution</strong> — runtime feedback to replan or pick join order.</li>
+<li><strong>Observability</strong> — <code>ActivitySource</code>, structured query plans, slow-query threshold.</li>
+</ol>
+<hr>
+<h2 id="cross-cutting-throughout">Cross-cutting (throughout)</h2>
+<ul>
+<li><strong>Testing</strong>: golden SQL files, property-based tests for optimizer rules, micro-benchmarks (<code>BenchmarkDotNet</code>) on scan/agg.</li>
+<li><strong>Unsafe vs safe</strong>: isolate <code>unsafe</code> SIMD in <code>RainDB.Native</code> optional project behind interface.</li>
+<li><strong>API stability</strong>: version <code>IPhysicalPlan</code> and wire formats once logical IR stabilizes.</li>
+</ul>
+<hr>
+<h2 id="mapping-to-the-development-roadmap">Mapping to the development roadmap</h2>
+<table class="table">
+<thead>
+<tr>
+<th>README phase</th>
+<th>Roadmap mapping</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Phase 0–1 (foundations, read path)</td>
+<td>Largely <strong>complete</strong>; Roadmap Phase A extends Phase 1</td>
+</tr>
+<tr>
+<td>Phase 2 (agg, join, sort)</td>
+<td><strong>Complete</strong> in-memory; Roadmap Phase A + E2 mature it</td>
+</tr>
+<tr>
+<td>Phase 2b (directory persistence)</td>
+<td><strong>MVP complete</strong>; Roadmap Phase C + F harden it</td>
+</tr>
+<tr>
+<td>Phase 3 (planning &amp; SQL)</td>
+<td>Roadmap Phases B + D</td>
+</tr>
+<tr>
+<td>Phase 4 (LINQ)</td>
+<td>Roadmap Phase G1</td>
+</tr>
+<tr>
+<td>Phase 5 (durability &amp; stats)</td>
+<td>Roadmap Phases C4, E3, F</td>
+</tr>
+</tbody>
+</table>
+</div>
+          <footer class="doc-footer">
+            <p><a href="index.html">RainDB home</a> · <a href="https://github.com/hoihky/RainDB" target="_blank" rel="noopener">GitHub</a> · MIT License</p>
+          </footer>
+        </article>
+
+        
+                <aside class="toc" aria-label="On this page">
+                  <p class="toc-title">On this page</p>
+                  <ul>
+                    
+                        <li class="toc-h1">
+                          <a href="#implementation-status-and-phased-plan">Implementation status and phased plan</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#phase-0-foundations-implemented">Phase 0 — Foundations (implemented)</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#phase-1-read-path-latency-implemented">Phase 1 — Read path & latency (implemented)</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#phase-2-analytics-operators-implemented-in-memory-olap">Phase 2 — Analytics operators (implemented, in-memory OLAP)</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#phase-2b-durable-catalog-snapshot-mvp-implemented">Phase 2b — Durable catalog snapshot (MVP implemented)</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#phase-3-planning-sql-not-started">Phase 3 — Planning & SQL (not started)</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#phase-4-linq-stub-only">Phase 4 — LINQ (stub only)</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#phase-5-durability-production-hardening-not-started">Phase 5 — Durability & production hardening (not started)</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#cross-cutting-throughout">Cross-cutting (throughout)</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#mapping-to-the-development-roadmap">Mapping to the development roadmap</a>
+                        </li>
+                        
+                  </ul>
+                </aside>
+                
+      </main>
+    </div>
+  </div>
+  <script src="assets/vendor/mermaid.min.js"></script>
+  <script src="assets/vendor/highlight.min.js"></script>
+  <script src="assets/js/site.js"></script>
+</body>
+</html>

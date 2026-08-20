@@ -2,7 +2,7 @@
 
 This guide teaches how to embed RainDB in a .NET application: create tables, load data, run SQL, read results, use physical plans, and persist data. It assumes .NET 10 and a local clone or project reference to the RainDB solution.
 
-**See also:** [RainDB internals](RainDB-Internals.md) (algorithms and architecture), [README](../README.md) (project overview), this guide (full SQL subset reference below).
+**See also:** [RainDB internals](RainDB-Internals.md) (algorithms and architecture), [RainDB overview](index.html) (web intro), this guide (full SQL subset reference below).
 
 ---
 

@@ -1,0 +1,792 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RainDB Internals · RainDB</title>
+  <meta name="description" content="Embedded columnar OLAP database engine for .NET">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/css/site.css">
+  <link rel="stylesheet" href="assets/vendor/atom-one-dark.min.css">
+</head>
+<body>
+  <div class="site">
+    <header class="topbar">
+      <button class="sidebar-toggle" id="sidebar-toggle" aria-label="Toggle navigation">☰</button>
+      <a href="index.html" class="brand">RainDB</a>
+      <nav class="topbar-nav" aria-label="Primary">
+        <a href="index.html">Overview</a>
+        <a href="Programming-Guide.html">Programming Guide</a>
+        <a href="RainDB-Internals.html">Internals</a>
+        <a href="https://github.com/hoihky/RainDB" target="_blank" rel="noopener">GitHub</a>
+      </nav>
+      <div class="search-wrap">
+        <input type="search" id="search" placeholder="Search docs…" autocomplete="off">
+      </div>
+    </header>
+
+    <div class="layout">
+      <aside class="sidebar" id="sidebar">
+        <nav class="nav" aria-label="Documentation">
+          <ul class="nav-list">
+            <li class="nav-item depth-0">
+              <a href="index.html" class="nav-link">Overview</a>
+            </li>
+            <li class="nav-item depth-0">
+                          
+                            <a href="Development-Roadmap.html" class="nav-link">Development Roadmap</a>
+                            
+                        </li>
+                        
+                        <li class="nav-item depth-0">
+                          
+                            <a href="Implementation-Status.html" class="nav-link">Implementation Status</a>
+                            
+                        </li>
+                        
+                        <li class="nav-item depth-0">
+                          
+                            <a href="Programming-Guide.html" class="nav-link">Programming Guide</a>
+                            
+                        </li>
+                        
+                        <li class="nav-item depth-0 is-active">
+                          
+                            <a href="RainDB-Internals.html" class="nav-link">RainDB Internals</a>
+                            
+                        </li>
+                        
+          </ul>
+        </nav>
+      </aside>
+
+      <main class="content">
+        <article class="doc">
+          <header class="doc-header">
+            <h1>RainDB Internals</h1>
+          </header>
+          <div class="doc-body"><h1 id="raindb-internals">RainDB internals</h1>
+<p>This document explains RainDB’s architecture, core data structures, and execution algorithms. It is written for contributors and advanced integrators who need to reason about behavior beyond the public API.</p>
+<p>For hands-on usage, see <strong><a href="Programming-Guide.html">Programming Guide</a></strong>. For release status, see <strong><a href="Implementation-Status.html">Implementation Status</a></strong>. For project overview and vision, see the root <strong><a href="index.html">README</a></strong>.</p>
+<hr>
+<h2 id="design-goals">1. Design goals</h2>
+<p>RainDB is an <strong>embedded</strong>, <strong>single-process</strong>, <strong>column-oriented</strong> OLAP engine for .NET:</p>
+<table class="table">
+<thead>
+<tr>
+<th>Principle</th>
+<th>Meaning in code</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Layered modules</td>
+<td>Abstractions → Core → Query → Sql/Linq → Driver; dependencies point inward.</td>
+</tr>
+<tr>
+<td>One physical IR</td>
+<td>SQL and (future) LINQ lower to the same <code>IPhysicalPlan</code> types.</td>
+</tr>
+<tr>
+<td>Vectorized batches</td>
+<td>Hot paths iterate <code>IColumnarBatch</code> / <code>IColumnChunk</code>, not row objects.</td>
+</tr>
+<tr>
+<td>Deterministic OLAP order</td>
+<td>Parallel morsels merge by <strong>source batch index</strong>; grouped keys are sorted for stable output where applicable.</td>
+</tr>
+<tr>
+<td>Testable contracts</td>
+<td><code>tests/RainDB.Tests</code> and the Programming Guide SQL subset define expected behavior.</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="solution-architecture">2. Solution architecture</h2>
+<pre class="mermaid">flowchart TB
+  subgraph host [RainDB.Driver]
+    Engine[RainDbEngine]
+  end
+  subgraph frontends [Front ends]
+    SQL[RainDB.Sql]
+    LINQ[RainDB.Linq]
+  end
+  subgraph exec [RainDB.Query]
+    Executor[DefaultQueryExecutor]
+    Plans[Physical plans]
+    Engines[VectorizedScanEngine HashAggregateEngine JoinExecutionEngine SortTopNEngine]
+  end
+  subgraph storage [RainDB.Core]
+    Catalog[InMemoryCatalog MemoryTable]
+    Chunks[Column chunks]
+    Persist[RainDbFileDatabase]
+  end
+  subgraph contracts [RainDB.Abstractions]
+    IR[ICatalog IColumnChunk IPhysicalPlan IExecutionContext]
+  end
+  Engine --&gt; SQL
+  Engine --&gt; LINQ
+  Engine --&gt; Executor
+  SQL --&gt; Plans
+  LINQ --&gt; Plans
+  Executor --&gt; Engines
+  Engines --&gt; Chunks
+  Engines --&gt; Catalog
+  Catalog --&gt; IR
+  Chunks --&gt; IR
+  Persist --&gt; Catalog
+</pre>
+<h3 id="project-responsibilities">2.1 Project responsibilities</h3>
+<table class="table">
+<thead>
+<tr>
+<th>Project</th>
+<th>Namespace roots</th>
+<th>Responsibility</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>RainDB.Abstractions</strong></td>
+<td><code>RainDB.*</code> contracts</td>
+<td>Catalog, columnar model, execution interfaces, logical IR (<code>RainDB.Logical</code>), SQL/LINQ compiler interfaces.</td>
+</tr>
+<tr>
+<td><strong>RainDB.Core</strong></td>
+<td><code>RainDB.Core.*</code></td>
+<td><code>MemoryTable</code>, chunk implementations, <code>HybridBufferPool</code>, mmap I/O, <code>RainDbFileDatabase</code> + batch codec.</td>
+</tr>
+<tr>
+<td><strong>RainDB.Query</strong></td>
+<td><code>RainDB.Query.*</code></td>
+<td>Physical plans, engines, vectorized selection/projection, query results.</td>
+</tr>
+<tr>
+<td><strong>RainDB.Sql</strong></td>
+<td><code>RainDB.Sql.*</code></td>
+<td>Lexer, parser, binders, <code>DefaultSqlCompiler</code>, <code>StrictSqlSubset</code>.</td>
+</tr>
+<tr>
+<td><strong>RainDB.Linq</strong></td>
+<td><code>RainDB.Linq.*</code></td>
+<td>Stub <code>DefaultLinqCompiler</code> → <code>ExplainOnlyPhysicalPlan</code> (roadmap).</td>
+</tr>
+<tr>
+<td><strong>RainDB</strong> (driver)</td>
+<td><code>RainDB</code></td>
+<td><code>RainDbEngine</code> composition root.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="key-class-relationships">2.2 Key class relationships</h3>
+<pre><code class="language-text">RainDbEngine
+  ├── ICatalog (InMemoryCatalog)
+  ├── IQueryExecutor (DefaultQueryExecutor)
+  ├── ISqlCompiler (DefaultSqlCompiler)
+  ├── IBufferPool / IAlignedBufferPool (HybridBufferPool)
+  └── ISpillWriter (NoOpSpillWriter by default)
+
+DefaultQueryExecutor
+  └── pattern match on IPhysicalPlan → static *Engine.ExecuteAsync
+
+IColumnarTableSource (MemoryTable)
+  └── IReadOnlyList&lt;IColumnarBatch&gt; Batches
+        └── IColumnChunk[] per column
+</code></pre>
+<p><strong>Extension point:</strong> inject custom <code>IQueryExecutor</code>, <code>ISqlCompiler</code>, pools, or <code>ISpillWriter</code> via <code>RainDbEngine</code> constructor for benchmarks or alternate planners.</p>
+<hr>
+<h2 id="columnar-storage-model">3. Columnar storage model</h2>
+<h3 id="batch-and-chunk-invariants">3.1 Batch and chunk invariants</h3>
+<ul>
+<li>A <strong>batch</strong> (<code>IColumnarBatch</code>) has one <code>RowCount</code> and one <strong>chunk per table column</strong> (same order as <code>TableSchema.Columns</code>).</li>
+<li>A <strong>chunk</strong> (<code>IColumnChunk</code>) exposes:
+<ul>
+<li><code>PhysicalType</code> (<code>RainDbType</code>)</li>
+<li><code>Values</code> — packed fixed-width little-endian bytes, or UTF-8 blob (layout depends on chunk class)</li>
+<li>Optional <strong>null bitmap</strong>: bit <code>1</code> = NULL at row <code>i</code>, byte <code>i &gt;&gt; 3</code>, mask <code>1 &lt;&lt; (i &amp; 7)</code></li>
+</ul>
+</li>
+</ul>
+<h3 id="chunk-implementations-raindb.core.columnar">3.2 Chunk implementations (<code>RainDB.Core.Columnar</code>)</h3>
+<table class="table">
+<thead>
+<tr>
+<th>Type</th>
+<th>Class</th>
+<th>Layout</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Fixed-width</td>
+<td><code>FixedWidthColumnChunk</code></td>
+<td><code>rowCount × width</code> bytes; boolean stored as one byte per row (0/1).</td>
+</tr>
+<tr>
+<td>UTF-8 (Arrow)</td>
+<td><code>Utf8ColumnChunk</code></td>
+<td><code>offsets[rowCount+1]</code> + contiguous UTF-8 blob.</td>
+</tr>
+<tr>
+<td>UTF-8 (length-prefixed)</td>
+<td><code>Utf8LengthPrefixedColumnChunk</code></td>
+<td>Per row: <code>int32</code> LE length + payload; index built at construction.</td>
+</tr>
+<tr>
+<td>Projected (query)</td>
+<td><code>PooledFixedWidthColumnChunk</code></td>
+<td>Fixed-width gather output; buffers from pool; <code>IDisposable</code>.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="memorytable">3.3 <code>MemoryTable</code></h3>
+<ul>
+<li>Append-only list of batches; <code>AppendBatch</code> validates schema/types/row counts.</li>
+<li>Optional <code>MemoryTableOptions.StrictVectorChunkRows</code>: enforces <code>VectorChunkLimits</code> (64K–1M rows per non-empty batch).</li>
+<li><code>SchemaVersion</code> + <code>BumpSchemaVersion()</code> + event for future plan cache invalidation.</li>
+<li><code>IRainDbBatchPersistence.OnBatchAppended</code> hook when wired through <code>RainDbFileDatabase</code>.</li>
+</ul>
+<h3 id="catalog">3.4 Catalog</h3>
+<ul>
+<li><code>TableId</code> (stable GUID) + name → <code>ITableSource</code>.</li>
+<li>Execution resolves <code>TableId</code> after SQL binding; <code>IColumnarTableSource</code> adds <code>Batches</code> for scans.</li>
+</ul>
+<hr>
+<h2 id="buffer-and-memory-management">4. Buffer and memory management</h2>
+<h3 id="hybridbufferpool">4.1 <code>HybridBufferPool</code></h3>
+<ul>
+<li>Implements both <code>IBufferPool</code> (<code>ArrayPool&lt;byte&gt;.Shared</code>) and <code>IAlignedBufferPool</code>.</li>
+<li><strong>Aligned rent:</strong> allocates extra padding, returns <code>IMemoryOwner&lt;byte&gt;</code> sub-slice with ≥32-byte alignment (AVX2-friendly).</li>
+<li><strong>LOH guidance:</strong> prefer rents under ~85KB when possible (documented on <code>IBufferPool</code>).</li>
+</ul>
+<h3 id="query-result-memory">4.2 Query result memory</h3>
+<ul>
+<li><code>ProjectGather</code> writes fixed-width output into <strong>pooled</strong> buffers (<code>PooledFixedWidthColumnChunk</code>).</li>
+<li><code>ColumnarMaterializedQueryResult.DisposeAsync</code> disposes <code>IDisposable</code> columns to return pool memory.</li>
+<li><strong>Always</strong> <code>await using</code> query results when using default scan/project paths.</li>
+</ul>
+<hr>
+<h2 id="execution-pipeline">5. Execution pipeline</h2>
+<h3 id="session-context">5.1 Session context</h3>
+<p><code>IExecutionContext</code> (<code>RainDbExecutionContext</code>) carries:</p>
+<ul>
+<li><code>ICatalog</code>, <code>IBufferPool</code>, <code>IAlignedBufferPool</code>, <code>ISpillWriter</code>, <code>CancellationToken</code></li>
+</ul>
+<p>Each <code>ExecuteSqlAsync</code> / <code>ExecutePhysicalAsync</code> call creates a fresh session.</p>
+<h3 id="physical-plans-raindb.query.plans">5.2 Physical plans (<code>RainDB.Query.Plans</code>)</h3>
+<table class="table">
+<thead>
+<tr>
+<th>Plan</th>
+<th>Engine</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>VectorizedScanPhysicalPlan</code></td>
+<td><code>VectorizedScanEngine</code></td>
+<td>Scan, <code>WHERE</code>, project, optional <strong>global</strong> aggregate.</td>
+</tr>
+<tr>
+<td><code>HashAggregatePhysicalPlan</code></td>
+<td><code>HashAggregateEngine</code></td>
+<td><code>GROUP BY</code> on one table (or ephemeral source).</td>
+</tr>
+<tr>
+<td><code>JoinPhysicalPlan</code></td>
+<td><code>JoinExecutionEngine</code></td>
+<td>Inner equi-join (hash or sort-merge).</td>
+</tr>
+<tr>
+<td><code>SortTopNPhysicalPlan</code></td>
+<td><code>SortTopNEngine</code></td>
+<td><code>ORDER BY</code> / <code>LIMIT</code> on one table.</td>
+</tr>
+<tr>
+<td><code>JoinSortTopNPhysicalPlan</code></td>
+<td><code>SortTopNEngine</code></td>
+<td>Join then sort/limit.</td>
+</tr>
+<tr>
+<td><code>GroupedJoinPhysicalPlan</code></td>
+<td>Join + <code>HashAggregateEngine</code></td>
+<td>Join materialized rowset, then hash agg.</td>
+</tr>
+</tbody>
+</table>
+<p><code>IPhysicalPlan.Explain()</code> returns a short text description; <code>DefaultQueryExecutor</code> invokes it before dispatch (lightweight tracing hook).</p>
+<p>There is <strong>no separate optimizer</strong> today: binders emit one physical shape per logical node (join algorithm fixed to <strong>hash</strong> in <code>DefaultSqlCompiler</code>).</p>
+<hr>
+<h2 id="selection-and-projection-vectorized-scan-path">6. Selection and projection (vectorized scan path)</h2>
+<h3 id="data-structure-dense-selection-vector">6.1 Data structure: dense selection vector</h3>
+<p>A <strong>selection vector</strong> is a dense <code>int[]</code> of <strong>source row indices</strong> that survive predicates, in increasing row order within the batch.</p>
+<ul>
+<li>Capacity: up to <code>batch.RowCount</code> (rented from <code>ArrayPool&lt;int&gt;.Shared</code> in engines).</li>
+<li><strong>No filter:</strong> logical selection is <code>0..n-1</code> without materializing indices (<code>useRowSelection: false</code> in <code>ProjectGather</code>).</li>
+</ul>
+<h3 id="conjunctive-where-selectionevaluator">6.2 Conjunctive <code>WHERE</code> (<code>SelectionEvaluator</code>)</h3>
+<p>Algorithm for <code>filter₁ AND filter₂ AND …</code>:</p>
+<ol>
+<li>Evaluate <strong>first</strong> predicate into <code>dest[0..count)</code> using column-specific kernels (<code>FixedWidthSelectionKernels</code> or UTF-8 path).</li>
+<li>For each subsequent predicate, <strong>intersect in place</strong>: compact <code>dest</code> to rows that also pass the next filter (<code>IntersectSelectedIndices</code> or UTF-8 <code>IntersectUtf8</code>).</li>
+</ol>
+<p>Complexity: O(n) for the first predicate + O(kᵢ) per additional predicate, where kᵢ is the current selection size (beneficial at 10–30% selectivity).</p>
+<p><strong>UTF-8 semantics</strong> (dedicated path, documented on <code>SelectionEvaluator</code>):</p>
+<ul>
+<li>Only <code>=</code>, <code>!=</code>, <code>&lt;&gt;</code> with a single-quoted literal.</li>
+<li>Byte-wise equality on cell payload (Arrow slice or length-prefixed payload).</li>
+<li>NULL cells never match.</li>
+</ul>
+<h3 id="fixed-width-compare-kernels">6.3 Fixed-width compare kernels</h3>
+<p><code>FixedWidthSelectionKernels</code>:</p>
+<ul>
+<li>Uses <code>MemoryMarshal.Cast&lt;byte, T&gt;</code> for typed scans over column values.</li>
+<li>Skips null rows via bitmap checks before compare.</li>
+<li><strong>Fast path:</strong> null-free <code>Int32</code> equality may use <code>Vector128</code> compares (hardware accelerated when available).</li>
+</ul>
+<p><code>RowMatchesFilter</code> remains the semantic reference for joins and row-wise fallbacks.</p>
+<h3 id="projection-projectgather">6.4 Projection (<code>ProjectGather</code>)</h3>
+<table class="table">
+<thead>
+<tr>
+<th>Case</th>
+<th>Behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>No row selection, full batch</td>
+<td>Single <code>CopyTo</code> of entire column (<code>CopyEntireFixedWidthColumn</code>).</td>
+</tr>
+<tr>
+<td>Row selection</td>
+<td>Gather per selected index into aligned value buffer; optional null bitmap in <code>IBufferPool</code>.</td>
+</tr>
+<tr>
+<td>UTF-8</td>
+<td>Still allocates new Arrow/LP chunks (not pooled in Phase A1).</td>
+</tr>
+</tbody>
+</table>
+<p>Output: <code>ColumnarBatch</code> with <code>PooledFixedWidthColumnChunk</code> or UTF-8 chunk types.</p>
+<h3 id="morsel-parallelism-vectorizedscanengine">6.5 Morsel parallelism (<code>VectorizedScanEngine</code>)</h3>
+<ul>
+<li><strong>Morsel</strong> = one source batch index.</li>
+<li><code>MaxDegreeOfParallelism</code>: <code>-1</code> → <code>Environment.ProcessorCount</code>, <code>0</code> → 1, else explicit cap.</li>
+<li>Schedulers: <code>Parallel.For</code> or <code>Channel&lt;int&gt;</code> worker pool (<code>UseChannelScheduler</code>).</li>
+<li>Output array indexed by batch index → <strong>stable batch order</strong> in <code>IColumnarQueryResult.Batches</code>.</li>
+</ul>
+<h3 id="global-aggregates-in-scan-engine">6.6 Global aggregates in scan engine</h3>
+<ul>
+<li>Per-batch <strong>partial</strong> accumulators (<code>PartialAgg</code> struct).</li>
+<li>Deterministic combine across batches.</li>
+<li><code>COUNT(*)</code>: filtered row count; <code>COUNT(col)</code>: non-null among selected rows.</li>
+<li><code>SUM</code> / <code>MIN</code> / <code>MAX</code>: <code>IAggregateQueryResult.ValueIsNull</code> when no contributing non-null values.</li>
+<li>Optional AVX2 <code>SumFloat64</code> when <code>UseAvx2DoubleSum</code>, no nulls, full-column scan without selection.</li>
+</ul>
+<hr>
+<h2 id="hash-aggregation-hashaggregateengine">7. Hash aggregation (<code>HashAggregateEngine</code>)</h2>
+<h3 id="algorithm">7.1 Algorithm</h3>
+<ol>
+<li><strong>Per source batch</strong> (optionally parallel): build a <code>Dictionary&lt;GroupKey, AggregateAccumulator[]&gt;</code> (or composite UTF-8 key variant).</li>
+<li>Apply <code>WHERE</code> via same selection vector as scan.</li>
+<li>For each selected row: build group key → update accumulators.</li>
+<li><strong>Merge</strong> partial dictionaries across batches.</li>
+<li><strong>Sort keys</strong> (<code>GroupKeyComparer</code>) for deterministic output order.</li>
+<li><strong>Materialize</strong> one output <code>ColumnarBatch</code> with grouping columns + aggregate columns (null bits on aggregate outputs per SQL rules).</li>
+</ol>
+<h3 id="group-keys">7.2 Group keys</h3>
+<p><strong>Fixed-width keys</strong> — <code>GroupKey</code>:</p>
+<ul>
+<li><code>ulong[] Parts</code> — one part per key column (encoded fixed-width values).</li>
+<li><code>uint NullMask</code> — bit set if any key part is NULL; such rows are typically skipped for equi-join; aggregation uses key nullability per engine rules.</li>
+</ul>
+<p><strong>UTF-8 / mixed keys</strong> — <code>CompositeJoinKey</code> / composite hash path in <code>HashAggregateEngine.ExecuteWithCompositeKeysAsync</code>.</p>
+<h3 id="spill-hook">7.3 Spill hook</h3>
+<p>If <code>ISpillWriter.IsEnabled</code> and <code>SpillPartialEntryThreshold</code> exceeded, engine writes a <strong>metrics JSON line</strong> via <code>SpillChunkAsync</code>. Full external aggregation is not implemented; interface is reserved for Phase E.</p>
+<hr>
+<h2 id="join-execution-joinexecutionengine">8. Join execution (<code>JoinExecutionEngine</code>)</h2>
+<h3 id="supported-join">8.1 Supported join</h3>
+<ul>
+<li><strong>Inner equi-join</strong> only; keys must match types (fixed-width or <code>Utf8</code>).</li>
+<li>Optional <code>WHERE</code> filters pushed to probe/build sides (<code>ColumnCompareFilter[]</code> per side).</li>
+</ul>
+<h3 id="hash-join">8.2 Hash join</h3>
+<ol>
+<li><strong>Build phase:</strong> scan right (build) batches; insert <code>(GroupKey or CompositeJoinKey) → List&lt;RowRef(batchIdx, rowIdx)&gt;</code> skipping null keys.</li>
+<li><strong>Probe phase:</strong> scan left batches; for each probe row, lookup key and emit <code>(probe, build)</code> pairs into <code>List&lt;RowRefMatch&gt;</code>.</li>
+<li><strong>Materialize</strong> wide output batch (left columns then right, or explicit <code>JoinOutputColumnRef</code> order).</li>
+</ol>
+<h3 id="sort-merge-join">8.3 Sort-merge join</h3>
+<ol>
+<li>Collect keyed row references from each side; sort by key (<code>SortEntryFixed</code> + <code>GroupKeyComparer</code>).</li>
+<li>Merge-like walk on sorted keys to emit matches (duplicate key handling: nested loop on equal key runs).</li>
+</ol>
+<h3 id="grouped-join-plan">8.4 Grouped join plan</h3>
+<p><code>GroupedJoinPhysicalPlan</code>: run join → wrap result in <code>EphemeralColumnarTableSource</code> → <code>HashAggregateEngine</code> on ephemeral table. Full join rowset is materialized in memory.</p>
+<hr>
+<h2 id="sort-and-limit-sorttopnengine">9. Sort and limit (<code>SortTopNEngine</code>)</h2>
+<ol>
+<li>Collect row locations <code>(batchIdx, rowIdx)</code> from all batches (apply <code>WHERE</code> if present).</li>
+<li>If sort keys present: <code>Array.Sort</code> with <code>RowLocComparer</code> (null-aware, type-specific compare for Int32/Int64/Float64/Boolean/Utf8).</li>
+<li>Apply <code>LIMIT</code> by truncating sorted row list (full sort today; heap top-N is roadmap Phase A2).</li>
+<li>Materialize projected columns into output batch.</li>
+</ol>
+<p>Join variant: execute join first, then sort/limit on join output schema.</p>
+<hr>
+<h2 id="sql-compilation">10. SQL compilation</h2>
+<h3 id="pipeline">10.1 Pipeline</h3>
+<pre><code class="language-text">SQL text
+→ SqlLexer (tokens)
+→ SqlParser / SelectParser → LogicalPlan (LogicalTableScan | LogicalInnerJoin)
+→ Binder (LogicalTableScanBinder | LogicalJoinBinder)
+→ IPhysicalPlan
+→ DefaultQueryExecutor
+</code></pre>
+<p><code>StrictSqlSubset.ParseLogicalPlan</code> / <code>CompilePhysicalPlan</code> expose parse and parse+bind without <code>RainDbEngine</code>.</p>
+<h3 id="logical-ir-raindb.logical">10.2 Logical IR (<code>RainDB.Logical</code>)</h3>
+<p>Relational-shaped, SQL-close: table names, <code>SimpleWhereClause</code>, <code>LogicalAggregate</code>, sort keys, limits. No buffer or execution details.</p>
+<h3 id="binding-rules-high-level">10.3 Binding rules (high level)</h3>
+<ul>
+<li>Resolve table/column names against <code>ICatalog</code>; map to column ordinals.</li>
+<li>Validate aggregate types (e.g. <code>MIN</code>/<code>MAX</code> only <code>Float64</code> today).</li>
+<li>Emit filters as <code>ColumnCompareFilter</code> (column index, op, immediate bits or UTF-8 literal bytes).</li>
+<li>Choose plan shape: scan vs <code>HashAggregatePhysicalPlan</code> vs join variants vs sort/top-N wrappers.</li>
+</ul>
+<p>Parser rejects unsupported constructs with <code>SqlCompileException</code> (e.g. <code>HAVING</code>, <code>SELECT *</code> with <code>GROUP BY</code>).</p>
+<hr>
+<h2 id="persistence-raindbfiledatabase">11. Persistence (<code>RainDbFileDatabase</code>)</h2>
+<h3 id="on-disk-layout">11.1 On-disk layout</h3>
+<pre><code class="language-text">dataDir/
+catalog.json          # table ids, names, column types (formatVersion: 1)
+tables/
+  {tableId}/
+    000000.batch
+    000001.batch
+    ...
+</code></pre>
+<h3 id="lifecycle">11.2 Lifecycle</h3>
+<ul>
+<li><strong>Open:</strong> hydrate <code>MemoryTable</code> instances + register persistence hook on created tables.</li>
+<li><strong>Append:</strong> <code>MemoryTable.AppendBatch</code> → encode batch → write <code>######.batch</code> (locked I/O).</li>
+<li><strong>FlushCatalog:</strong> rewrite <code>catalog.json</code> (MemoryTable entries only).</li>
+<li><strong>ExportCatalog / ImportCatalog:</strong> snapshot or cold load without live append hook.</li>
+</ul>
+<h3 id="codec-raindbbatchbinarycodec-v1">11.3 Codec (<code>RainDbBatchBinaryCodec</code> v1)</h3>
+<p>Self-describing per-batch binary; supports fixed-width, Arrow UTF-8, length-prefixed UTF-8.</p>
+<p><strong>Durability note:</strong> not a WAL; crash between catalog and batch write can leave inconsistency until future journaling (see roadmap).</p>
+<h3 id="mmap-columnarfixedwidthmmapreader">11.4 mmap (<code>ColumnarFixedWidthMmapReader</code>)</h3>
+<p>Optional zero-copy read path for <strong>fixed-width column files</strong> on disk; not yet wired as default <code>MemoryTable</code> storage (queries still run on in-memory batches after load).</p>
+<hr>
+<h2 id="threading-and-cancellation">12. Threading and cancellation</h2>
+<ul>
+<li>Parallel engines use <code>ParallelOptions.CancellationToken</code> or cooperative checks in loops.</li>
+<li>Catalog mutations are not synchronized for multi-writer scenarios; assume <strong>single-writer</strong> host process.</li>
+<li>File I/O under <code>RainDbFileDatabase</code> uses an instance lock.</li>
+</ul>
+<hr>
+<h2 id="testing-map">13. Testing map</h2>
+<table class="table">
+<thead>
+<tr>
+<th>Area</th>
+<th>Test classes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Columnar / catalog</td>
+<td><code>ColumnarAndCatalogTests</code></td>
+</tr>
+<tr>
+<td>Scan / filter / agg</td>
+<td><code>Phase1ReadPathTests</code>, <code>VectorizedSelectionPerformanceTests</code></td>
+</tr>
+<tr>
+<td>SQL correctness</td>
+<td><code>SqlFeatureCorrectnessTests</code>, <code>SqlStrictSubsetCompilerTests</code>, <code>SqlGroupByTests</code>, <code>SqlOrderByLimitTests</code></td>
+</tr>
+<tr>
+<td>Joins</td>
+<td><code>JoinExecutionTests</code></td>
+</tr>
+<tr>
+<td>Hash agg</td>
+<td><code>HashAggregatePhysicalTests</code></td>
+</tr>
+<tr>
+<td>Physical plans</td>
+<td><code>PhysicalPlanCorrectnessTests</code></td>
+</tr>
+<tr>
+<td>Persistence</td>
+<td><code>RainDbPersistenceTests</code></td>
+</tr>
+</tbody>
+</table>
+<p>When documentation and code disagree, <strong>tests + README</strong> win.</p>
+<hr>
+<h2 id="glossary">14. Glossary</h2>
+<table class="table">
+<thead>
+<tr>
+<th>Term</th>
+<th>Definition</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Morsel</strong></td>
+<td>One <code>IColumnarBatch</code> in a table; unit of parallel scan work.</td>
+</tr>
+<tr>
+<td><strong>Selection vector</strong></td>
+<td>Dense array of source row indices passing predicates.</td>
+</tr>
+<tr>
+<td><strong>Binding</strong></td>
+<td>Name resolution + type checks + physical plan emission.</td>
+</tr>
+<tr>
+<td><strong>Lowering</strong></td>
+<td>Logical IR → physical plan (in binders today).</td>
+</tr>
+<tr>
+<td><strong>Strict subset</strong></td>
+<td>Implemented SQL dialect; not ANSI-complete.</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="related-documents">15. Related documents</h2>
+<table class="table">
+<thead>
+<tr>
+<th>Document</th>
+<th>Audience</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="Programming-Guide.html">Programming Guide</a></td>
+<td>Application developers using <code>RainDbEngine</code></td>
+</tr>
+<tr>
+<td><a href="Development-Roadmap.html">Development Roadmap</a></td>
+<td>Planned phases and exit criteria</td>
+</tr>
+<tr>
+<td><a href="index.html">README</a></td>
+<td>Feature list and SQL reference</td>
+</tr>
+</tbody>
+</table>
+</div>
+          <footer class="doc-footer">
+            <p><a href="index.html">RainDB home</a> · <a href="https://github.com/hoihky/RainDB" target="_blank" rel="noopener">GitHub</a> · MIT License</p>
+          </footer>
+        </article>
+
+        
+                <aside class="toc" aria-label="On this page">
+                  <p class="toc-title">On this page</p>
+                  <ul>
+                    
+                        <li class="toc-h1">
+                          <a href="#raindb-internals">RainDB internals</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#1-design-goals">1. Design goals</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#2-solution-architecture">2. Solution architecture</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#21-project-responsibilities">2.1 Project responsibilities</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#22-key-class-relationships">2.2 Key class relationships</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#3-columnar-storage-model">3. Columnar storage model</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#31-batch-and-chunk-invariants">3.1 Batch and chunk invariants</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#32-chunk-implementations">3.2 Chunk implementations ()</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#33">3.3 </a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#34-catalog">3.4 Catalog</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#4-buffer-and-memory-management">4. Buffer and memory management</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#41">4.1 </a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#42-query-result-memory">4.2 Query result memory</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#5-execution-pipeline">5. Execution pipeline</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#51-session-context">5.1 Session context</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#52-physical-plans">5.2 Physical plans ()</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#6-selection-and-projection-vectorized-scan-path">6. Selection and projection (vectorized scan path)</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#61-data-structure-dense-selection-vector">6.1 Data structure: dense selection vector</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#62-conjunctive">6.2 Conjunctive  ()</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#63-fixed-width-compare-kernels">6.3 Fixed-width compare kernels</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#64-projection">6.4 Projection ()</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#65-morsel-parallelism">6.5 Morsel parallelism ()</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#66-global-aggregates-in-scan-engine">6.6 Global aggregates in scan engine</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#7-hash-aggregation">7. Hash aggregation ()</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#71-algorithm">7.1 Algorithm</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#72-group-keys">7.2 Group keys</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#73-spill-hook">7.3 Spill hook</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#8-join-execution">8. Join execution ()</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#81-supported-join">8.1 Supported join</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#82-hash-join">8.2 Hash join</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#83-sort-merge-join">8.3 Sort-merge join</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#84-grouped-join-plan">8.4 Grouped join plan</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#9-sort-and-limit">9. Sort and limit ()</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#10-sql-compilation">10. SQL compilation</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#101-pipeline">10.1 Pipeline</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#102-logical-ir">10.2 Logical IR ()</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#103-binding-rules-high-level">10.3 Binding rules (high level)</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#11-persistence">11. Persistence ()</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#111-on-disk-layout">11.1 On-disk layout</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#112-lifecycle">11.2 Lifecycle</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#113-codec-v1">11.3 Codec ( v1)</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#114-mmap">11.4 mmap ()</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#12-threading-and-cancellation">12. Threading and cancellation</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#13-testing-map">13. Testing map</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#14-glossary">14. Glossary</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#15-related-documents">15. Related documents</a>
+                        </li>
+                        
+                  </ul>
+                </aside>
+                
+      </main>
+    </div>
+  </div>
+  <script src="assets/vendor/mermaid.min.js"></script>
+  <script src="assets/vendor/highlight.min.js"></script>
+  <script src="assets/js/site.js"></script>
+</body>
+</html>

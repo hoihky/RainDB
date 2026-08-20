@@ -1,0 +1,744 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Programming Guide · RainDB</title>
+  <meta name="description" content="Embedded columnar OLAP database engine for .NET">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/css/site.css">
+  <link rel="stylesheet" href="assets/vendor/atom-one-dark.min.css">
+</head>
+<body>
+  <div class="site">
+    <header class="topbar">
+      <button class="sidebar-toggle" id="sidebar-toggle" aria-label="Toggle navigation">☰</button>
+      <a href="index.html" class="brand">RainDB</a>
+      <nav class="topbar-nav" aria-label="Primary">
+        <a href="index.html">Overview</a>
+        <a href="Programming-Guide.html">Programming Guide</a>
+        <a href="RainDB-Internals.html">Internals</a>
+        <a href="https://github.com/hoihky/RainDB" target="_blank" rel="noopener">GitHub</a>
+      </nav>
+      <div class="search-wrap">
+        <input type="search" id="search" placeholder="Search docs…" autocomplete="off">
+      </div>
+    </header>
+
+    <div class="layout">
+      <aside class="sidebar" id="sidebar">
+        <nav class="nav" aria-label="Documentation">
+          <ul class="nav-list">
+            <li class="nav-item depth-0">
+              <a href="index.html" class="nav-link">Overview</a>
+            </li>
+            <li class="nav-item depth-0">
+                          
+                            <a href="Development-Roadmap.html" class="nav-link">Development Roadmap</a>
+                            
+                        </li>
+                        
+                        <li class="nav-item depth-0">
+                          
+                            <a href="Implementation-Status.html" class="nav-link">Implementation Status</a>
+                            
+                        </li>
+                        
+                        <li class="nav-item depth-0 is-active">
+                          
+                            <a href="Programming-Guide.html" class="nav-link">Programming Guide</a>
+                            
+                        </li>
+                        
+                        <li class="nav-item depth-0">
+                          
+                            <a href="RainDB-Internals.html" class="nav-link">RainDB Internals</a>
+                            
+                        </li>
+                        
+          </ul>
+        </nav>
+      </aside>
+
+      <main class="content">
+        <article class="doc">
+          <header class="doc-header">
+            <h1>Programming Guide</h1>
+          </header>
+          <div class="doc-body"><h1 id="raindb-programming-guide">RainDB programming guide</h1>
+<p>This guide teaches how to embed RainDB in a .NET application: create tables, load data, run SQL, read results, use physical plans, and persist data. It assumes .NET 10 and a local clone or project reference to the RainDB solution.</p>
+<p><strong>See also:</strong> <a href="RainDB-Internals.html">RainDB internals</a> (algorithms and architecture), <a href="index.html">README</a> (project overview), this guide (full SQL subset reference below).</p>
+<hr>
+<h2 id="getting-started">1. Getting started</h2>
+<h3 id="build-and-test">1.1 Build and test</h3>
+<pre><code class="language-bash">cd RainDB
+dotnet build RainDB.slnx
+dotnet test RainDB.slnx
+dotnet run --project samples/RainDB.AnalyticsDemo
+</code></pre>
+<h3 id="referencing-raindb-from-your-app">1.2 Referencing RainDB from your app</h3>
+<p>Reference the driver project (composition root) and, when building tables in code, <strong>RainDB.Core</strong>:</p>
+<table class="table">
+<thead>
+<tr>
+<th>Project</th>
+<th>When you need it</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>RainDB.Driver</code> (<code>RainDB</code> assembly)</td>
+<td><code>RainDbEngine</code>, <code>ExecuteSqlAsync</code>, <code>ExecutePhysicalAsync</code></td>
+</tr>
+<tr>
+<td><code>RainDB.Core</code></td>
+<td><code>MemoryTable</code>, column chunks, <code>RainDbFileDatabase</code></td>
+</tr>
+<tr>
+<td><code>RainDB.Abstractions</code></td>
+<td><code>ICatalog</code>, <code>IQueryResult</code>, <code>IPhysicalPlan</code>, schema types</td>
+</tr>
+<tr>
+<td><code>RainDB.Sql</code></td>
+<td><code>StrictSqlSubset</code> for compile-only tooling</td>
+</tr>
+</tbody>
+</table>
+<p>Typical usings:</p>
+<pre><code class="language-csharp">using RainDB;
+using RainDB.Columnar;
+using RainDB.Core.Columnar;
+using RainDB.Core.Tables;
+using RainDB.Execution;
+using RainDB.Schema;
+</code></pre>
+<hr>
+<h2 id="engine-lifecycle">2. Engine lifecycle</h2>
+<h3 id="in-memory-engine-default">2.1 In-memory engine (default)</h3>
+<pre><code class="language-csharp">var engine = RainDbEngine.CreateDefault();
+</code></pre>
+<p>This creates:</p>
+<ul>
+<li><code>InMemoryCatalog</code></li>
+<li><code>HybridBufferPool</code> (general + aligned allocation)</li>
+<li><code>DefaultQueryExecutor</code>, <code>DefaultSqlCompiler</code>, stub <code>DefaultLinqCompiler</code></li>
+<li>No-op spill writer</li>
+</ul>
+<h3 id="persistent-directory-database">2.2 Persistent directory database</h3>
+<pre><code class="language-csharp">var engine = RainDbEngine.OpenPersistent("/path/to/dataDir");
+var fileDb = engine.FileDatabase!; // keeps persistence alive
+</code></pre>
+<ul>
+<li>Loads <code>catalog.json</code> and existing <code>.batch</code> files into memory if present.</li>
+<li>New tables should be created with <code>fileDb.CreateMemoryTable(...)</code> so <strong>appends are mirrored to disk</strong>.</li>
+</ul>
+<h3 id="custom-catalog">2.3 Custom catalog</h3>
+<pre><code class="language-csharp">using RainDB.Core.Catalog;
+
+var catalog = new InMemoryCatalog();
+// ... register tables ...
+var engine = RainDbEngine.CreateDefault(catalog);
+</code></pre>
+<h3 id="disposal-pattern">2.4 Disposal pattern</h3>
+<p>Query results may own pooled memory (<code>await using</code>):</p>
+<pre><code class="language-csharp">await using var result = await engine.ExecuteSqlAsync("SELECT ...");
+</code></pre>
+<p>Call <code>DisposeAsync</code> on results when you are done reading columns, especially after wide scans with filters.</p>
+<hr>
+<h2 id="defining-tables-and-schema">3. Defining tables and schema</h2>
+<h3 id="schema">3.1 Schema</h3>
+<pre><code class="language-csharp">var schema = new TableSchema([
+    new ColumnDef("region", RainDbType.Utf8),
+    new ColumnDef("amount", RainDbType.Float64),
+    new ColumnDef("qty", RainDbType.Int32),
+    new ColumnDef("active", RainDbType.Boolean),
+]);
+</code></pre>
+<p>Supported types today: <code>Int32</code>, <code>Int64</code>, <code>Float64</code>, <code>Boolean</code>, <code>Utf8</code>.</p>
+<h3 id="registering-a-memory-table">3.2 Registering a memory table</h3>
+<pre><code class="language-csharp">var table = new MemoryTable("sales", schema);
+engine.Catalog.Register(table);
+</code></pre>
+<p>With persistence:</p>
+<pre><code class="language-csharp">var table = fileDb.CreateMemoryTable("sales", schema);
+// already registered on fileDb.Catalog (same as engine.Catalog)
+</code></pre>
+<h3 id="strict-vector-sizing-optional">3.3 Strict vector sizing (optional)</h3>
+<p>For DuckDB-style batch sizes (64K–1M rows per append):</p>
+<pre><code class="language-csharp">var table = new MemoryTable(
+"sales",
+schema,
+options: new MemoryTableOptions(StrictVectorChunkRows: true));
+</code></pre>
+<p>Without strict mode, small batches are allowed (useful in unit tests).</p>
+<hr>
+<h2 id="building-columnar-data">4. Building columnar data</h2>
+<h3 id="fixed-width-columns">4.1 Fixed-width columns</h3>
+<p>Values are <strong>little-endian</strong> packed bytes.</p>
+<pre><code class="language-csharp">// Two Int32 values: 1 and 2
+var qtyBytes = new byte[] { 1, 0, 0, 0, 2, 0, 0, 0 };
+var qty = new FixedWidthColumnChunk(
+    RainDbType.Int32,
+    rowCount: 2,
+    values: qtyBytes,
+    nullBitmap: ReadOnlyMemory&lt;byte&gt;.Empty,
+    hasNulls: false);
+
+// Two Float64 values
+var amtBytes = new byte[16];
+BitConverter.GetBytes(10.0).CopyTo(amtBytes, 0);
+BitConverter.GetBytes(20.0).CopyTo(amtBytes, 8);
+var amt = new FixedWidthColumnChunk(
+    RainDbType.Float64, 2, amtBytes, ReadOnlyMemory&lt;byte&gt;.Empty, hasNulls: false);
+</code></pre>
+<h3 id="null-bitmap">4.2 Null bitmap</h3>
+<p>One bit per row: <code>1</code> = NULL. Example: row 1 null in a 2-row Int32 column:</p>
+<pre><code class="language-csharp">var values = new byte[] { 1, 0, 0, 0, 0, 0, 0, 0 };
+var nullBitmap = new byte[] { 0b0000_0010 }; // bit 1 set
+var col = new FixedWidthColumnChunk(RainDbType.Int32, 2, values, nullBitmap, hasNulls: true);
+</code></pre>
+<h3 id="utf-8-columns-arrow-style">4.3 UTF-8 columns (Arrow style)</h3>
+<pre><code class="language-csharp">var offsets = new[] { 0, 2, 4 }; // two strings in one blob
+var blob = "usuk"u8.ToArray();
+var region = new Utf8ColumnChunk(2, offsets, blob, ReadOnlyMemory&lt;byte&gt;.Empty, hasNulls: false);
+</code></pre>
+<h3 id="appending-batches">4.4 Appending batches</h3>
+<pre><code class="language-csharp">table.AppendBatch(new ColumnarBatch(rowCount: 2, new IColumnChunk[] { region, amt }));
+</code></pre>
+<p><code>AppendBatch</code> validates column count, types, and row counts. Failed validation throws <code>ArgumentException</code>.</p>
+<hr>
+<h2 id="running-sql">5. Running SQL</h2>
+<h3 id="execute-a-query">5.1 Execute a query</h3>
+<pre><code class="language-csharp">await using var result = await engine.ExecuteSqlAsync(
+"SELECT region, amount FROM sales WHERE amount &gt; 0.5");
+</code></pre>
+<p>RainDB accepts a <strong>single statement</strong> per call (strict subset). Full grammar:</p>
+<h3 id="strict-sql-subset-supported-today">5.1.1 Strict SQL subset (supported today)</h3>
+<p>Single statement; ASCII identifiers; <code>SELECT</code> / <code>FROM</code> / optional <code>WHERE</code> / optional <strong><code>GROUP BY</code></strong> / optional <strong><code>ORDER BY</code></strong> / optional <strong><code>LIMIT</code></strong>; line comments <code>--</code>.</p>
+<ul>
+<li><strong>Row query</strong>: <code>SELECT * FROM table</code> <strong>or</strong> <code>SELECT col [, col …] FROM table</code> <strong>[WHERE col op literal]</strong> (conjuncts with <strong><code>AND</code></strong>). Optional <strong><code>ORDER BY col [ASC | DESC] [, …]</code></strong> and <strong><code>LIMIT n</code></strong> (positive integer). <strong><code>ORDER BY</code></strong> keys: <strong>fixed-width</strong> types or <strong><code>Utf8</code></strong>. Without <strong><code>ORDER BY</code></strong>, <strong><code>LIMIT</code></strong> applies in stable batch/row order. <strong><code>ORDER BY</code> / <code>LIMIT</code></strong> are <strong>not</strong> supported with <strong><code>GROUP BY</code></strong> or global aggregates in this subset. Table-qualified columns allowed where documented below.</li>
+<li><strong>Compare ops</strong>: <code>=</code>, <code>!=</code> or <code>&lt;&gt;</code>, <code>&lt;</code>, <code>&lt;=</code>, <code>&gt;</code>, <code>&gt;=</code>.</li>
+<li><strong>Literals</strong>: integers, decimals (must include <code>.</code> for float literal), <code>TRUE</code> / <code>FALSE</code> for boolean columns, <strong>single-quoted strings</strong> (escape <code>''</code> inside the string) for <strong>UTF-8 column</strong> predicates.</li>
+<li><strong>Global aggregate</strong> (single grouping bucket): <code>SELECT SUM(col) FROM table [WHERE ...]</code>; <code>MIN</code> / <code>MAX</code> on <strong><code>Float64</code></strong> only; <strong><code>SUM</code></strong> on <code>Int32</code> / <code>Int64</code> / <code>Float64</code>; <strong><code>COUNT(*)</code></strong> and <strong><code>COUNT(col)</code></strong> (non-null rows only for <code>COUNT(col)</code>). <strong><code>SUM</code> / <code>MIN</code> / <code>MAX</code></strong>: when there are <strong>no non-null values</strong> (including <strong>no rows after <code>WHERE</code></strong>), the scalar result is <strong>SQL NULL</strong>, surfaced as <strong><code>IAggregateQueryResult.ValueIsNull == true</code></strong>. <strong><code>COUNT(*)</code></strong> on an empty table returns <strong>0</strong>, not NULL.</li>
+<li><strong><code>GROUP BY</code></strong> (single-table): <code>SELECT … FROM table [WHERE …] GROUP BY col [, col …]</code> where the <strong><code>SELECT</code></strong> list may mix <strong>grouping columns</strong> (each must appear in <strong><code>GROUP BY</code></strong>, matching optional table qualifier against the scanned table) and aggregates (<code>SUM</code>, <code>MIN</code>, <code>MAX</code>, <code>COUNT</code>). <strong><code>SUM(tbl.col)</code></strong>-style qualified arguments are accepted when the qualifier matches the <strong><code>FROM</code></strong> table. Output column order matches <strong><code>SELECT</code></strong>. Grouping keys may be <strong>fixed-width</strong> (<code>Int32</code>, <code>Int64</code>, <code>Float64</code>, <code>Boolean</code>) or <strong><code>Utf8</code></strong>. <strong><code>COUNT(col)</code></strong> allows <strong><code>Utf8</code></strong> (null-bitmap only). <strong><code>SUM</code>/<code>MIN</code>/<code>MAX</code></strong> null semantics per group match SQL (null bits on result columns where applicable).</li>
+<li><strong><code>INNER JOIN</code></strong>: <code>SELECT … FROM left INNER JOIN right ON left.col = right.col [AND …]</code> (equi-join keys: same type, <strong>fixed-width or <code>Utf8</code></strong>). Row query: <strong><code>SELECT *</code></strong> (all left columns then all right, output names <code>LeftName_col</code>) <strong>or</strong> explicit <strong><code>SELECT L.c, R.d</code></strong> with optional qualifiers; ambiguous bare names are rejected.</li>
+<li><strong><code>INNER JOIN</code> + <code>GROUP BY</code></strong>: <code>SELECT … FROM … INNER JOIN … ON … GROUP BY …</code> is supported. <strong><code>GROUP BY</code></strong> and non-aggregated <strong><code>SELECT</code></strong> columns must use <strong>qualified</strong> <code>table.column</code> (parser rule). Aggregates may use <strong><code>SUM(R.amt)</code></strong> or an <strong>unambiguous</strong> bare column name if it appears on only one side. The executor runs the join, then hash-aggregates over the <strong>materialized join rowset</strong> (<code>GroupedJoinPhysicalPlan</code>).</li>
+<li><strong><code>INNER JOIN</code> + sort / limit</strong>: non-grouped joins may end with <strong><code>ORDER BY</code></strong> (qualified <code>table.column</code>; with an explicit <strong><code>SELECT</code></strong> list, each sort key must appear in <strong><code>SELECT</code></strong>) and <strong><code>LIMIT</code></strong> (<code>JoinSortTopNPhysicalPlan</code>).</li>
+<li><strong>Not supported</strong>: <code>HAVING</code>, subqueries, <code>DISTINCT</code>, outer joins, quoted identifiers, expressions in <code>SELECT</code>/<code>WHERE</code>/<code>GROUP BY</code>, <strong><code>ORDER BY</code> / <code>LIMIT</code> with <code>GROUP BY</code></strong>, grouping by types other than fixed-width + <strong><code>Utf8</code></strong>.</li>
+</ul>
+<p><strong>API</strong>: <code>StrictSqlSubset.ParseLogicalPlan(sql)</code> and <strong><code>StrictSqlSubset.CompilePhysicalPlan(sql, catalog) → IPhysicalPlan</code></strong> (scan, sort/top-N, hash aggregate, join, join+sort, or grouped join) for debugging / tools without going through <code>ISqlCompiler</code>.</p>
+<h3 id="examples-by-result-shape">5.2 Examples by result shape</h3>
+<p><strong>Row set</strong> — cast to <code>IColumnarQueryResult</code>:</p>
+<pre><code class="language-csharp">await using var rows = await engine.ExecuteSqlAsync("SELECT qty FROM sales WHERE qty &gt; 1");
+if (rows is IColumnarQueryResult col)
+{
+    foreach (var batch in col.Batches)
+    {
+        var chunk = batch.Columns[0];
+        // read bytes from chunk.Values.Span per row
+    }
+}
+</code></pre>
+<p><strong>Scalar aggregate</strong> — cast to <code>IAggregateQueryResult</code>:</p>
+<pre><code class="language-csharp">await using var result = await engine.ExecuteSqlAsync("SELECT SUM(amount) FROM sales");
+if (result is IAggregateQueryResult agg)
+{
+    if (agg.ValueIsNull)
+        Console.WriteLine("NULL");
+    else if (agg.ResultType == RainDbType.Float64)
+        Console.WriteLine(agg.Float64Value);
+    else
+        Console.WriteLine(agg.Int64Value);
+}
+</code></pre>
+<p><strong>GROUP BY</strong> — again <code>IColumnarQueryResult</code> with one or more output batches:</p>
+<pre><code class="language-csharp">await using var result = await engine.ExecuteSqlAsync(
+"SELECT region, SUM(amount) FROM sales GROUP BY region");
+</code></pre>
+<h3 id="null-semantics-important">5.3 NULL semantics (important)</h3>
+<table class="table">
+<thead>
+<tr>
+<th>Construct</th>
+<th>Behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>WHERE col = literal</code></td>
+<td>Rows where <code>col</code> IS NULL do <strong>not</strong> match.</td>
+</tr>
+<tr>
+<td><code>SUM</code> / <code>MIN</code> / <code>MAX</code> (no rows or all null)</td>
+<td><code>ValueIsNull == true</code> on global aggregate.</td>
+</tr>
+<tr>
+<td><code>COUNT(*)</code></td>
+<td>Counts rows after <code>WHERE</code>; empty table → <code>0</code>, not NULL.</td>
+</tr>
+<tr>
+<td><code>COUNT(col)</code></td>
+<td>Counts non-null <code>col</code> among surviving rows.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="compile-without-executing">5.4 Compile without executing</h3>
+<p>Useful for tests, EXPLAIN-style tools, or custom execution:</p>
+<pre><code class="language-csharp">using RainDB.Sql;
+
+var plan = StrictSqlSubset.CompilePhysicalPlan(
+    "SELECT qty FROM sales WHERE qty &gt; 1",
+    engine.Catalog);
+
+var logicalOnly = StrictSqlSubset.ParseLogicalPlan("SELECT * FROM sales");
+</code></pre>
+<p>Compile failures throw <code>SqlCompileException</code> with a message (unsupported syntax, unknown table, type mismatch).</p>
+<hr>
+<h2 id="physical-plans-advanced">6. Physical plans (advanced)</h2>
+<p>Bypass SQL when benchmarking or prototyping operators:</p>
+<pre><code class="language-csharp">using RainDB.Query.Plans;
+
+var plan = new VectorizedScanPhysicalPlan(
+    table.Id,
+    outputColumnIndices: [1],
+    filters: [new ColumnCompareFilter(0, ScalarCompareOp.Gt, 1)],
+    aggregate: null,
+    options: new VectorizedScanExecutionOptions
+    {
+        MaxDegreeOfParallelism = Environment.ProcessorCount,
+        UseChannelScheduler = false,
+        UseAvx2DoubleSum = true,
+    });
+
+await using var result = await engine.ExecutePhysicalAsync(plan);
+</code></pre>
+<h3 id="parallelism-options">6.1 Parallelism options</h3>
+<table class="table">
+<thead>
+<tr>
+<th>Option</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>MaxDegreeOfParallelism = -1</code></td>
+<td>Use all logical processors.</td>
+</tr>
+<tr>
+<td><code>MaxDegreeOfParallelism = 1</code></td>
+<td>Single-threaded (deterministic debugging).</td>
+</tr>
+<tr>
+<td><code>UseChannelScheduler = true</code></td>
+<td>Channel-based morsel queue instead of <code>Parallel.For</code>.</td>
+</tr>
+</tbody>
+</table>
+<p>Output batch order matches <strong>source table batch order</strong>.</p>
+<h3 id="join-plan-direct">6.2 Join plan (direct)</h3>
+<p>Prefer SQL unless you need a specific <code>PhysicalJoinAlgorithm</code>:</p>
+<pre><code class="language-csharp">var joinPlan = new JoinPhysicalPlan(
+    PhysicalJoinAlgorithm.Hash,
+    probeTableId: left.Id,
+    buildTableId: right.Id,
+    probeKeyColumnIndices: [0],
+    buildKeyColumnIndices: [0],
+    outputSchema: /* TableSchema for wide output */,
+    outputColumnOrder: null,
+    probeSideFilters: null,
+    buildSideFilters: null);
+
+await using var joined = await engine.ExecutePhysicalAsync(joinPlan);
+</code></pre>
+<hr>
+<h2 id="reading-query-results">7. Reading query results</h2>
+<h3 id="iqueryresult">7.1 <code>IQueryResult</code></h3>
+<ul>
+<li><code>RowCount</code> — total logical rows (sum of batch rows for columnar; <code>1</code> for scalar aggregate).</li>
+<li><code>DisposeAsync()</code> — release pooled column memory when applicable.</li>
+</ul>
+<h3 id="icolumnarqueryresult">7.2 <code>IColumnarQueryResult</code></h3>
+<ul>
+<li><code>Batches</code> — <code>IReadOnlyList&lt;IColumnarBatch&gt;</code> in stable order.</li>
+<li>Each batch: <code>RowCount</code>, <code>Columns[i]</code> aligned with <code>SELECT</code> list order (not always table ordinal order).</li>
+</ul>
+<h3 id="reading-a-fixed-width-cell">7.3 Reading a fixed-width cell</h3>
+<pre><code class="language-csharp">using System.Buffers.Binary;
+
+static int ReadInt32(IColumnChunk col, int row)
+{
+    var offset = row * sizeof(int);
+    return BinaryPrimitives.ReadInt32LittleEndian(col.Values.Span.Slice(offset, 4));
+}
+
+static double ReadFloat64(IColumnChunk col, int row)
+{
+    var offset = row * sizeof(double);
+    return BitConverter.Int64BitsToDouble(
+        BinaryPrimitives.ReadInt64LittleEndian(col.Values.Span.Slice(offset, 8)));
+}
+</code></pre>
+<p>Check <code>chunk.HasNulls</code> and null bitmap before reading (see internals doc for bit layout).</p>
+<h3 id="reading-utf-8">7.4 Reading UTF-8</h3>
+<p>For <code>Utf8ColumnChunk</code>, use offset table; for <code>Utf8LengthPrefixedColumnChunk</code>, use <code>GetPayloadSpan(row)</code>.</p>
+<hr>
+<h2 id="persistence-workflows">8. Persistence workflows</h2>
+<h3 id="create-and-append-on-disk">8.1 Create and append on disk</h3>
+<pre><code class="language-csharp">var engine = RainDbEngine.OpenPersistent("./mydb");
+var table = engine.FileDatabase!.CreateMemoryTable("events", schema);
+table.AppendBatch(batch); // writes tables/{id}/000000.batch
+</code></pre>
+<h3 id="reopen">8.2 Reopen</h3>
+<pre><code class="language-csharp">var engine2 = RainDbEngine.OpenPersistent("./mydb");
+await using var r = await engine2.ExecuteSqlAsync("SELECT COUNT(*) FROM events");
+</code></pre>
+<h3 id="export-import-snapshot">8.3 Export / import snapshot</h3>
+<pre><code class="language-csharp">using RainDB.Core.Persistence;
+
+RainDbFileDatabase.ExportCatalog(engine.Catalog, "/backup/snapshot");
+var imported = RainDbFileDatabase.ImportCatalog("/backup/snapshot");
+var engineFromImport = RainDbEngine.CreateDefault(imported);
+</code></pre>
+<p>Import does <strong>not</strong> attach live append persistence unless you open a new <code>RainDbFileDatabase</code> and register tables manually.</p>
+<h3 id="flush-catalog-metadata">8.4 Flush catalog metadata</h3>
+<pre><code class="language-csharp">engine.FileDatabase?.FlushCatalog();
+</code></pre>
+<hr>
+<h2 id="customizing-the-engine">9. Customizing the engine</h2>
+<p>Inject collaborators when you outgrow defaults:</p>
+<pre><code class="language-csharp">var engine = new RainDbEngine(
+catalog: myCatalog,
+bufferPool: myPool,
+alignedBufferPool: myAlignedPool,
+executor: myExecutor,
+sqlCompiler: myCompiler,
+linqCompiler: myLinq,
+spillWriter: mySpill);
+</code></pre>
+<p>Implement:</p>
+<ul>
+<li><code>IQueryExecutor</code> — run or wrap <code>IPhysicalPlan</code>.</li>
+<li><code>ISqlCompiler</code> — parse/bind pipeline.</li>
+<li><code>ISpillWriter</code> — future external sort/spill (metrics hook today).</li>
+</ul>
+<p>Use <code>CreateSession(CancellationToken)</code> for manual execution:</p>
+<pre><code class="language-csharp">var ctx = engine.CreateSession(cancellationToken);
+var plan = await engine.SqlCompiler.CompileAsync(sql, engine.Catalog, cancellationToken);
+await using var result = await engine.Executor.ExecuteAsync(plan, ctx);
+</code></pre>
+<hr>
+<h2 id="sql-quick-reference">10. SQL quick reference</h2>
+<p>Supported (non-exhaustive; see README):</p>
+<ul>
+<li><code>SELECT</code> / <code>FROM</code> / <code>WHERE</code> (AND conjuncts) / <code>GROUP BY</code> / <code>ORDER BY</code> / <code>LIMIT</code></li>
+<li><code>INNER JOIN</code> … <code>ON</code> equi-keys</li>
+<li>Aggregates: <code>SUM</code>, <code>MIN</code>, <code>MAX</code>, <code>COUNT</code>, <code>COUNT(*)</code></li>
+<li>Comparisons: <code>=</code>, <code>!=</code>, <code>&lt;&gt;</code>, <code>&lt;</code>, <code>&lt;=</code>, <code>&gt;</code>, <code>&gt;=</code></li>
+<li>Literals: integers, <code>1.0</code> floats, <code>TRUE</code>/<code>FALSE</code>, <code>'utf8 strings'</code></li>
+</ul>
+<p><strong>Not supported:</strong> <code>HAVING</code>, subqueries, <code>DISTINCT</code>, outer joins, expressions in <code>SELECT</code>/<code>WHERE</code>, <code>ORDER BY</code> with <code>GROUP BY</code>, etc.</p>
+<p>Example scripts: <code>samples/sql/*.sql</code> and <code>samples/RainDB.AnalyticsDemo</code>.</p>
+<hr>
+<h2 id="common-pitfalls">11. Common pitfalls</h2>
+<table class="table">
+<thead>
+<tr>
+<th>Pitfall</th>
+<th>Guidance</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Forgetting <code>await using</code> on results</td>
+<td>Pooled scan output may leak array pool slots.</td>
+</tr>
+<tr>
+<td>Expecting full SQL</td>
+<td>Use section 5.1.1 strict subset; unsupported syntax throws at compile time.</td>
+</tr>
+<tr>
+<td>LINQ provider</td>
+<td><code>DefaultLinqCompiler</code> is a stub; use SQL or physical plans.</td>
+</tr>
+<tr>
+<td>Huge single batch + strict mode</td>
+<td>Stay within 64K–1M rows per append when strict is on.</td>
+</tr>
+<tr>
+<td>Crash-safe durability</td>
+<td>Batch + catalog writes are not WAL-journaled yet; plan for export snapshots.</td>
+</tr>
+<tr>
+<td>Join memory</td>
+<td>Large joins materialize matches in memory; size workloads accordingly.</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="linq-roadmap">12. LINQ (roadmap)</h2>
+<p><code>ILinqCompiler</code> is wired on <code>RainDbEngine</code> but returns <code>ExplainOnlyPhysicalPlan</code> until the LINQ provider is implemented. Do not use for production queries.</p>
+<hr>
+<h2 id="sample-end-to-end-analytics">13. Sample: end-to-end analytics</h2>
+<pre><code class="language-csharp">using RainDB;
+using RainDB.Columnar;
+using RainDB.Core.Columnar;
+using RainDB.Core.Tables;
+using RainDB.Execution;
+using RainDB.Schema;
+
+var engine = RainDbEngine.CreateDefault();
+
+var schema = new TableSchema([
+    new ColumnDef("region", RainDbType.Utf8),
+    new ColumnDef("amount", RainDbType.Float64),
+]);
+
+var table = new MemoryTable("sales", schema);
+var utf8 = new Utf8ColumnChunk(2, new[] { 0, 2, 4 }, "usuk"u8.ToArray(), ReadOnlyMemory&lt;byte&gt;.Empty, false);
+var amt = new FixedWidthColumnChunk(
+    RainDbType.Float64,
+    2,
+    BitConverter.GetBytes(1.0).Concat(BitConverter.GetBytes(2.0)).ToArray(),
+    ReadOnlyMemory&lt;byte&gt;.Empty,
+    false);
+table.AppendBatch(new ColumnarBatch(2, new IColumnChunk[] { utf8, amt }));
+engine.Catalog.Register(table);
+
+await using (var rows = await engine.ExecuteSqlAsync(
+    "SELECT region, amount FROM sales WHERE amount &gt; 0.5"))
+{
+    if (rows is IColumnarQueryResult col)
+        Console.WriteLine($"Rows: {col.RowCount}");
+}
+
+await using (var agg = await engine.ExecuteSqlAsync("SELECT SUM(amount) FROM sales"))
+{
+    if (agg is IAggregateQueryResult sum &amp;&amp; !sum.ValueIsNull)
+        Console.WriteLine($"Total: {sum.Float64Value}");
+}
+</code></pre>
+<hr>
+<h2 id="where-to-go-next">14. Where to go next</h2>
+<table class="table">
+<thead>
+<tr>
+<th>Goal</th>
+<th>Resource</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Algorithms &amp; data structures</td>
+<td><a href="RainDB-Internals.html">RainDB-Internals.md</a></td>
+</tr>
+<tr>
+<td>Roadmap</td>
+<td><a href="Development-Roadmap.html">Development-Roadmap.md</a></td>
+</tr>
+<tr>
+<td>Behavioral contract</td>
+<td><code>tests/RainDB.Tests</code>, README SQL section</td>
+</tr>
+<tr>
+<td>Demo app</td>
+<td><code>samples/RainDB.AnalyticsDemo/Program.cs</code></td>
+</tr>
+</tbody>
+</table>
+</div>
+          <footer class="doc-footer">
+            <p><a href="index.html">RainDB home</a> · <a href="https://github.com/hoihky/RainDB" target="_blank" rel="noopener">GitHub</a> · MIT License</p>
+          </footer>
+        </article>
+
+        
+                <aside class="toc" aria-label="On this page">
+                  <p class="toc-title">On this page</p>
+                  <ul>
+                    
+                        <li class="toc-h1">
+                          <a href="#raindb-programming-guide">RainDB programming guide</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#1-getting-started">1. Getting started</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#11-build-and-test">1.1 Build and test</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#12-referencing-raindb-from-your-app">1.2 Referencing RainDB from your app</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#2-engine-lifecycle">2. Engine lifecycle</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#21-in-memory-engine-default">2.1 In-memory engine (default)</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#22-persistent-directory-database">2.2 Persistent directory database</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#23-custom-catalog">2.3 Custom catalog</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#24-disposal-pattern">2.4 Disposal pattern</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#3-defining-tables-and-schema">3. Defining tables and schema</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#31-schema">3.1 Schema</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#32-registering-a-memory-table">3.2 Registering a memory table</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#33-strict-vector-sizing-optional">3.3 Strict vector sizing (optional)</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#4-building-columnar-data">4. Building columnar data</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#41-fixed-width-columns">4.1 Fixed-width columns</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#42-null-bitmap">4.2 Null bitmap</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#43-utf-8-columns-arrow-style">4.3 UTF-8 columns (Arrow style)</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#44-appending-batches">4.4 Appending batches</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#5-running-sql">5. Running SQL</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#51-execute-a-query">5.1 Execute a query</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#511-strict-sql-subset-supported-today">5.1.1 Strict SQL subset (supported today)</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#52-examples-by-result-shape">5.2 Examples by result shape</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#53-null-semantics-important">5.3 NULL semantics (important)</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#54-compile-without-executing">5.4 Compile without executing</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#6-physical-plans-advanced">6. Physical plans (advanced)</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#61-parallelism-options">6.1 Parallelism options</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#62-join-plan-direct">6.2 Join plan (direct)</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#7-reading-query-results">7. Reading query results</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#71">7.1 </a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#72">7.2 </a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#73-reading-a-fixed-width-cell">7.3 Reading a fixed-width cell</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#74-reading-utf-8">7.4 Reading UTF-8</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#8-persistence-workflows">8. Persistence workflows</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#81-create-and-append-on-disk">8.1 Create and append on disk</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#82-reopen">8.2 Reopen</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#83-export-import-snapshot">8.3 Export / import snapshot</a>
+                        </li>
+                        
+                        <li class="toc-h3">
+                          <a href="#84-flush-catalog-metadata">8.4 Flush catalog metadata</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#9-customizing-the-engine">9. Customizing the engine</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#10-sql-quick-reference">10. SQL quick reference</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#11-common-pitfalls">11. Common pitfalls</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#12-linq-roadmap">12. LINQ (roadmap)</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#13-sample-end-to-end-analytics">13. Sample: end-to-end analytics</a>
+                        </li>
+                        
+                        <li class="toc-h2">
+                          <a href="#14-where-to-go-next">14. Where to go next</a>
+                        </li>
+                        
+                  </ul>
+                </aside>
+                
+      </main>
+    </div>
+  </div>
+  <script src="assets/vendor/mermaid.min.js"></script>
+  <script src="assets/vendor/highlight.min.js"></script>
+  <script src="assets/js/site.js"></script>
+</body>
+</html>

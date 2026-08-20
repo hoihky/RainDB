@@ -1,0 +1,90 @@
+/* Print styles for MDWeb PDF export (used by _mdweb-print.html) */
+
+.print-document {
+  max-width: 820px;
+  margin: 0 auto;
+  padding: 2rem 2.5rem 3rem;
+  background: #fff;
+  color: #0f172a;
+}
+
+.print-cover {
+  min-height: 70vh;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  text-align: center;
+  page-break-after: always;
+}
+
+.print-cover h1 {
+  font-size: 2.25rem;
+  margin: 0 0 1rem;
+  border: none;
+  padding: 0;
+}
+
+.print-cover p {
+  font-size: 1.1rem;
+  color: #64748b;
+  max-width: 36rem;
+}
+
+.print-chapter {
+  margin-bottom: 3rem;
+  page-break-before: always;
+}
+
+.print-chapter-header {
+  margin-bottom: 1.5rem;
+  padding-bottom: 0.75rem;
+  border-bottom: 2px solid #e2e8f0;
+}
+
+.print-part-label {
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #6366f1;
+  margin: 0 0 0.35rem;
+}
+
+.print-chapter-header h2 {
+  margin: 0;
+  font-size: 1.75rem;
+  border: none;
+  padding: 0;
+}
+
+.print-chapter .doc-body {
+  font-size: 0.95rem;
+}
+
+@media print {
+  body {
+    background: #fff;
+  }
+
+  .print-document {
+    padding: 0;
+    max-width: none;
+  }
+
+  .print-chapter {
+    page-break-before: always;
+  }
+
+  h1, h2, h3, h4 {
+    page-break-after: avoid;
+  }
+
+  pre, table, blockquote, .mermaid {
+    page-break-inside: avoid;
+  }
+
+  a {
+    color: #0f172a;
+    text-decoration: underline;
+  }
+}

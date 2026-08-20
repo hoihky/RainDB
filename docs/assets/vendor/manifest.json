@@ -1,0 +1,24 @@
+{
+  "assets": [
+    {
+      "name": "mermaid",
+      "file": "mermaid.min.js",
+      "version": "11.15.0",
+      "registry": "npm",
+      "package": "mermaid",
+      "source": "https://www.npmjs.com/package/mermaid/v/11.15.0",
+      "socket": "https://socket.dev/npm/package/mermaid/overview/11.15.0",
+      "npmIntegrity": "sha512-pTMbcf3rWdtLiYGpmoTjHEpeY8seiy6sR+9nD7LOs8KfUbHE4lOUAprTRqRAcWSQ6MQpdX+YEsxShtGsINtPtw==",
+      "sriSha384": "sha384-yQ4mmBBT+vhTAwjFH0toJXNYJ6O4usWnt6EPIdWwrRvx2V/n5lXuDZQwQFeSFydF",
+      "securityNotes": "11.15.0 fixes CSS/HTML injection and DoS issues in <=11.14.0 (CVE-2026-41148, CVE-2026-41149, CVE-2026-41150, CVE-2026-41159). Runtime uses securityLevel: strict (inline SVG, sanitized). Do not add crossorigin on script tag — it breaks file:// viewing."
+    },
+    {
+      "name": "highlight.js",
+      "file": "highlight.min.js",
+      "version": "11.9.0",
+      "registry": "npm",
+      "package": "@highlightjs/cdn-assets",
+      "source": "https://www.npmjs.com/package/@highlightjs/cdn-assets/v/11.9.0"
+    }
+  ]
+}
