@@ -4,12 +4,9 @@ namespace RainDB.Query.Execution.Sorting;
 /// Retains the <paramref name="k"/> best rows per an <see cref="IComparer{T}"/> (sort-order) using a bounded max-heap.
 /// Memory is O(k); does not sort the result — callers sort the returned span for output order.
 /// </summary>
-internal static class BoundedTopKHeap
+internal sealed class BoundedTopKHeap
 {
-    /// <summary>
-    /// Returns exactly <paramref name="k"/> row locations that belong in the global top-k (best k per comparer).
-    /// </summary>
-    public static RowLocation[] Select(ReadOnlySpan<RowLocation> candidates, int k, IComparer<RowLocation> comparer)
+    public RowLocation[] Select(ReadOnlySpan<RowLocation> candidates, int k, IComparer<RowLocation> comparer)
     {
         if (k <= 0)
             throw new ArgumentOutOfRangeException(nameof(k));

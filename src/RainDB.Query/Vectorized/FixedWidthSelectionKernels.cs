@@ -9,9 +9,14 @@ using RainDB.Schema;
 namespace RainDB.Query.Vectorized;
 
 /// <summary>Fixed-width compare kernels writing dense selection vectors (row indices).</summary>
-internal static class FixedWidthSelectionKernels
+internal sealed class FixedWidthSelectionKernels
 {
-    internal static int FillSelectedIndices(
+    private readonly SelectionEvaluator _selection;
+
+    public FixedWidthSelectionKernels(SelectionEvaluator selection) =>
+        _selection = selection ?? throw new ArgumentNullException(nameof(selection));
+
+    internal int FillSelectedIndices(
         IColumnChunk column,
         ColumnCompareFilter filter,
         Span<int> dest)
@@ -35,7 +40,7 @@ internal static class FixedWidthSelectionKernels
     }
 
     /// <summary>Compact <paramref name="selectedRows"/>[0..<paramref name="count"/>] to rows that also pass <paramref name="filter"/>.</summary>
-    internal static int IntersectSelectedIndices(
+    internal int IntersectSelectedIndices(
         IColumnChunk column,
         ColumnCompareFilter filter,
         Span<int> selectedRows,
@@ -66,7 +71,7 @@ internal static class FixedWidthSelectionKernels
                 for (var r = 0; r < count; r++)
                 {
                     var row = selectedRows[r];
-                    if (SelectionEvaluator.RowMatchesFilter(column, filter, row))
+                    if (_selection.RowMatchesFilter(column, filter, row))
                         selectedRows[write++] = row;
                 }
 
@@ -76,7 +81,7 @@ internal static class FixedWidthSelectionKernels
         return write;
     }
 
-    private static int FillInt32(
+    private int FillInt32(
         ReadOnlySpan<byte> values,
         ReadOnlySpan<byte> nb,
         bool hasNulls,
@@ -91,7 +96,7 @@ internal static class FixedWidthSelectionKernels
         var count = 0;
         for (var i = 0; i < ints.Length; i++)
         {
-            if (SelectionEvaluator.IsNull(nb, i, hasNulls))
+            if (_selection.IsNull(nb, i, hasNulls))
                 continue;
             if (CompareInt32(ints[i], imm, op))
                 dest[count++] = i;
@@ -127,7 +132,7 @@ internal static class FixedWidthSelectionKernels
         return count;
     }
 
-    private static int IntersectInt32(
+    private int IntersectInt32(
         ReadOnlySpan<byte> values,
         ReadOnlySpan<byte> nb,
         bool hasNulls,
@@ -141,7 +146,7 @@ internal static class FixedWidthSelectionKernels
         for (var r = 0; r < count; r++)
         {
             var i = selectedRows[r];
-            if (SelectionEvaluator.IsNull(nb, i, hasNulls))
+            if (_selection.IsNull(nb, i, hasNulls))
                 continue;
             if (CompareInt32(ints[i], imm, op))
                 selectedRows[write++] = i;
@@ -150,7 +155,7 @@ internal static class FixedWidthSelectionKernels
         return write;
     }
 
-    private static int FillInt64(
+    private int FillInt64(
         ReadOnlySpan<byte> values,
         ReadOnlySpan<byte> nb,
         bool hasNulls,
@@ -162,7 +167,7 @@ internal static class FixedWidthSelectionKernels
         var longs = MemoryMarshal.Cast<byte, long>(values);
         for (var i = 0; i < longs.Length; i++)
         {
-            if (SelectionEvaluator.IsNull(nb, i, hasNulls))
+            if (_selection.IsNull(nb, i, hasNulls))
                 continue;
             if (CompareInt64(longs[i], imm, op))
                 dest[count++] = i;
@@ -171,7 +176,7 @@ internal static class FixedWidthSelectionKernels
         return count;
     }
 
-    private static int IntersectInt64(
+    private int IntersectInt64(
         ReadOnlySpan<byte> values,
         ReadOnlySpan<byte> nb,
         bool hasNulls,
@@ -185,7 +190,7 @@ internal static class FixedWidthSelectionKernels
         for (var r = 0; r < count; r++)
         {
             var i = selectedRows[r];
-            if (SelectionEvaluator.IsNull(nb, i, hasNulls))
+            if (_selection.IsNull(nb, i, hasNulls))
                 continue;
             if (CompareInt64(longs[i], imm, op))
                 selectedRows[write++] = i;
@@ -194,7 +199,7 @@ internal static class FixedWidthSelectionKernels
         return write;
     }
 
-    private static int FillFloat64(
+    private int FillFloat64(
         ReadOnlySpan<byte> values,
         ReadOnlySpan<byte> nb,
         bool hasNulls,
@@ -206,7 +211,7 @@ internal static class FixedWidthSelectionKernels
         var doubles = MemoryMarshal.Cast<byte, double>(values);
         for (var i = 0; i < doubles.Length; i++)
         {
-            if (SelectionEvaluator.IsNull(nb, i, hasNulls))
+            if (_selection.IsNull(nb, i, hasNulls))
                 continue;
             if (CompareDouble(doubles[i], imm, op))
                 dest[count++] = i;
@@ -215,7 +220,7 @@ internal static class FixedWidthSelectionKernels
         return count;
     }
 
-    private static int IntersectFloat64(
+    private int IntersectFloat64(
         ReadOnlySpan<byte> values,
         ReadOnlySpan<byte> nb,
         bool hasNulls,
@@ -229,7 +234,7 @@ internal static class FixedWidthSelectionKernels
         for (var r = 0; r < count; r++)
         {
             var i = selectedRows[r];
-            if (SelectionEvaluator.IsNull(nb, i, hasNulls))
+            if (_selection.IsNull(nb, i, hasNulls))
                 continue;
             if (CompareDouble(doubles[i], imm, op))
                 selectedRows[write++] = i;
@@ -238,7 +243,7 @@ internal static class FixedWidthSelectionKernels
         return write;
     }
 
-    private static int FillBool(
+    private int FillBool(
         ReadOnlySpan<byte> values,
         ReadOnlySpan<byte> nb,
         bool hasNulls,
@@ -249,7 +254,7 @@ internal static class FixedWidthSelectionKernels
         var count = 0;
         for (var i = 0; i < values.Length; i++)
         {
-            if (SelectionEvaluator.IsNull(nb, i, hasNulls))
+            if (_selection.IsNull(nb, i, hasNulls))
                 continue;
             var v = values[i] != 0;
             if (CompareBool(v, imm, op))
@@ -259,7 +264,7 @@ internal static class FixedWidthSelectionKernels
         return count;
     }
 
-    private static int IntersectBool(
+    private int IntersectBool(
         ReadOnlySpan<byte> values,
         ReadOnlySpan<byte> nb,
         bool hasNulls,
@@ -272,7 +277,7 @@ internal static class FixedWidthSelectionKernels
         for (var r = 0; r < count; r++)
         {
             var i = selectedRows[r];
-            if (SelectionEvaluator.IsNull(nb, i, hasNulls))
+            if (_selection.IsNull(nb, i, hasNulls))
                 continue;
             var v = values[i] != 0;
             if (CompareBool(v, imm, op))

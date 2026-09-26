@@ -5,10 +5,9 @@ using System.Runtime.Intrinsics.X86;
 namespace RainDB.Core.Columnar;
 
 /// <summary>Hardware-accelerated reductions for contiguous fixed-width columns (scalar fallbacks always available).</summary>
-public static class AggregateIntrinsics
+public sealed class ColumnarAggregateIntrinsics : IColumnarAggregateIntrinsics
 {
-    /// <summary>Sum of contiguous little-endian <see cref="double"/> values (no nulls / caller filtered).</summary>
-    public static double SumFloat64(ReadOnlySpan<byte> valuesLittleEndian, bool allowAvx2 = true)
+    public double SumFloat64(ReadOnlySpan<byte> valuesLittleEndian, bool allowAvx2 = true)
     {
         if (valuesLittleEndian.Length % sizeof(double) != 0)
             throw new ArgumentException("Length must be multiple of 8.", nameof(valuesLittleEndian));
@@ -20,8 +19,7 @@ public static class AggregateIntrinsics
         return SumDoubleScalar(doubles);
     }
 
-    /// <summary>Minimum of contiguous little-endian <see cref="double"/> values (empty span → <see cref="double.NaN"/>).</summary>
-    public static double MinFloat64(ReadOnlySpan<byte> valuesLittleEndian, bool allowAvx2 = true)
+    public double MinFloat64(ReadOnlySpan<byte> valuesLittleEndian, bool allowAvx2 = true)
     {
         if (valuesLittleEndian.Length % sizeof(double) != 0)
             throw new ArgumentException("Length must be multiple of 8.", nameof(valuesLittleEndian));
@@ -33,8 +31,7 @@ public static class AggregateIntrinsics
         return MinDoubleScalar(doubles);
     }
 
-    /// <summary>Maximum of contiguous little-endian <see cref="double"/> values (empty span → <see cref="double.NaN"/>).</summary>
-    public static double MaxFloat64(ReadOnlySpan<byte> valuesLittleEndian, bool allowAvx2 = true)
+    public double MaxFloat64(ReadOnlySpan<byte> valuesLittleEndian, bool allowAvx2 = true)
     {
         if (valuesLittleEndian.Length % sizeof(double) != 0)
             throw new ArgumentException("Length must be multiple of 8.", nameof(valuesLittleEndian));
@@ -46,8 +43,7 @@ public static class AggregateIntrinsics
         return MaxDoubleScalar(doubles);
     }
 
-    /// <summary>Sum of contiguous little-endian <see cref="int"/> values (widened to <see cref="long"/>).</summary>
-    public static long SumInt32(ReadOnlySpan<byte> valuesLittleEndian, bool allowSimd = true)
+    public long SumInt32(ReadOnlySpan<byte> valuesLittleEndian, bool allowSimd = true)
     {
         if (valuesLittleEndian.Length % sizeof(int) != 0)
             throw new ArgumentException("Length must be multiple of 4.", nameof(valuesLittleEndian));
@@ -59,8 +55,7 @@ public static class AggregateIntrinsics
         return SumInt32Scalar(ints);
     }
 
-    /// <summary>Sum of contiguous little-endian <see cref="long"/> values.</summary>
-    public static long SumInt64(ReadOnlySpan<byte> valuesLittleEndian, bool allowAvx2 = true)
+    public long SumInt64(ReadOnlySpan<byte> valuesLittleEndian, bool allowAvx2 = true)
     {
         if (valuesLittleEndian.Length % sizeof(long) != 0)
             throw new ArgumentException("Length must be multiple of 8.", nameof(valuesLittleEndian));
@@ -72,8 +67,7 @@ public static class AggregateIntrinsics
         return SumInt64Scalar(longs);
     }
 
-    /// <summary>Deterministic 64-bit mix for composite hash keys (scalar; stable across platforms).</summary>
-    public static ulong MixHash(ulong hash, ulong value) =>
+    public ulong MixHash(ulong hash, ulong value) =>
         unchecked(hash ^ (value + 0x9e3779b97f4a7c15UL + (hash << 6) + (hash >> 2)));
 
     private static double SumDoubleScalar(ReadOnlySpan<double> values)

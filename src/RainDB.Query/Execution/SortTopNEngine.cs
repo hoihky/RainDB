@@ -4,6 +4,7 @@ using RainDB.Catalog;
 using RainDB.Columnar;
 using RainDB.Core.Columnar;
 using RainDB.Execution;
+using RainDB.Query.Execution.Operators;
 using RainDB.Query.Execution.Sorting;
 using RainDB.Query.Plans;
 using RainDB.Query.Results;
@@ -13,9 +14,23 @@ using RainDB.Schema;
 namespace RainDB.Query.Execution;
 
 /// <summary>In-memory sort and/or LIMIT over columnar batches (single-table or pre-materialized join output).</summary>
-public static class SortTopNEngine
+public sealed class SortTopNOperator : Operators.ISortTopNOperator
 {
-    public static ValueTask<IQueryResult> ExecuteTableAsync(
+    private readonly Operators.IJoinOperator _join;
+    private readonly QueryOperatorDependencies _deps;
+
+    public SortTopNOperator(Operators.IJoinOperator join)
+        : this(join, new QueryOperatorDependencies())
+    {
+    }
+
+    internal SortTopNOperator(Operators.IJoinOperator join, QueryOperatorDependencies dependencies)
+    {
+        _join = join ?? throw new ArgumentNullException(nameof(join));
+        _deps = dependencies ?? throw new ArgumentNullException(nameof(dependencies));
+    }
+
+    public ValueTask<IQueryResult> ExecuteTableAsync(
         SortTopNPhysicalPlan plan,
         IColumnarTableSource table,
         IExecutionContext context)
@@ -31,7 +46,7 @@ public static class SortTopNEngine
         var batches = table.Batches;
         var ct = context.CancellationToken;
         var rows = CollectFilteredRows(batches, plan.Filters, ct);
-        var ordered = SortTopNRowSelection.SelectInSortOrder(
+        var ordered = _deps.SortTopNSelection.SelectInSortOrder(
             rows,
             plan.SortKeys,
             plan.Limit,
@@ -41,7 +56,7 @@ public static class SortTopNEngine
         return new ValueTask<IQueryResult>(new ColumnarMaterializedQueryResult([batch]));
     }
 
-    public static async ValueTask<IQueryResult> ExecuteJoinAsync(
+    public async ValueTask<IQueryResult> ExecuteJoinAsync(
         JoinSortTopNPhysicalPlan plan,
         IColumnarTableSource probeTable,
         IColumnarTableSource buildTable,
@@ -51,14 +66,14 @@ public static class SortTopNEngine
         ArgumentNullException.ThrowIfNull(probeTable);
         ArgumentNullException.ThrowIfNull(buildTable);
         ArgumentNullException.ThrowIfNull(context);
-        var joinRes = await JoinExecutionEngine.ExecuteAsync(plan.Join, probeTable, buildTable, context).ConfigureAwait(false);
+        var joinRes = await _join.ExecuteAsync(plan.Join, probeTable, buildTable, context).ConfigureAwait(false);
         if (joinRes is not IColumnarQueryResult col)
             throw new InvalidOperationException("Join must return columnar result.");
         var batches = col.Batches;
         var schema = plan.Join.OutputSchema;
         ValidateSortKeys(schema, plan.SortKeys);
         var rows = CollectAllRows(batches, context.CancellationToken);
-        var ordered = SortTopNRowSelection.SelectInSortOrder(
+        var ordered = _deps.SortTopNSelection.SelectInSortOrder(
             rows,
             plan.SortKeys,
             plan.Limit,
@@ -101,7 +116,7 @@ public static class SortTopNEngine
         }
     }
 
-    private static RowLocation[] CollectFilteredRows(
+    private RowLocation[] CollectFilteredRows(
         IReadOnlyList<IColumnarBatch> batches,
         ColumnCompareFilter[]? filters,
         CancellationToken ct)
@@ -121,7 +136,7 @@ public static class SortTopNEngine
                 int k;
                 if (filters is { Length: > 0 } fa)
                 {
-                    k = SelectionEvaluator.FillSelectedRowsConjunctive(batch, fa, tmp.AsSpan(0, batch.RowCount));
+                    k = _deps.Selection.FillSelectedRowsConjunctive(batch, fa, tmp.AsSpan(0, batch.RowCount));
                     for (var i = 0; i < k; i++)
                         list.Add(new RowLocation(bi, tmp[i]));
                 }
@@ -154,7 +169,7 @@ public static class SortTopNEngine
         return list.ToArray();
     }
 
-    private static ColumnarBatch MaterializeRows(
+    private ColumnarBatch MaterializeRows(
         IReadOnlyList<IColumnarBatch> batches,
         TableSchema schema,
         ReadOnlySpan<RowLocation> rows,
@@ -174,7 +189,7 @@ public static class SortTopNEngine
         return new ColumnarBatch(n, cols);
     }
 
-    private static IColumnChunk GatherFixedWidthColumn(
+    private IColumnChunk GatherFixedWidthColumn(
         IReadOnlyList<IColumnarBatch> batches,
         int colIx,
         RainDbType type,
@@ -191,7 +206,7 @@ public static class SortTopNEngine
             var col = batches[loc.BatchIndex].Columns[colIx];
             var r = loc.RowIndex;
             var srcNb = col.HasNulls ? col.NullBitmap.Span : ReadOnlySpan<byte>.Empty;
-            if (SelectionEvaluator.IsNull(srcNb, r, col.HasNulls))
+            if (_deps.Selection.IsNull(srcNb, r, col.HasNulls))
             {
                 anyNull = true;
                 SetNull(nb, o);
@@ -204,7 +219,7 @@ public static class SortTopNEngine
         return new FixedWidthColumnChunk(type, rows.Length, values, nb, anyNull);
     }
 
-    private static IColumnChunk GatherUtf8Column(IReadOnlyList<IColumnarBatch> batches, int colIx, ReadOnlySpan<RowLocation> rows)
+    private IColumnChunk GatherUtf8Column(IReadOnlyList<IColumnarBatch> batches, int colIx, ReadOnlySpan<RowLocation> rows)
     {
         var offsets = new int[rows.Length + 1];
         using var blob = new MemoryStream();
@@ -218,7 +233,7 @@ public static class SortTopNEngine
             var col = batches[loc.BatchIndex].Columns[colIx];
             var r = loc.RowIndex;
             var srcNb = col.HasNulls ? col.NullBitmap.Span : ReadOnlySpan<byte>.Empty;
-            if (SelectionEvaluator.IsNull(srcNb, r, col.HasNulls))
+            if (_deps.Selection.IsNull(srcNb, r, col.HasNulls))
             {
                 anyNull = true;
                 SetNull(nb, o);

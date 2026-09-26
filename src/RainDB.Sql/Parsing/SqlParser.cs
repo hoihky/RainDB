@@ -5,9 +5,9 @@ using RainDB.Sql;
 
 namespace RainDB.Sql.Parsing;
 
-internal static class SqlParser
+public sealed class SqlParser
 {
-    public static LogicalPlan Parse(string sql)
+    public LogicalPlan Parse(string sql)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(sql);
         var trimmed = sql.Trim();

@@ -3,6 +3,7 @@ using RainDB.Columnar;
 using RainDB.Core.Columnar;
 using RainDB.Execution;
 using RainDB.Query.Execution.Joining;
+using RainDB.Query.Execution.Operators;
 using RainDB.Query.Plans;
 using RainDB.Query.Results;
 using RainDB.Query.Vectorized;
@@ -11,8 +12,18 @@ using RainDB.Schema;
 namespace RainDB.Query.Execution;
 
 /// <summary>Phase 2 inner equi-join: hash build on the right, probe from the left; or sort-merge on join keys.</summary>
-public static class JoinExecutionEngine
+public sealed class JoinOperator : Operators.IJoinOperator
 {
+    private readonly QueryOperatorDependencies _deps;
+
+    public JoinOperator()
+        : this(new QueryOperatorDependencies())
+    {
+    }
+
+    internal JoinOperator(QueryOperatorDependencies dependencies) =>
+        _deps = dependencies ?? throw new ArgumentNullException(nameof(dependencies));
+
     private readonly record struct RowRef(int BatchIdx, int RowIdx);
 
     private sealed class SortEntryFixed
@@ -25,7 +36,7 @@ public static class JoinExecutionEngine
     }
 
     /// <summary>Probe-driven join: emits output in fixed-size chunks (no full <c>List&lt;match&gt;</c>).</summary>
-    internal static void ExecuteStreaming(
+    public void ExecuteStreaming(
         JoinPhysicalPlan plan,
         IColumnarTableSource probeTable,
         IColumnarTableSource buildTable,
@@ -53,6 +64,7 @@ public static class JoinExecutionEngine
             probeSchema,
             buildSchema,
             emitBatch,
+            _deps.JoinMaterializer,
             matchChunkRowCount);
 
         var utf8JoinKeys = JoinKeysIncludeUtf8(probeSchema, plan.ProbeKeyColumnIndices);
@@ -77,7 +89,7 @@ public static class JoinExecutionEngine
         emitter.Flush();
     }
 
-    public static ValueTask<IQueryResult> ExecuteAsync(
+    public ValueTask<IQueryResult> ExecuteAsync(
         JoinPhysicalPlan plan,
         IColumnarTableSource probeTable,
         IColumnarTableSource buildTable,
@@ -86,7 +98,7 @@ public static class JoinExecutionEngine
         var batches = new List<ColumnarBatch>();
         ExecuteStreaming(plan, probeTable, buildTable, context, batches.Add);
         if (batches.Count == 0)
-            batches.Add(JoinBatchMaterializer.EmptyBatch(plan));
+            batches.Add(_deps.JoinMaterializer.EmptyBatch(plan));
 
         IQueryResult r = new ColumnarMaterializedQueryResult(batches);
         return new ValueTask<IQueryResult>(r);
@@ -155,20 +167,20 @@ public static class JoinExecutionEngine
         }
     }
 
-    private static bool RowPassesAll(IColumnarBatch batch, ColumnCompareFilter[]? filters, int row)
+    private bool RowPassesAll(IColumnarBatch batch, ColumnCompareFilter[]? filters, int row)
     {
         if (filters is null || filters.Length == 0)
             return true;
         foreach (var f in filters)
         {
-            if (!SelectionEvaluator.RowMatchesFilter(batch.Columns[f.ColumnIndex], f, row))
+            if (!_deps.Selection.RowMatchesFilter(batch.Columns[f.ColumnIndex], f, row))
                 return false;
         }
 
         return true;
     }
 
-    private static void RunHashJoinFixed(
+    private void RunHashJoinFixed(
         JoinPhysicalPlan plan,
         IReadOnlyList<IColumnarBatch> probeBatches,
         IReadOnlyList<IColumnarBatch> buildBatches,
@@ -179,7 +191,7 @@ public static class JoinExecutionEngine
         ProbeHashJoinFixed(plan, probeBatches, dict, ct, emitter);
     }
 
-    private static Dictionary<GroupKey, List<RowRef>> BuildHashIndexFixed(
+    private Dictionary<GroupKey, List<RowRef>> BuildHashIndexFixed(
         JoinPhysicalPlan plan,
         IReadOnlyList<IColumnarBatch> buildBatches,
         CancellationToken ct)
@@ -194,7 +206,7 @@ public static class JoinExecutionEngine
             {
                 if (!RowPassesAll(batch, plan.BuildSideFilters, row))
                     continue;
-                var key = FixedWidthGroupKeyBuilder.BuildKey(batch, row, plan.BuildKeyColumnIndices, scratch);
+                var key = _deps.GroupKeys.BuildKey(batch, row, plan.BuildKeyColumnIndices, scratch);
                 if (key.NullMask != 0)
                     continue;
                 if (!dict.TryGetValue(key, out var list))
@@ -210,7 +222,7 @@ public static class JoinExecutionEngine
         return dict;
     }
 
-    private static void ProbeHashJoinFixed(
+    private void ProbeHashJoinFixed(
         JoinPhysicalPlan plan,
         IReadOnlyList<IColumnarBatch> probeBatches,
         Dictionary<GroupKey, List<RowRef>> dict,
@@ -226,7 +238,7 @@ public static class JoinExecutionEngine
             {
                 if (!RowPassesAll(batch, plan.ProbeSideFilters, row))
                     continue;
-                var key = FixedWidthGroupKeyBuilder.BuildKey(batch, row, plan.ProbeKeyColumnIndices, scratch);
+                var key = _deps.GroupKeys.BuildKey(batch, row, plan.ProbeKeyColumnIndices, scratch);
                 if (key.NullMask != 0)
                     continue;
                 if (!dict.TryGetValue(key, out var list))
@@ -237,7 +249,7 @@ public static class JoinExecutionEngine
         }
     }
 
-    private static void RunHashJoinUtf8(
+    private void RunHashJoinUtf8(
         JoinPhysicalPlan plan,
         IReadOnlyList<IColumnarBatch> probeBatches,
         IReadOnlyList<IColumnarBatch> buildBatches,
@@ -250,7 +262,7 @@ public static class JoinExecutionEngine
         ProbeHashJoinUtf8(plan, probeBatches, probeSchema, dict, ct, emitter);
     }
 
-    private static Dictionary<CompositeJoinKey, List<RowRef>> BuildHashIndexUtf8(
+    private Dictionary<CompositeJoinKey, List<RowRef>> BuildHashIndexUtf8(
         JoinPhysicalPlan plan,
         IReadOnlyList<IColumnarBatch> buildBatches,
         TableSchema buildSchema,
@@ -265,7 +277,7 @@ public static class JoinExecutionEngine
             {
                 if (!RowPassesAll(batch, plan.BuildSideFilters, row))
                     continue;
-                var key = CompositeJoinKeyBuilder.Build(buildSchema, batch, row, plan.BuildKeyColumnIndices);
+                var key = _deps.CompositeJoinKeys.Build(buildSchema, batch, row, plan.BuildKeyColumnIndices);
                 if (key.NullMask != 0)
                     continue;
                 if (!dict.TryGetValue(key, out var list))
@@ -281,7 +293,7 @@ public static class JoinExecutionEngine
         return dict;
     }
 
-    private static void ProbeHashJoinUtf8(
+    private void ProbeHashJoinUtf8(
         JoinPhysicalPlan plan,
         IReadOnlyList<IColumnarBatch> probeBatches,
         TableSchema probeSchema,
@@ -297,7 +309,7 @@ public static class JoinExecutionEngine
             {
                 if (!RowPassesAll(batch, plan.ProbeSideFilters, row))
                     continue;
-                var key = CompositeJoinKeyBuilder.Build(probeSchema, batch, row, plan.ProbeKeyColumnIndices);
+                var key = _deps.CompositeJoinKeys.Build(probeSchema, batch, row, plan.ProbeKeyColumnIndices);
                 if (key.NullMask != 0)
                     continue;
                 if (!dict.TryGetValue(key, out var list))
@@ -308,7 +320,7 @@ public static class JoinExecutionEngine
         }
     }
 
-    private static void RunSortMergeJoinFixed(
+    private void RunSortMergeJoinFixed(
         JoinPhysicalPlan plan,
         IReadOnlyList<IColumnarBatch> probeBatches,
         IReadOnlyList<IColumnarBatch> buildBatches,
@@ -326,7 +338,7 @@ public static class JoinExecutionEngine
         MergeSortedKeyRuns(left, right, comparer, ct, emitter);
     }
 
-    private static void RunSortMergeJoinUtf8(
+    private void RunSortMergeJoinUtf8(
         JoinPhysicalPlan plan,
         IReadOnlyList<IColumnarBatch> probeBatches,
         IReadOnlyList<IColumnarBatch> buildBatches,
@@ -345,7 +357,7 @@ public static class JoinExecutionEngine
         MergeSortedCompositeRuns(left, right, comparer, ct, emitter);
     }
 
-    private static void MergeSortedKeyRuns(
+    private void MergeSortedKeyRuns(
         List<SortEntryFixed> left,
         List<SortEntryFixed> right,
         GroupKeyComparer comparer,
@@ -391,7 +403,7 @@ public static class JoinExecutionEngine
         }
     }
 
-    private static void MergeSortedCompositeRuns(
+    private void MergeSortedCompositeRuns(
         List<SortEntryUtf8> left,
         List<SortEntryUtf8> right,
         CompositeJoinKeyComparer comparer,
@@ -446,7 +458,7 @@ public static class JoinExecutionEngine
         public int RowIdx { get; init; }
     }
 
-    private static List<SortEntryFixed> FlattenNonNullFixedKeys(
+    private List<SortEntryFixed> FlattenNonNullFixedKeys(
         IReadOnlyList<IColumnarBatch> batches,
         int[] keyIndices,
         ColumnCompareFilter[]? sideFilters,
@@ -462,7 +474,7 @@ public static class JoinExecutionEngine
             {
                 if (!RowPassesAll(batch, sideFilters, row))
                     continue;
-                var key = FixedWidthGroupKeyBuilder.BuildKey(batch, row, keyIndices, scratch);
+                var key = _deps.GroupKeys.BuildKey(batch, row, keyIndices, scratch);
                 if (key.NullMask != 0)
                     continue;
                 list.Add(new SortEntryFixed { Key = key, BatchIdx = bi, RowIdx = row });
@@ -472,7 +484,7 @@ public static class JoinExecutionEngine
         return list;
     }
 
-    private static List<SortEntryUtf8> FlattenNonNullCompositeKeys(
+    private List<SortEntryUtf8> FlattenNonNullCompositeKeys(
         IReadOnlyList<IColumnarBatch> batches,
         int[] keyIndices,
         ColumnCompareFilter[]? sideFilters,
@@ -488,7 +500,7 @@ public static class JoinExecutionEngine
             {
                 if (!RowPassesAll(batch, sideFilters, row))
                     continue;
-                var key = CompositeJoinKeyBuilder.Build(schema, batch, row, keyIndices);
+                var key = _deps.CompositeJoinKeys.Build(schema, batch, row, keyIndices);
                 if (key.NullMask != 0)
                     continue;
                 list.Add(new SortEntryUtf8 { Key = key, BatchIdx = bi, RowIdx = row });

@@ -9,22 +9,23 @@ namespace RainDB.Sql.Compilation;
 public sealed class DefaultSqlCompiler : ISqlCompiler
 {
     private readonly VectorizedScanExecutionOptions _defaultScanOptions;
+    private readonly LogicalPlanCompiler _logicalCompiler;
 
-    public DefaultSqlCompiler(VectorizedScanExecutionOptions defaultScanOptions = default) =>
+    public DefaultSqlCompiler(
+        VectorizedScanExecutionOptions defaultScanOptions = default,
+        LogicalPlanCompiler? logicalCompiler = null)
+    {
         _defaultScanOptions = defaultScanOptions;
+        _logicalCompiler = logicalCompiler ?? new LogicalPlanCompiler();
+    }
 
     public ValueTask<IPhysicalPlan> CompileAsync(string sql, ICatalog catalog, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(sql);
         ArgumentNullException.ThrowIfNull(catalog);
         cancellationToken.ThrowIfCancellationRequested();
-        var logical = SqlParser.Parse(sql);
-        IPhysicalPlan plan = logical.Root switch
-        {
-            LogicalTableScan s => LogicalTableScanBinder.BindAndLower(s, catalog, _defaultScanOptions),
-            LogicalInnerJoin j => LogicalJoinBinder.BindAndLower(j, catalog, PhysicalJoinAlgorithm.Hash, _defaultScanOptions),
-            _ => throw new InvalidOperationException($"Unsupported logical root {logical.Root.GetType().Name}."),
-        };
+        var logical = _logicalCompiler.Parse(sql);
+        IPhysicalPlan plan = _logicalCompiler.CompilePhysical(logical.Root, catalog, _defaultScanOptions);
         return ValueTask.FromResult(plan);
     }
 }

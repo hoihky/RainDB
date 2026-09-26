@@ -6,9 +6,14 @@ using RainDB.Schema;
 
 namespace RainDB.Query.Vectorized;
 
-internal static class ProjectGather
+internal sealed class ProjectGather
 {
-    internal static ColumnarBatch Project(
+    private readonly SelectionEvaluator _selection;
+
+    public ProjectGather(SelectionEvaluator selection) =>
+        _selection = selection ?? throw new ArgumentNullException(nameof(selection));
+
+    internal ColumnarBatch Project(
         IColumnarBatch batch,
         ReadOnlySpan<int> outputColumnIndices,
         bool useRowSelection,
@@ -40,7 +45,7 @@ internal static class ProjectGather
         return new ColumnarBatch(selectedCount, cols);
     }
 
-    private static IColumnChunk GatherColumn(
+    private IColumnChunk GatherColumn(
         IColumnChunk source,
         bool useRowSelection,
         ReadOnlySpan<int> selectedRows,
@@ -60,7 +65,7 @@ internal static class ProjectGather
         return GatherFixedWidth(source, useRowSelection, selectedRows, selectedCount, bufferPool, alignedBufferPool);
     }
 
-    private static IColumnChunk GatherFixedWidth(
+    private IColumnChunk GatherFixedWidth(
         IColumnChunk source,
         bool useRowSelection,
         ReadOnlySpan<int> selectedRows,
@@ -90,7 +95,7 @@ internal static class ProjectGather
             for (var o = 0; o < selectedCount; o++)
             {
                 var r = RowAt(useRowSelection, selectedRows, o);
-                if (SelectionEvaluator.IsNull(srcNb, r, true))
+                if (_selection.IsNull(srcNb, r, true))
                 {
                     anyNull = true;
                     SetNullBit(outNb, o);
@@ -183,7 +188,7 @@ internal static class ProjectGather
     private static int RowAt(bool useRowSelection, ReadOnlySpan<int> selectedRows, int o) =>
         useRowSelection ? selectedRows[o] : o;
 
-    private static Utf8ColumnChunk GatherUtf8Arrow(
+    private Utf8ColumnChunk GatherUtf8Arrow(
         Utf8ColumnChunk src,
         bool useRowSelection,
         ReadOnlySpan<int> selectedRows,
@@ -206,7 +211,7 @@ internal static class ProjectGather
         {
             offsets[o] = blob.Count;
             var r = RowAt(useRowSelection, selectedRows, o);
-            if (src.HasNulls && SelectionEvaluator.IsNull(srcNb, r, true))
+            if (src.HasNulls && _selection.IsNull(srcNb, r, true))
             {
                 anyNull = true;
                 if (nbBuf != null)
@@ -226,7 +231,7 @@ internal static class ProjectGather
         return new Utf8ColumnChunk(selectedCount, offsetsMem, blob.ToArray(), nbOut, anyNull);
     }
 
-    private static Utf8LengthPrefixedColumnChunk GatherUtf8LengthPrefixed(
+    private Utf8LengthPrefixedColumnChunk GatherUtf8LengthPrefixed(
         Utf8LengthPrefixedColumnChunk src,
         bool useRowSelection,
         ReadOnlySpan<int> selectedRows,
@@ -246,7 +251,7 @@ internal static class ProjectGather
         for (var o = 0; o < selectedCount; o++)
         {
             var r = RowAt(useRowSelection, selectedRows, o);
-            if (src.HasNulls && SelectionEvaluator.IsNull(srcNb, r, true))
+            if (src.HasNulls && _selection.IsNull(srcNb, r, true))
             {
                 anyNull = true;
                 if (nbBuf != null)

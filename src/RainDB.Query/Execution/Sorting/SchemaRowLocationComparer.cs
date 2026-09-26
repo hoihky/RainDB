@@ -13,15 +13,18 @@ internal sealed class SchemaRowLocationComparer : IComparer<RowLocation>
     private readonly TableSchema _schema;
     private readonly SortKeyPhysicalSpec[] _keys;
     private readonly IReadOnlyList<IColumnarBatch> _batches;
+    private readonly SelectionEvaluator _selection;
 
     public SchemaRowLocationComparer(
         TableSchema schema,
         SortKeyPhysicalSpec[] keys,
-        IReadOnlyList<IColumnarBatch> batches)
+        IReadOnlyList<IColumnarBatch> batches,
+        SelectionEvaluator selection)
     {
         _schema = schema;
         _keys = keys;
         _batches = batches;
+        _selection = selection ?? throw new ArgumentNullException(nameof(selection));
     }
 
     public int Compare(RowLocation x, RowLocation y)
@@ -41,8 +44,8 @@ internal sealed class SchemaRowLocationComparer : IComparer<RowLocation>
         var colA = _batches[a.BatchIndex].Columns[colIx];
         var colB = _batches[b.BatchIndex].Columns[colIx];
         var t = _schema.Columns[colIx].Type;
-        var na = colA.HasNulls && SelectionEvaluator.IsNull(colA.NullBitmap.Span, a.RowIndex, true);
-        var nb = colB.HasNulls && SelectionEvaluator.IsNull(colB.NullBitmap.Span, b.RowIndex, true);
+        var na = colA.HasNulls && _selection.IsNull(colA.NullBitmap.Span, a.RowIndex, true);
+        var nb = colB.HasNulls && _selection.IsNull(colB.NullBitmap.Span, b.RowIndex, true);
         if (na && nb)
             return 0;
         if (na)

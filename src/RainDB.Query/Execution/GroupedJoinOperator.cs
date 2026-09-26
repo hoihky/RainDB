@@ -1,16 +1,23 @@
 using RainDB.Catalog;
-using RainDB.Columnar;
 using RainDB.Execution;
+using RainDB.Query.Execution.Operators;
 using RainDB.Query.Plans;
-using RainDB.Query.Results;
-using RainDB.Schema;
 
 namespace RainDB.Query.Execution;
 
 /// <summary>Pipelines inner join probe batches directly into hash aggregation (no full join rowset).</summary>
-public static class GroupedJoinExecutionEngine
+public sealed class GroupedJoinOperator : IGroupedJoinOperator
 {
-    public static ValueTask<IQueryResult> ExecuteAsync(
+    private readonly IJoinOperator _join;
+    private readonly IHashAggregateGroupingSupport _hashAggregate;
+
+    internal GroupedJoinOperator(IJoinOperator join, IHashAggregateGroupingSupport hashAggregate)
+    {
+        _join = join ?? throw new ArgumentNullException(nameof(join));
+        _hashAggregate = hashAggregate ?? throw new ArgumentNullException(nameof(hashAggregate));
+    }
+
+    public ValueTask<IQueryResult> ExecuteAsync(
         GroupedJoinPhysicalPlan plan,
         IColumnarTableSource probeTable,
         IColumnarTableSource buildTable,
@@ -22,14 +29,14 @@ public static class GroupedJoinExecutionEngine
         ArgumentNullException.ThrowIfNull(context);
 
         var joinSchema = plan.Join.OutputSchema;
-        HashAggregateEngine.ValidatePlanForInputSchema(plan.Aggregate, joinSchema);
+        _hashAggregate.ValidatePlanForInputSchema(plan.Aggregate, joinSchema);
 
-        return HashAggregateEngine.UsesCompositeGroupKeys(plan.Aggregate, joinSchema)
+        return _hashAggregate.UsesCompositeGroupKeys(plan.Aggregate, joinSchema)
             ? ExecuteCompositeAsync(plan, probeTable, buildTable, context)
             : ExecuteFixedWidthAsync(plan, probeTable, buildTable, context);
     }
 
-    private static ValueTask<IQueryResult> ExecuteFixedWidthAsync(
+    private ValueTask<IQueryResult> ExecuteFixedWidthAsync(
         GroupedJoinPhysicalPlan plan,
         IColumnarTableSource probeTable,
         IColumnarTableSource buildTable,
@@ -40,7 +47,7 @@ public static class GroupedJoinExecutionEngine
         var schema = plan.Join.OutputSchema;
         var ct = context.CancellationToken;
 
-        JoinExecutionEngine.ExecuteStreaming(
+        _join.ExecuteStreaming(
             plan.Join,
             probeTable,
             buildTable,
@@ -49,14 +56,14 @@ public static class GroupedJoinExecutionEngine
             {
                 if (joinBatch.RowCount == 0)
                     return;
-                var partial = HashAggregateEngine.AccumulateBatchForGrouped(joinBatch, agg, ct);
-                HashAggregateEngine.MergePartialIntoGlobal(global, partial, agg.Aggregates);
+                var partial = _hashAggregate.AccumulateBatchForGrouped(joinBatch, agg, ct);
+                _hashAggregate.MergePartialIntoGlobal(global, partial, agg.Aggregates);
             });
 
-        return HashAggregateEngine.MaterializeFromGlobalAsync(agg, schema, global);
+        return _hashAggregate.MaterializeFromGlobalAsync(agg, schema, global);
     }
 
-    private static ValueTask<IQueryResult> ExecuteCompositeAsync(
+    private ValueTask<IQueryResult> ExecuteCompositeAsync(
         GroupedJoinPhysicalPlan plan,
         IColumnarTableSource probeTable,
         IColumnarTableSource buildTable,
@@ -67,7 +74,7 @@ public static class GroupedJoinExecutionEngine
         var schema = plan.Join.OutputSchema;
         var ct = context.CancellationToken;
 
-        JoinExecutionEngine.ExecuteStreaming(
+        _join.ExecuteStreaming(
             plan.Join,
             probeTable,
             buildTable,
@@ -76,10 +83,10 @@ public static class GroupedJoinExecutionEngine
             {
                 if (joinBatch.RowCount == 0)
                     return;
-                var partial = HashAggregateEngine.AccumulateBatchCompositeForGrouped(joinBatch, agg, schema, ct);
-                HashAggregateEngine.MergePartialIntoGlobalComposite(global, partial, agg.Aggregates);
+                var partial = _hashAggregate.AccumulateBatchCompositeForGrouped(joinBatch, agg, schema, ct);
+                _hashAggregate.MergePartialIntoGlobalComposite(global, partial, agg.Aggregates);
             });
 
-        return HashAggregateEngine.MaterializeFromGlobalCompositeAsync(agg, schema, global);
+        return _hashAggregate.MaterializeFromGlobalCompositeAsync(agg, schema, global);
     }
 }

@@ -12,9 +12,9 @@ using RainDB.Sql;
 namespace RainDB.Sql.Compilation;
 
 /// <summary>Binds <see cref="LogicalTableScan"/> to <see cref="IPhysicalPlan"/> (vectorized scan or hash aggregate).</summary>
-public static class LogicalTableScanBinder
+public sealed class LogicalTableScanBinder
 {
-    public static IPhysicalPlan BindAndLower(
+    public IPhysicalPlan BindAndLower(
         LogicalTableScan scan,
         ICatalog catalog,
         VectorizedScanExecutionOptions scanOptions = default)
@@ -33,7 +33,7 @@ public static class LogicalTableScanBinder
         return BindVectorizedScan(scan, colTable, schema, scanOptions);
     }
 
-    private static HashAggregatePhysicalPlan BindHashAggregate(
+    private HashAggregatePhysicalPlan BindHashAggregate(
         LogicalTableScan scan,
         IColumnarTableSource colTable,
         TableSchema schema,
@@ -118,7 +118,7 @@ public static class LogicalTableScanBinder
         }
     }
 
-    private static IPhysicalPlan BindVectorizedScan(
+    private IPhysicalPlan BindVectorizedScan(
         LogicalTableScan scan,
         IColumnarTableSource colTable,
         TableSchema schema,
@@ -201,7 +201,7 @@ public static class LogicalTableScanBinder
         return arr;
     }
 
-    internal static ColumnCompareFilter[]? BuildColumnCompareFilters(IReadOnlyList<SimpleWhereClause>? conjuncts, TableSchema schema, string tableName)
+    internal ColumnCompareFilter[]? BuildColumnCompareFilters(IReadOnlyList<SimpleWhereClause>? conjuncts, TableSchema schema, string tableName)
     {
         if (conjuncts is null or { Count: 0 })
             return null;
@@ -212,7 +212,7 @@ public static class LogicalTableScanBinder
     }
 
     /// <summary>Binds one conjunct to a column filter (shared with join lowering).</summary>
-    internal static ColumnCompareFilter BuildColumnCompareFilter(SimpleWhereClause where, TableSchema schema, string tableName)
+    internal ColumnCompareFilter BuildColumnCompareFilter(SimpleWhereClause where, TableSchema schema, string tableName)
     {
         var wi = ResolveColumn(schema, where.ColumnName, tableName);
         var wt = schema.Columns[wi].Type;

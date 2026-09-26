@@ -16,9 +16,14 @@ namespace RainDB.Query.Vectorized;
 /// Comparison is raw UTF-8 byte equality against the cell payload (Arrow blob slice or length-prefixed payload).
 /// SQL NULL cells do not match. Range, <c>LIKE</c>, and collation are not implemented.</para>
 /// </remarks>
-internal static class SelectionEvaluator
+internal sealed class SelectionEvaluator
 {
-    internal static bool IsNull(ReadOnlySpan<byte> nullBitmap, int row, bool hasNulls)
+    private FixedWidthSelectionKernels? _kernels;
+
+    internal void BindSelectionKernels(FixedWidthSelectionKernels kernels) =>
+        _kernels = kernels ?? throw new ArgumentNullException(nameof(kernels));
+
+    internal bool IsNull(ReadOnlySpan<byte> nullBitmap, int row, bool hasNulls)
     {
         if (!hasNulls)
             return false;
@@ -26,7 +31,7 @@ internal static class SelectionEvaluator
     }
 
     /// <summary>Writes matching row indices; returns count.</summary>
-    internal static int FillSelectedRowsConjunctive(IColumnarBatch batch, ReadOnlySpan<ColumnCompareFilter> filters, Span<int> dest)
+    internal int FillSelectedRowsConjunctive(IColumnarBatch batch, ReadOnlySpan<ColumnCompareFilter> filters, Span<int> dest)
     {
         var n = batch.RowCount;
         if (filters.Length == 0)
@@ -47,14 +52,15 @@ internal static class SelectionEvaluator
             var col = batch.Columns[filters[f].ColumnIndex];
             count = filters[f].Utf8LiteralBytes is not null || col.PhysicalType == RainDbType.Utf8
                 ? IntersectUtf8(col, filters[f], dest, count)
-                : FixedWidthSelectionKernels.IntersectSelectedIndices(col, filters[f], dest, count);
+                : (_kernels ?? throw new InvalidOperationException("Fixed-width selection kernels are not bound."))
+                    .IntersectSelectedIndices(col, filters[f], dest, count);
         }
 
         return count;
     }
 
     /// <summary>Writes 0..rowCount-1 row indices that pass <paramref name="filter"/> into <paramref name="dest"/>; returns match count.</summary>
-    internal static int FillSelectedRows(IColumnChunk column, ColumnCompareFilter filter, Span<int> dest)
+    internal int FillSelectedRows(IColumnChunk column, ColumnCompareFilter filter, Span<int> dest)
     {
         if (filter.ColumnIndex < 0)
             throw new ArgumentOutOfRangeException(nameof(filter));
@@ -69,10 +75,13 @@ internal static class SelectionEvaluator
         if (column.PhysicalType == RainDbType.Utf8)
             throw new NotSupportedException("UTF-8 column requires a string literal predicate.");
 
-        return FixedWidthSelectionKernels.FillSelectedIndices(column, filter, dest);
+        if (_kernels is null)
+            throw new InvalidOperationException("Fixed-width selection kernels are not bound.");
+
+        return _kernels.FillSelectedIndices(column, filter, dest);
     }
 
-    internal static bool RowMatchesFilter(IColumnChunk column, ColumnCompareFilter filter, int row)
+    internal bool RowMatchesFilter(IColumnChunk column, ColumnCompareFilter filter, int row)
     {
         if (filter.Utf8LiteralBytes is { } lit)
         {
@@ -125,7 +134,7 @@ internal static class SelectionEvaluator
         }
     }
 
-    private static int IntersectUtf8(IColumnChunk column, ColumnCompareFilter filter, Span<int> selectedRows, int count)
+    private int IntersectUtf8(IColumnChunk column, ColumnCompareFilter filter, Span<int> selectedRows, int count)
     {
         var write = 0;
         for (var r = 0; r < count; r++)
@@ -138,7 +147,7 @@ internal static class SelectionEvaluator
         return write;
     }
 
-    private static int FillUtf8Selected(IColumnChunk column, ColumnCompareFilter filter, Span<int> dest)
+    private int FillUtf8Selected(IColumnChunk column, ColumnCompareFilter filter, Span<int> dest)
     {
         var n = column.RowCount;
         var count = 0;

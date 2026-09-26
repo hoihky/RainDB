@@ -7,6 +7,7 @@ using RainDB.Linq;
 using RainDB.Linq.Compilation;
 using RainDB.Memory;
 using RainDB.Query.Execution;
+using RainDB.Query.Execution.Operators;
 using RainDB.Query.Runtime;
 using RainDB.Sql;
 using RainDB.Sql.Compilation;
@@ -61,7 +62,7 @@ public sealed class RainDbEngine
     {
         ArgumentNullException.ThrowIfNull(catalog);
         var buffers = new HybridBufferPool();
-        var executor = new DefaultQueryExecutor();
+        var executor = new DefaultQueryExecutor(new DefaultQueryOperatorSuite());
         var sql = new DefaultSqlCompiler();
         var linq = new DefaultLinqCompiler();
         return new RainDbEngine(catalog, buffers, buffers, executor, sql, linq, NoOpSpillWriter.Instance);
@@ -82,7 +83,7 @@ public sealed class RainDbEngine
         ArgumentNullException.ThrowIfNull(catalog);
         ArgumentNullException.ThrowIfNull(fileDatabase);
         var buffers = new HybridBufferPool();
-        var executor = new DefaultQueryExecutor();
+        var executor = new DefaultQueryExecutor(new DefaultQueryOperatorSuite());
         var sql = new DefaultSqlCompiler();
         var linq = new DefaultLinqCompiler();
         return new RainDbEngine(catalog, buffers, buffers, executor, sql, linq, NoOpSpillWriter.Instance, fileDatabase);

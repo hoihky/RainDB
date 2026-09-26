@@ -16,6 +16,7 @@ internal sealed class JoinMatchChunkEmitter
     private readonly TableSchema _probeSchema;
     private readonly TableSchema _buildSchema;
     private readonly Action<ColumnarBatch> _emitBatch;
+    private readonly JoinBatchMaterializer _materializer;
     private readonly int _chunkRowCount;
     private readonly List<JoinRowMatch> _pending;
 
@@ -26,6 +27,7 @@ internal sealed class JoinMatchChunkEmitter
         TableSchema probeSchema,
         TableSchema buildSchema,
         Action<ColumnarBatch> emitBatch,
+        JoinBatchMaterializer materializer,
         int chunkRowCount = DefaultChunkRowCount)
     {
         ArgumentNullException.ThrowIfNull(plan);
@@ -34,6 +36,8 @@ internal sealed class JoinMatchChunkEmitter
         ArgumentNullException.ThrowIfNull(probeSchema);
         ArgumentNullException.ThrowIfNull(buildSchema);
         ArgumentNullException.ThrowIfNull(emitBatch);
+        ArgumentNullException.ThrowIfNull(materializer);
+        _materializer = materializer;
         if (chunkRowCount <= 0)
             throw new ArgumentOutOfRangeException(nameof(chunkRowCount));
 
@@ -59,7 +63,7 @@ internal sealed class JoinMatchChunkEmitter
         if (_pending.Count == 0)
             return;
 
-        var batch = JoinBatchMaterializer.Materialize(_plan, _probeBatches, _buildBatches, _probeSchema, _buildSchema, _pending);
+        var batch = _materializer.Materialize(_plan, _probeBatches, _buildBatches, _probeSchema, _buildSchema, _pending);
         _emitBatch(batch);
         _pending.Clear();
     }

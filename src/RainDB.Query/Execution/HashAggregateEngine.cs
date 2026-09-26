@@ -4,6 +4,7 @@ using RainDB.Catalog;
 using RainDB.Columnar;
 using RainDB.Core.Columnar;
 using RainDB.Execution;
+using RainDB.Query.Execution.Operators;
 using RainDB.Query.Plans;
 using RainDB.Query.Results;
 using RainDB.Query.Vectorized;
@@ -12,9 +13,19 @@ using RainDB.Schema;
 namespace RainDB.Query.Execution;
 
 /// <summary>Parallel partial hash maps per source batch, deterministic global merge, sorted key materialization.</summary>
-public static class HashAggregateEngine
+public sealed class HashAggregateOperator : Operators.IHashAggregateOperator, Operators.IHashAggregateGroupingSupport
 {
-    public static async ValueTask<IQueryResult> ExecuteAsync(
+    private readonly QueryOperatorDependencies _deps;
+
+    public HashAggregateOperator()
+        : this(new QueryOperatorDependencies())
+    {
+    }
+
+    internal HashAggregateOperator(QueryOperatorDependencies dependencies) =>
+        _deps = dependencies ?? throw new ArgumentNullException(nameof(dependencies));
+
+    public async ValueTask<IQueryResult> ExecuteAsync(
         HashAggregatePhysicalPlan plan,
         IColumnarTableSource table,
         IExecutionContext context)
@@ -83,7 +94,7 @@ public static class HashAggregateEngine
         return new ColumnarMaterializedQueryResult([outBatch]);
     }
 
-    internal static void ValidatePlanForInputSchema(HashAggregatePhysicalPlan plan, TableSchema schema)
+    void Operators.IHashAggregateGroupingSupport.ValidatePlanForInputSchema(HashAggregatePhysicalPlan plan, TableSchema schema)
     {
         ArgumentNullException.ThrowIfNull(plan);
         ArgumentNullException.ThrowIfNull(schema);
@@ -130,20 +141,32 @@ public static class HashAggregateEngine
         }
     }
 
-    internal static Dictionary<GroupKey, AggregateAccumulator[]> AccumulateBatchForGrouped(
+    Dictionary<GroupKey, AggregateAccumulator[]> Operators.IHashAggregateGroupingSupport.AccumulateBatchForGrouped(
         IColumnarBatch batch,
         HashAggregatePhysicalPlan plan,
         CancellationToken cancellationToken) =>
         AccumulateBatch(batch, plan, cancellationToken);
 
-    internal static Dictionary<CompositeJoinKey, AggregateAccumulator[]> AccumulateBatchCompositeForGrouped(
+    Dictionary<CompositeJoinKey, AggregateAccumulator[]> Operators.IHashAggregateGroupingSupport.AccumulateBatchCompositeForGrouped(
         IColumnarBatch batch,
         HashAggregatePhysicalPlan plan,
         TableSchema schema,
         CancellationToken cancellationToken) =>
         AccumulateBatchComposite(batch, plan, schema, cancellationToken);
 
-    internal static void MergePartialIntoGlobal(
+    void Operators.IHashAggregateGroupingSupport.MergePartialIntoGlobal(
+        Dictionary<GroupKey, AggregateAccumulator[]> global,
+        Dictionary<GroupKey, AggregateAccumulator[]> partial,
+        AggregateSpec[] specs) =>
+        MergePartialIntoGlobalCore(global, partial, specs);
+
+    void Operators.IHashAggregateGroupingSupport.MergePartialIntoGlobalComposite(
+        Dictionary<CompositeJoinKey, AggregateAccumulator[]> global,
+        Dictionary<CompositeJoinKey, AggregateAccumulator[]> partial,
+        AggregateSpec[] specs) =>
+        MergePartialIntoGlobalCompositeCore(global, partial, specs);
+
+    private static void MergePartialIntoGlobalCore(
         Dictionary<GroupKey, AggregateAccumulator[]> global,
         Dictionary<GroupKey, AggregateAccumulator[]> partial,
         AggregateSpec[] specs)
@@ -166,7 +189,7 @@ public static class HashAggregateEngine
         }
     }
 
-    internal static void MergePartialIntoGlobalComposite(
+    private static void MergePartialIntoGlobalCompositeCore(
         Dictionary<CompositeJoinKey, AggregateAccumulator[]> global,
         Dictionary<CompositeJoinKey, AggregateAccumulator[]> partial,
         AggregateSpec[] specs)
@@ -189,7 +212,7 @@ public static class HashAggregateEngine
         }
     }
 
-    internal static ValueTask<IQueryResult> MaterializeFromGlobalAsync(
+    ValueTask<IQueryResult> Operators.IHashAggregateGroupingSupport.MaterializeFromGlobalAsync(
         HashAggregatePhysicalPlan plan,
         TableSchema inputSchema,
         Dictionary<GroupKey, AggregateAccumulator[]> global)
@@ -205,7 +228,7 @@ public static class HashAggregateEngine
         return new ValueTask<IQueryResult>(new ColumnarMaterializedQueryResult([outBatch]));
     }
 
-    internal static ValueTask<IQueryResult> MaterializeFromGlobalCompositeAsync(
+    ValueTask<IQueryResult> Operators.IHashAggregateGroupingSupport.MaterializeFromGlobalCompositeAsync(
         HashAggregatePhysicalPlan plan,
         TableSchema inputSchema,
         Dictionary<CompositeJoinKey, AggregateAccumulator[]> global)
@@ -236,7 +259,7 @@ public static class HashAggregateEngine
         }
     }
 
-    private static Dictionary<GroupKey, AggregateAccumulator[]> AccumulateBatch(
+    private Dictionary<GroupKey, AggregateAccumulator[]> AccumulateBatch(
         IColumnarBatch batch,
         HashAggregatePhysicalPlan plan,
         CancellationToken cancellationToken)
@@ -252,7 +275,7 @@ public static class HashAggregateEngine
             int k;
             if (plan.Filters is { Length: > 0 } filters)
             {
-                k = SelectionEvaluator.FillSelectedRowsConjunctive(batch, filters, rent.AsSpan(0, batch.RowCount));
+                k = _deps.Selection.FillSelectedRowsConjunctive(batch, filters, rent.AsSpan(0, batch.RowCount));
                 sel = rent.AsSpan(0, k);
             }
             else
@@ -268,7 +291,7 @@ public static class HashAggregateEngine
                 {
                     cancellationToken.ThrowIfCancellationRequested();
                     var row = sel.IsEmpty ? i : sel[i];
-                    var key = FixedWidthGroupKeyBuilder.BuildKey(batch, row, plan.GroupKeyColumnIndices, scratch);
+                    var key = _deps.GroupKeys.BuildKey(batch, row, plan.GroupKeyColumnIndices, scratch);
                     if (!dict.TryGetValue(key, out var accs))
                     {
                         accs = new AggregateAccumulator[aggCount];
@@ -282,9 +305,9 @@ public static class HashAggregateEngine
                         if (spec.Kind == AggregateKind.Count && spec.SourceColumnIndex < 0)
                             AggregateRowOps.AddCountStar(ref slot);
                         else if (spec.Kind == AggregateKind.Count)
-                            AggregateRowOps.AddCountColumn(ref slot, batch.Columns[spec.SourceColumnIndex], row);
+                            AggregateRowOps.AddCountColumn(ref slot, _deps.Selection, batch.Columns[spec.SourceColumnIndex], row);
                         else
-                            AggregateRowOps.AddRow(ref slot, batch.Columns[spec.SourceColumnIndex], spec.Kind, row);
+                            AggregateRowOps.AddRow(ref slot, _deps.Selection, batch.Columns[spec.SourceColumnIndex], spec.Kind, row);
                     }
                 }
             }
@@ -307,7 +330,7 @@ public static class HashAggregateEngine
     {
         var global = new Dictionary<GroupKey, AggregateAccumulator[]>();
         for (var bi = 0; bi < partials.Length; bi++)
-            MergePartialIntoGlobal(global, partials[bi], specs);
+            MergePartialIntoGlobalCore(global, partials[bi], specs);
 
         return global;
     }
@@ -518,7 +541,7 @@ public static class HashAggregateEngine
         return cols;
     }
 
-    internal static bool UsesCompositeGroupKeys(HashAggregatePhysicalPlan plan, TableSchema schema) =>
+    bool Operators.IHashAggregateGroupingSupport.UsesCompositeGroupKeys(HashAggregatePhysicalPlan plan, TableSchema schema) =>
         AnyUtf8GroupKey(plan, schema);
 
     private static bool AnyUtf8GroupKey(HashAggregatePhysicalPlan plan, TableSchema schema)
@@ -532,7 +555,7 @@ public static class HashAggregateEngine
         return false;
     }
 
-    private static async ValueTask<IQueryResult> ExecuteWithCompositeKeysAsync(
+    private async ValueTask<IQueryResult> ExecuteWithCompositeKeysAsync(
         HashAggregatePhysicalPlan plan,
         IColumnarTableSource table,
         IExecutionContext context)
@@ -592,7 +615,7 @@ public static class HashAggregateEngine
         return new ColumnarMaterializedQueryResult([outBatch]);
     }
 
-    private static Dictionary<CompositeJoinKey, AggregateAccumulator[]> AccumulateBatchComposite(
+    private Dictionary<CompositeJoinKey, AggregateAccumulator[]> AccumulateBatchComposite(
         IColumnarBatch batch,
         HashAggregatePhysicalPlan plan,
         TableSchema schema,
@@ -609,7 +632,7 @@ public static class HashAggregateEngine
             int k;
             if (plan.Filters is { Length: > 0 } filters)
             {
-                k = SelectionEvaluator.FillSelectedRowsConjunctive(batch, filters, rent.AsSpan(0, batch.RowCount));
+                k = _deps.Selection.FillSelectedRowsConjunctive(batch, filters, rent.AsSpan(0, batch.RowCount));
                 sel = rent.AsSpan(0, k);
             }
             else
@@ -622,7 +645,7 @@ public static class HashAggregateEngine
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 var row = sel.IsEmpty ? i : sel[i];
-                var key = CompositeJoinKeyBuilder.Build(schema, batch, row, plan.GroupKeyColumnIndices);
+                var key = _deps.CompositeJoinKeys.Build(schema, batch, row, plan.GroupKeyColumnIndices);
                 if (!dict.TryGetValue(key, out var accs))
                 {
                     accs = new AggregateAccumulator[aggCount];
@@ -636,9 +659,9 @@ public static class HashAggregateEngine
                     if (spec.Kind == AggregateKind.Count && spec.SourceColumnIndex < 0)
                         AggregateRowOps.AddCountStar(ref slot);
                     else if (spec.Kind == AggregateKind.Count)
-                        AggregateRowOps.AddCountColumn(ref slot, batch.Columns[spec.SourceColumnIndex], row);
+                        AggregateRowOps.AddCountColumn(ref slot, _deps.Selection, batch.Columns[spec.SourceColumnIndex], row);
                     else
-                        AggregateRowOps.AddRow(ref slot, batch.Columns[spec.SourceColumnIndex], spec.Kind, row);
+                        AggregateRowOps.AddRow(ref slot, _deps.Selection, batch.Columns[spec.SourceColumnIndex], spec.Kind, row);
                 }
             }
 
@@ -656,7 +679,7 @@ public static class HashAggregateEngine
     {
         var global = new Dictionary<CompositeJoinKey, AggregateAccumulator[]>();
         for (var bi = 0; bi < partials.Length; bi++)
-            MergePartialIntoGlobalComposite(global, partials[bi], specs);
+            MergePartialIntoGlobalCompositeCore(global, partials[bi], specs);
 
         return global;
     }
@@ -854,17 +877,26 @@ internal static class AggregateRowOps
 {
     public static void AddCountStar(ref AggregateAccumulator acc) => acc.Count++;
 
-    public static void AddCountColumn(ref AggregateAccumulator acc, IColumnChunk col, int row)
+    public static void AddCountColumn(
+        ref AggregateAccumulator acc,
+        SelectionEvaluator selection,
+        IColumnChunk col,
+        int row)
     {
         var nb = col.HasNulls ? col.NullBitmap.Span : ReadOnlySpan<byte>.Empty;
-        if (!SelectionEvaluator.IsNull(nb, row, col.HasNulls))
+        if (!selection.IsNull(nb, row, col.HasNulls))
             acc.Count++;
     }
 
-    public static void AddRow(ref AggregateAccumulator acc, IColumnChunk col, AggregateKind kind, int row)
+    public static void AddRow(
+        ref AggregateAccumulator acc,
+        SelectionEvaluator selection,
+        IColumnChunk col,
+        AggregateKind kind,
+        int row)
     {
         var nb = col.HasNulls ? col.NullBitmap.Span : ReadOnlySpan<byte>.Empty;
-        if (SelectionEvaluator.IsNull(nb, row, col.HasNulls))
+        if (selection.IsNull(nb, row, col.HasNulls))
             return;
 
         var values = col.Values.Span;

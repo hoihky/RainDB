@@ -161,8 +161,9 @@ public class JoinExecutionTests
 
         var logical = StrictSqlSubset.ParseLogicalPlan("SELECT * FROM A INNER JOIN B ON A.k = B.k");
         var join = Assert.IsType<LogicalInnerJoin>(logical.Root);
-        var hashPlan = LogicalJoinBinder.BindAndLower(join, engine.Catalog, PhysicalJoinAlgorithm.Hash);
-        var sortPlan = LogicalJoinBinder.BindAndLower(join, engine.Catalog, PhysicalJoinAlgorithm.SortMerge);
+        var joinBinder = new LogicalPlanCompiler().JoinBinder;
+        var hashPlan = joinBinder.BindAndLower(join, engine.Catalog, PhysicalJoinAlgorithm.Hash);
+        var sortPlan = joinBinder.BindAndLower(join, engine.Catalog, PhysicalJoinAlgorithm.SortMerge);
 
         await using var rh = await engine.ExecutePhysicalAsync(hashPlan);
         await using var rs = await engine.ExecutePhysicalAsync(sortPlan);
@@ -338,8 +339,9 @@ public class JoinExecutionTests
 
         var logical = StrictSqlSubset.ParseLogicalPlan("SELECT * FROM A INNER JOIN B ON A.tag = B.tag");
         var join = Assert.IsType<LogicalInnerJoin>(logical.Root);
-        var hashPlan = LogicalJoinBinder.BindAndLower(join, engine.Catalog, PhysicalJoinAlgorithm.Hash);
-        var sortPlan = LogicalJoinBinder.BindAndLower(join, engine.Catalog, PhysicalJoinAlgorithm.SortMerge);
+        var joinBinder = new LogicalPlanCompiler().JoinBinder;
+        var hashPlan = joinBinder.BindAndLower(join, engine.Catalog, PhysicalJoinAlgorithm.Hash);
+        var sortPlan = joinBinder.BindAndLower(join, engine.Catalog, PhysicalJoinAlgorithm.SortMerge);
 
         await using var rh = await engine.ExecutePhysicalAsync(hashPlan);
         await using var rs = await engine.ExecutePhysicalAsync(sortPlan);

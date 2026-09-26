@@ -6,6 +6,7 @@ using RainDB.Core.Tables;
 using RainDB.Execution;
 using RainDB.Logical;
 using RainDB.Query.Execution;
+using RainDB.Query.Execution.Operators;
 using RainDB.Query.Execution.Joining;
 using RainDB.Query.Plans;
 using RainDB.Schema;
@@ -35,11 +36,12 @@ public class JoinStreamingMemoryTests
 
         var logical = StrictSqlSubset.ParseLogicalPlan("SELECT * FROM L INNER JOIN R ON L.k = R.k");
         var join = Assert.IsType<LogicalInnerJoin>(logical.Root);
-        var joinPlan = Assert.IsType<JoinPhysicalPlan>(LogicalJoinBinder.BindAndLower(join, engine.Catalog, PhysicalJoinAlgorithm.Hash));
+        var joinPlan = Assert.IsType<JoinPhysicalPlan>(
+            new LogicalPlanCompiler().JoinBinder.BindAndLower(join, engine.Catalog, PhysicalJoinAlgorithm.Hash));
 
         var ctx = engine.CreateSession();
         var emitted = new List<ColumnarBatch>();
-        JoinExecutionEngine.ExecuteStreaming(
+        new JoinOperator().ExecuteStreaming(
             joinPlan,
             left,
             right,
@@ -95,7 +97,8 @@ public class JoinStreamingMemoryTests
         var grouped = Assert.IsType<GroupedJoinPhysicalPlan>(
             StrictSqlSubset.CompilePhysicalPlan(sql, engine.Catalog));
 
-        await using var direct = await GroupedJoinExecutionEngine.ExecuteAsync(
+        var suite = new DefaultQueryOperatorSuite();
+        await using var direct = await suite.GroupedJoin.ExecuteAsync(
             grouped,
             left,
             right,

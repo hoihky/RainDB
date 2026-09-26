@@ -1,14 +1,20 @@
 using RainDB.Columnar;
 using RainDB.Query.Plans;
+using RainDB.Query.Vectorized;
 using RainDB.Schema;
 
 namespace RainDB.Query.Execution.Sorting;
 
-/// <summary>Chooses full sort vs bounded heap top-k for ORDER BY / LIMIT (Strategy via branch, not virtual dispatch).</summary>
-internal static class SortTopNRowSelection
+/// <summary>Chooses full sort vs bounded heap top-k for ORDER BY / LIMIT.</summary>
+internal sealed class SortTopNRowSelector
 {
-    /// <summary>Returns row locations in final SQL sort order (and truncated to LIMIT when set).</summary>
-    public static RowLocation[] SelectInSortOrder(
+    private readonly SelectionEvaluator _selection;
+    private readonly BoundedTopKHeap _heap = new();
+
+    public SortTopNRowSelector(SelectionEvaluator selection) =>
+        _selection = selection ?? throw new ArgumentNullException(nameof(selection));
+
+    public RowLocation[] SelectInSortOrder(
         RowLocation[] rows,
         SortKeyPhysicalSpec[] sortKeys,
         int? limit,
@@ -26,7 +32,7 @@ internal static class SortTopNRowSelection
         if (sortKeys.Length == 0)
             return TruncateWithoutSort(rows, limit);
 
-        var comparer = new SchemaRowLocationComparer(schema, sortKeys, batches);
+        var comparer = new SchemaRowLocationComparer(schema, sortKeys, batches, _selection);
 
         if (limit is not { } k)
         {
@@ -42,7 +48,7 @@ internal static class SortTopNRowSelection
         }
 
         var top = rows.Length > k
-            ? BoundedTopKHeap.Select(rows, k, comparer)
+            ? _heap.Select(rows, k, comparer)
             : rows;
 
         Array.Sort(top, comparer);

@@ -6,9 +6,14 @@ using RainDB.Schema;
 
 namespace RainDB.Query.Execution.Joining;
 
-internal static class JoinBatchMaterializer
+internal sealed class JoinBatchMaterializer
 {
-    public static ColumnarBatch Materialize(
+    private readonly SelectionEvaluator _selection;
+
+    public JoinBatchMaterializer(SelectionEvaluator selection) =>
+        _selection = selection ?? throw new ArgumentNullException(nameof(selection));
+
+    public ColumnarBatch Materialize(
         JoinPhysicalPlan plan,
         IReadOnlyList<IColumnarBatch> probeBatches,
         IReadOnlyList<IColumnarBatch> buildBatches,
@@ -58,7 +63,7 @@ internal static class JoinBatchMaterializer
         return new ColumnarBatch(n, cols);
     }
 
-    public static ColumnarBatch EmptyBatch(JoinPhysicalPlan plan)
+    public ColumnarBatch EmptyBatch(JoinPhysicalPlan plan)
     {
         var outSchema = plan.OutputSchema;
         var totalCols = outSchema.Columns.Count;
@@ -76,7 +81,7 @@ internal static class JoinBatchMaterializer
         return new FixedWidthColumnChunk(type, 0, Array.Empty<byte>(), ReadOnlyMemory<byte>.Empty, false);
     }
 
-    private static IColumnChunk MaterializeOneColumn(
+    private IColumnChunk MaterializeOneColumn(
         IReadOnlyList<IColumnarBatch> batches,
         RainDbType type,
         int colIndex,
@@ -101,7 +106,7 @@ internal static class JoinBatchMaterializer
             var batch = batches[bi];
             var col = batch.Columns[colIndex];
             var srcNb = col.HasNulls ? col.NullBitmap.Span : ReadOnlySpan<byte>.Empty;
-            if (SelectionEvaluator.IsNull(srcNb, ri, col.HasNulls))
+            if (_selection.IsNull(srcNb, ri, col.HasNulls))
             {
                 anyNull = true;
                 SetNullBit(outNb.AsSpan(), o);
@@ -120,7 +125,7 @@ internal static class JoinBatchMaterializer
             anyNull);
     }
 
-    private static IColumnChunk MaterializeUtf8Column(
+    private IColumnChunk MaterializeUtf8Column(
         IReadOnlyList<IColumnarBatch> batches,
         int colIndex,
         IReadOnlyList<JoinRowMatch> matches,
@@ -146,7 +151,7 @@ internal static class JoinBatchMaterializer
             var ri = useProbeSide ? m.LeftRow : m.RightRow;
             var col = batches[bi].Columns[colIndex];
             var srcNb = col.HasNulls ? col.NullBitmap.Span : ReadOnlySpan<byte>.Empty;
-            if (SelectionEvaluator.IsNull(srcNb, ri, col.HasNulls))
+            if (_selection.IsNull(srcNb, ri, col.HasNulls))
             {
                 anyNull = true;
                 if (nbBuf != null)

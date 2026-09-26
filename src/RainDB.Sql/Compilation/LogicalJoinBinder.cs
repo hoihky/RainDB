@@ -9,9 +9,14 @@ using RainDB.Sql;
 namespace RainDB.Sql.Compilation;
 
 /// <summary>Binds <see cref="LogicalInnerJoin"/> to <see cref="JoinPhysicalPlan"/> or <see cref="GroupedJoinPhysicalPlan"/>.</summary>
-public static class LogicalJoinBinder
+public sealed class LogicalJoinBinder
 {
-    public static IPhysicalPlan BindAndLower(
+    private readonly LogicalTableScanBinder _scanBinder;
+
+    public LogicalJoinBinder(LogicalTableScanBinder scanBinder) =>
+        _scanBinder = scanBinder ?? throw new ArgumentNullException(nameof(scanBinder));
+
+    public IPhysicalPlan BindAndLower(
         LogicalInnerJoin join,
         ICatalog catalog,
         PhysicalJoinAlgorithm algorithm,
@@ -83,7 +88,7 @@ public static class LogicalJoinBinder
         return new JoinSortTopNPhysicalPlan(joinPlan, sortSpecs, join.Limit, scanOptions);
     }
 
-    private static GroupedJoinPhysicalPlan BindGroupedJoin(
+    private GroupedJoinPhysicalPlan BindGroupedJoin(
         LogicalInnerJoin join,
         IColumnarTableSource leftCol,
         IColumnarTableSource rightCol,
@@ -377,7 +382,7 @@ public static class LogicalJoinBinder
         return (refs.ToArray(), new TableSchema(cols));
     }
 
-    private static (ColumnCompareFilter[]? probe, ColumnCompareFilter[]? build) ResolveJoinWhere(
+    private (ColumnCompareFilter[]? probe, ColumnCompareFilter[]? build) ResolveJoinWhere(
         IReadOnlyList<SimpleWhereClause>? conjuncts,
         ITableSource left,
         ITableSource right)
@@ -392,9 +397,9 @@ public static class LogicalJoinBinder
             if (w.QualifierTableName is { } qt)
             {
                 if (TableEq(qt, left.Name))
-                    probeList.Add(LogicalTableScanBinder.BuildColumnCompareFilter(w, left.Schema, left.Name));
+                    probeList.Add(_scanBinder.BuildColumnCompareFilter(w, left.Schema, left.Name));
                 else if (TableEq(qt, right.Name))
-                    buildList.Add(LogicalTableScanBinder.BuildColumnCompareFilter(w, right.Schema, right.Name));
+                    buildList.Add(_scanBinder.BuildColumnCompareFilter(w, right.Schema, right.Name));
                 else
                     throw new SqlCompileException(
                         $"WHERE references unknown table '{qt}' (expected '{left.Name}' or '{right.Name}').");
@@ -410,9 +415,9 @@ public static class LogicalJoinBinder
             }
 
             if (li >= 0)
-                probeList.Add(LogicalTableScanBinder.BuildColumnCompareFilter(w, left.Schema, left.Name));
+                probeList.Add(_scanBinder.BuildColumnCompareFilter(w, left.Schema, left.Name));
             else if (ri >= 0)
-                buildList.Add(LogicalTableScanBinder.BuildColumnCompareFilter(w, right.Schema, right.Name));
+                buildList.Add(_scanBinder.BuildColumnCompareFilter(w, right.Schema, right.Name));
             else
                 throw new SqlCompileException(
                     $"Unknown column '{w.ColumnName}' in WHERE (not found on '{left.Name}' or '{right.Name}').");

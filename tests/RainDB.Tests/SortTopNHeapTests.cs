@@ -4,12 +4,15 @@ using RainDB.Core.Tables;
 using RainDB.Execution;
 using RainDB.Query.Execution.Sorting;
 using RainDB.Query.Plans;
+using RainDB.Query.Vectorized;
 using RainDB.Schema;
 
 namespace RainDB.Tests;
 
 public class SortTopNHeapTests
 {
+    private static readonly SelectionEvaluator Selection = new();
+
     [Fact]
     public void BoundedTopKHeap_selects_k_smallest_integers()
     {
@@ -19,9 +22,10 @@ public class SortTopNHeapTests
         var comparer = new SchemaRowLocationComparer(
             schema,
             [new SortKeyPhysicalSpec(0, Descending: false)],
-            batches);
+            batches,
+            Selection);
         var all = AllRowLocations(batches);
-        var top = BoundedTopKHeap.Select(all, 3, comparer);
+        var top = new BoundedTopKHeap().Select(all, 3, comparer);
         Array.Sort(top, comparer);
         Assert.Equal(3, top.Length);
         Assert.Equal(0, ReadKey(batches, top[0]));
@@ -38,9 +42,10 @@ public class SortTopNHeapTests
         var comparer = new SchemaRowLocationComparer(
             schema,
             [new SortKeyPhysicalSpec(0, Descending: true)],
-            batches);
+            batches,
+            Selection);
         var all = AllRowLocations(batches);
-        var top = BoundedTopKHeap.Select(all, 2, comparer);
+        var top = new BoundedTopKHeap().Select(all, 2, comparer);
         Array.Sort(top, comparer);
         Assert.Equal(2, top.Length);
         Assert.Equal(14, ReadKey(batches, top[0]));
@@ -68,11 +73,12 @@ public class SortTopNHeapTests
         const int k = 7;
         var all = AllRowLocations(batches);
         var reference = (RowLocation[])all.Clone();
-        var comparer = new SchemaRowLocationComparer(schema, keys, batches);
+        var comparer = new SchemaRowLocationComparer(schema, keys, batches, Selection);
         Array.Sort(reference, comparer);
         var expected = reference.AsSpan(0, k).ToArray();
 
-        var actual = SortTopNRowSelection.SelectInSortOrder((RowLocation[])all.Clone(), keys, k, schema, batches);
+        var selector = new SortTopNRowSelector(Selection);
+        var actual = selector.SelectInSortOrder((RowLocation[])all.Clone(), keys, k, schema, batches);
 
         Assert.Equal(expected.Length, actual.Length);
         for (var i = 0; i < expected.Length; i++)

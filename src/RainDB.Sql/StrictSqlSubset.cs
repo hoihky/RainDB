@@ -3,31 +3,33 @@ using RainDB.Execution;
 using RainDB.Logical;
 using RainDB.Query.Plans;
 using RainDB.Sql.Compilation;
-using RainDB.Sql.Parsing;
 
 namespace RainDB.Sql;
 
 /// <summary>Entry points for the strict SQL subset (parse → logical → physical without <see cref="ISqlCompiler"/>).</summary>
-public static class StrictSqlSubset
+public sealed class StrictSqlSubset
 {
+    public static StrictSqlSubset Shared { get; } = new();
+
+    private readonly LogicalPlanCompiler _compiler = new();
+
+    public LogicalPlanCompiler Compiler => _compiler;
+
+    public LogicalPlan Parse(string sql) => _compiler.Parse(sql);
+
+    public IPhysicalPlan CompilePhysical(
+        string sql,
+        ICatalog catalog,
+        VectorizedScanExecutionOptions scanOptions = default) =>
+        _compiler.CompilePhysical(Parse(sql).Root, catalog, scanOptions);
+
     /// <summary>Parse SQL into a <see cref="LogicalPlan"/> (table scan or inner join root).</summary>
-    public static LogicalPlan ParseLogicalPlan(string sql) => SqlParser.Parse(sql);
+    public static LogicalPlan ParseLogicalPlan(string sql) => Shared.Parse(sql);
 
     /// <summary>Parse and bind to a physical plan using <paramref name="catalog"/>.</summary>
     public static IPhysicalPlan CompilePhysicalPlan(
         string sql,
         ICatalog catalog,
         VectorizedScanExecutionOptions scanOptions = default) =>
-        CompileRoot(ParseLogicalPlan(sql).Root, catalog, scanOptions);
-
-    private static IPhysicalPlan CompileRoot(
-        ILogicalRoot root,
-        ICatalog catalog,
-        VectorizedScanExecutionOptions scanOptions) =>
-        root switch
-        {
-            LogicalTableScan s => LogicalTableScanBinder.BindAndLower(s, catalog, scanOptions),
-            LogicalInnerJoin j => LogicalJoinBinder.BindAndLower(j, catalog, PhysicalJoinAlgorithm.Hash, scanOptions),
-            _ => throw new InvalidOperationException($"Unsupported logical root {root.GetType().Name}."),
-        };
+        Shared.CompilePhysical(sql, catalog, scanOptions);
 }

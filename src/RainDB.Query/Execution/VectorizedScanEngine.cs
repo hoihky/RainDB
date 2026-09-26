@@ -4,6 +4,7 @@ using RainDB.Catalog;
 using RainDB.Columnar;
 using RainDB.Core.Columnar;
 using RainDB.Execution;
+using RainDB.Query.Execution.Operators;
 using RainDB.Query.Plans;
 using RainDB.Query.Results;
 using RainDB.Query.Vectorized;
@@ -12,9 +13,19 @@ using RainDB.Schema;
 namespace RainDB.Query.Execution;
 
 /// <summary>Phase 1 vectorized scan / filter / project / aggregate with morsel parallelism.</summary>
-public static class VectorizedScanEngine
+public sealed class VectorizedScanOperator : Operators.IVectorizedScanOperator
 {
-    public static async ValueTask<IQueryResult> ExecuteAsync(
+    private readonly QueryOperatorDependencies _deps;
+
+    public VectorizedScanOperator()
+        : this(new QueryOperatorDependencies())
+    {
+    }
+
+    internal VectorizedScanOperator(QueryOperatorDependencies dependencies) =>
+        _deps = dependencies ?? throw new ArgumentNullException(nameof(dependencies));
+
+    public async ValueTask<IQueryResult> ExecuteAsync(
         VectorizedScanPhysicalPlan plan,
         IColumnarTableSource table,
         IExecutionContext context)
@@ -79,7 +90,7 @@ public static class VectorizedScanEngine
         }
     }
 
-    private static async ValueTask<IReadOnlyList<IColumnarBatch>> ProjectAllBatchesAsync(
+    private async ValueTask<IReadOnlyList<IColumnarBatch>> ProjectAllBatchesAsync(
         VectorizedScanPhysicalPlan plan,
         IColumnarTableSource table,
         IExecutionContext context)
@@ -152,7 +163,7 @@ public static class VectorizedScanEngine
         await Task.WhenAll(workers).ConfigureAwait(false);
     }
 
-    private static IColumnarBatch ProcessOneBatch(
+    private IColumnarBatch ProcessOneBatch(
         VectorizedScanPhysicalPlan plan,
         IColumnarBatch batch,
         IExecutionContext context)
@@ -165,11 +176,11 @@ public static class VectorizedScanEngine
             int selected;
             var hasFilters = plan.Filters is { Length: > 0 };
             if (hasFilters)
-                selected = SelectionEvaluator.FillSelectedRowsConjunctive(batch, plan.Filters!, span);
+                selected = _deps.Selection.FillSelectedRowsConjunctive(batch, plan.Filters!, span);
             else
                 selected = batch.RowCount;
 
-            return ProjectGather.Project(
+            return _deps.ProjectGather.Project(
                 batch,
                 plan.OutputColumnIndices.AsSpan(),
                 useRowSelection: hasFilters,
@@ -184,7 +195,7 @@ public static class VectorizedScanEngine
         }
     }
 
-    private static async ValueTask<IAggregateQueryResult> ComputeAggregateAsync(
+    private async ValueTask<IAggregateQueryResult> ComputeAggregateAsync(
         VectorizedScanPhysicalPlan plan,
         IColumnarTableSource table,
         AggregateSpec spec,
@@ -246,7 +257,7 @@ public static class VectorizedScanEngine
     private static int EffectiveDop(int maxDegreeOfParallelism) =>
         maxDegreeOfParallelism < 0 ? Environment.ProcessorCount : maxDegreeOfParallelism == 0 ? 1 : maxDegreeOfParallelism;
 
-    private static PartialAgg AccumulateAggregateBatch(
+    private PartialAgg AccumulateAggregateBatch(
         VectorizedScanPhysicalPlan plan,
         IColumnarBatch batch,
         AggregateSpec spec,
@@ -264,7 +275,7 @@ public static class VectorizedScanEngine
                 int k;
                 if (plan.Filters is { Length: > 0 } filters)
                 {
-                    k = SelectionEvaluator.FillSelectedRowsConjunctive(batch, filters, rent.AsSpan(0, batch.RowCount));
+                    k = _deps.Selection.FillSelectedRowsConjunctive(batch, filters, rent.AsSpan(0, batch.RowCount));
                     sel = rent.AsSpan(0, k);
                 }
                 else
@@ -273,7 +284,7 @@ public static class VectorizedScanEngine
                     sel = ReadOnlySpan<int>.Empty;
                 }
 
-                return PartialAgg.FromCountColumn(col, sel, k);
+                return PartialAgg.FromCountColumn(_deps, col, sel, k);
             }
             finally
             {
@@ -289,7 +300,7 @@ public static class VectorizedScanEngine
             int k;
             if (plan.Filters is { Length: > 0 } filters)
             {
-                k = SelectionEvaluator.FillSelectedRowsConjunctive(batch, filters, rent2.AsSpan(0, batch.RowCount));
+                k = _deps.Selection.FillSelectedRowsConjunctive(batch, filters, rent2.AsSpan(0, batch.RowCount));
                 sel = rent2.AsSpan(0, k);
             }
             else
@@ -298,7 +309,7 @@ public static class VectorizedScanEngine
                 sel = ReadOnlySpan<int>.Empty;
             }
 
-            return PartialAgg.FromColumn(measureCol, spec.Kind, sel, k, options);
+            return PartialAgg.FromColumn(_deps, measureCol, spec.Kind, sel, k, options);
         }
         finally
         {
@@ -306,14 +317,14 @@ public static class VectorizedScanEngine
         }
     }
 
-    private static PartialAgg AccumulateFilteredRowCount(VectorizedScanPhysicalPlan plan, IColumnarBatch batch)
+    private PartialAgg AccumulateFilteredRowCount(VectorizedScanPhysicalPlan plan, IColumnarBatch batch)
     {
         var rent = ArrayPool<int>.Shared.Rent(batch.RowCount);
         try
         {
             int k;
             if (plan.Filters is { Length: > 0 } filters)
-                k = SelectionEvaluator.FillSelectedRowsConjunctive(batch, filters, rent.AsSpan(0, batch.RowCount));
+                k = _deps.Selection.FillSelectedRowsConjunctive(batch, filters, rent.AsSpan(0, batch.RowCount));
             else
                 k = batch.RowCount;
 
@@ -359,14 +370,18 @@ public static class VectorizedScanEngine
         public static PartialAgg FromCountStar(int selectedRowCount) =>
             new PartialAgg(0, 0d, 0d, 0d, 0L, false, false, selectedRowCount);
 
-        public static PartialAgg FromCountColumn(IColumnChunk col, ReadOnlySpan<int> selectedRows, int selectedCount)
+        public static PartialAgg FromCountColumn(
+            QueryOperatorDependencies deps,
+            IColumnChunk col,
+            ReadOnlySpan<int> selectedRows,
+            int selectedCount)
         {
             var nb = col.HasNulls ? col.NullBitmap.Span : ReadOnlySpan<byte>.Empty;
             long c = 0;
             for (var i = 0; i < selectedCount; i++)
             {
                 var r = Row(selectedRows, i);
-                if (!SelectionEvaluator.IsNull(nb, r, col.HasNulls))
+                if (!deps.Selection.IsNull(nb, r, col.HasNulls))
                     c++;
             }
 
@@ -414,6 +429,7 @@ public static class VectorizedScanEngine
         }
 
         public static PartialAgg FromColumn(
+            QueryOperatorDependencies deps,
             IColumnChunk col,
             AggregateKind kind,
             ReadOnlySpan<int> selectedRows,
@@ -424,18 +440,20 @@ public static class VectorizedScanEngine
             var values = col.Values.Span;
             return kind switch
             {
-                AggregateKind.Sum when col.PhysicalType == RainDbType.Float64 => SumFloat64(col, selectedRows, selectedCount, nb, values, options),
+                AggregateKind.Sum when col.PhysicalType == RainDbType.Float64 =>
+                    SumFloat64(deps, col, selectedRows, selectedCount, nb, values, options),
                 AggregateKind.Sum when col.PhysicalType == RainDbType.Int32 =>
-                    SumInt32(col, selectedRows, selectedCount, col.HasNulls, nb, values, options),
+                    SumInt32(deps, col, selectedRows, selectedCount, col.HasNulls, nb, values, options),
                 AggregateKind.Sum when col.PhysicalType == RainDbType.Int64 =>
-                    SumInt64(col, selectedRows, selectedCount, col.HasNulls, nb, values, options),
+                    SumInt64(deps, col, selectedRows, selectedCount, col.HasNulls, nb, values, options),
                 AggregateKind.Min or AggregateKind.Max when col.PhysicalType == RainDbType.Float64 =>
-                    MinMaxFloat64(kind, col, selectedRows, selectedCount, col.HasNulls, nb, values, options),
+                    MinMaxFloat64(deps, kind, col, selectedRows, selectedCount, col.HasNulls, nb, values, options),
                 _ => throw new NotSupportedException($"Aggregate on {col.PhysicalType} is not supported."),
             };
         }
 
         private static PartialAgg SumFloat64(
+            QueryOperatorDependencies deps,
             IColumnChunk col,
             ReadOnlySpan<int> selectedRows,
             int selectedCount,
@@ -448,7 +466,7 @@ public static class VectorizedScanEngine
 
             if (selectedRows.IsEmpty && !col.HasNulls && options.UseAvx2DoubleSum)
             {
-                var sum = AggregateIntrinsics.SumFloat64(values, allowAvx2: true);
+                var sum = deps.Aggregates.SumFloat64(values, allowAvx2: true);
                 return new PartialAgg(selectedCount, sum, 0d, 0d, 0L, false, false, 0);
             }
 
@@ -457,7 +475,7 @@ public static class VectorizedScanEngine
             for (var i = 0; i < selectedCount; i++)
             {
                 var r = Row(selectedRows, i);
-                if (SelectionEvaluator.IsNull(nb, r, col.HasNulls))
+                if (deps.Selection.IsNull(nb, r, col.HasNulls))
                     continue;
                 var bits = System.Buffers.Binary.BinaryPrimitives.ReadInt64LittleEndian(values.Slice(r * sizeof(double), sizeof(double)));
                 s += BitConverter.Int64BitsToDouble(bits);
@@ -468,6 +486,7 @@ public static class VectorizedScanEngine
         }
 
         private static PartialAgg SumInt32(
+            QueryOperatorDependencies deps,
             IColumnChunk col,
             ReadOnlySpan<int> selectedRows,
             int selectedCount,
@@ -481,7 +500,7 @@ public static class VectorizedScanEngine
 
             if (selectedRows.IsEmpty && !col.HasNulls && options.UseAvx2IntegerSum)
             {
-                var sum = AggregateIntrinsics.SumInt32(values, allowSimd: true);
+                var sum = deps.Aggregates.SumInt32(values, allowSimd: true);
                 return new PartialAgg(selectedCount, 0d, 0d, 0d, sum, false, false, 0);
             }
 
@@ -490,7 +509,7 @@ public static class VectorizedScanEngine
             for (var i = 0; i < selectedCount; i++)
             {
                 var r = Row(selectedRows, i);
-                if (SelectionEvaluator.IsNull(nb, r, hasNulls))
+                if (deps.Selection.IsNull(nb, r, hasNulls))
                     continue;
                 s += System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(values.Slice(r * sizeof(int), sizeof(int)));
                 contrib++;
@@ -500,6 +519,7 @@ public static class VectorizedScanEngine
         }
 
         private static PartialAgg SumInt64(
+            QueryOperatorDependencies deps,
             IColumnChunk col,
             ReadOnlySpan<int> selectedRows,
             int selectedCount,
@@ -513,7 +533,7 @@ public static class VectorizedScanEngine
 
             if (selectedRows.IsEmpty && !col.HasNulls && options.UseAvx2IntegerSum)
             {
-                var sum = AggregateIntrinsics.SumInt64(values, allowAvx2: true);
+                var sum = deps.Aggregates.SumInt64(values, allowAvx2: true);
                 return new PartialAgg(selectedCount, 0d, 0d, 0d, sum, false, false, 0);
             }
 
@@ -522,7 +542,7 @@ public static class VectorizedScanEngine
             for (var i = 0; i < selectedCount; i++)
             {
                 var r = Row(selectedRows, i);
-                if (SelectionEvaluator.IsNull(nb, r, hasNulls))
+                if (deps.Selection.IsNull(nb, r, hasNulls))
                     continue;
                 s += System.Buffers.Binary.BinaryPrimitives.ReadInt64LittleEndian(values.Slice(r * sizeof(long), sizeof(long)));
                 contrib++;
@@ -532,6 +552,7 @@ public static class VectorizedScanEngine
         }
 
         private static PartialAgg MinMaxFloat64(
+            QueryOperatorDependencies deps,
             AggregateKind kind,
             IColumnChunk col,
             ReadOnlySpan<int> selectedRows,
@@ -547,8 +568,8 @@ public static class VectorizedScanEngine
             if (selectedRows.IsEmpty && !col.HasNulls && options.UseAvx2DoubleMinMax)
             {
                 var x = kind == AggregateKind.Min
-                    ? AggregateIntrinsics.MinFloat64(values, allowAvx2: true)
-                    : AggregateIntrinsics.MaxFloat64(values, allowAvx2: true);
+                    ? deps.Aggregates.MinFloat64(values, allowAvx2: true)
+                    : deps.Aggregates.MaxFloat64(values, allowAvx2: true);
                 return kind == AggregateKind.Min
                     ? new PartialAgg(selectedCount, 0d, x, 0d, 0L, true, false, 0)
                     : new PartialAgg(selectedCount, 0d, 0d, x, 0L, false, true, 0);
@@ -559,7 +580,7 @@ public static class VectorizedScanEngine
             for (var i = 0; i < selectedCount; i++)
             {
                 var r = Row(selectedRows, i);
-                if (SelectionEvaluator.IsNull(nb, r, hasNulls))
+                if (deps.Selection.IsNull(nb, r, hasNulls))
                     continue;
                 var bits = System.Buffers.Binary.BinaryPrimitives.ReadInt64LittleEndian(values.Slice(r * sizeof(double), sizeof(double)));
                 var v = BitConverter.Int64BitsToDouble(bits);

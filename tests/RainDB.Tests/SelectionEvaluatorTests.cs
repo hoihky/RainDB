@@ -10,6 +10,13 @@ namespace RainDB.Tests;
 
 public class SelectionEvaluatorTests
 {
+    private static SelectionEvaluator CreateEvaluator()
+    {
+        var eval = new SelectionEvaluator();
+        eval.BindSelectionKernels(new FixedWidthSelectionKernels(eval));
+        return eval;
+    }
+
     [Fact]
     public void Conjunctive_where_intersects_predicates()
     {
@@ -23,7 +30,8 @@ public class SelectionEvaluatorTests
             new ColumnCompareFilter(1, ScalarCompareOp.Lt, 35),
         };
         Span<int> dest = stackalloc int[4];
-        var count = SelectionEvaluator.FillSelectedRowsConjunctive(batch, filters, dest);
+        var eval = CreateEvaluator();
+        var count = eval.FillSelectedRowsConjunctive(batch, filters, dest);
         Assert.Equal(2, count);
         Assert.Equal(1, dest[0]);
         Assert.Equal(2, dest[1]);
@@ -37,7 +45,8 @@ public class SelectionEvaluatorTests
         ]);
         var filter = new ColumnCompareFilter(0, ScalarCompareOp.Eq, 0, "ab"u8.ToArray());
         Span<int> dest = stackalloc int[2];
-        var count = SelectionEvaluator.FillSelectedRows(batch.Columns[0], filter, dest);
+        var eval = CreateEvaluator();
+        var count = eval.FillSelectedRows(batch.Columns[0], filter, dest);
         Assert.Equal(1, count);
         Assert.Equal(0, dest[0]);
     }
@@ -49,7 +58,8 @@ public class SelectionEvaluatorTests
         var col = new Utf8ColumnChunk(1, new[] { 0, 1 }, blob, new byte[] { 0b0000_0001 }, hasNulls: true);
         var filter = new ColumnCompareFilter(0, ScalarCompareOp.Eq, 0, "x"u8.ToArray());
         Span<int> dest = stackalloc int[1];
-        var count = SelectionEvaluator.FillSelectedRows(col, filter, dest);
+        var eval = CreateEvaluator();
+        var count = eval.FillSelectedRows(col, filter, dest);
         Assert.Equal(0, count);
     }
 
@@ -60,6 +70,7 @@ public class SelectionEvaluatorTests
         BinaryPrimitives.WriteInt32LittleEndian(vals, 5);
         var col = new FixedWidthColumnChunk(RainDbType.Int32, 1, vals, new byte[] { 0b0000_0001 }, hasNulls: true);
         var filter = new ColumnCompareFilter(0, ScalarCompareOp.Eq, 5);
-        Assert.False(SelectionEvaluator.RowMatchesFilter(col, filter, 0));
+        var eval = CreateEvaluator();
+        Assert.False(eval.RowMatchesFilter(col, filter, 0));
     }
 }
