@@ -425,10 +425,12 @@ public static class VectorizedScanEngine
             return kind switch
             {
                 AggregateKind.Sum when col.PhysicalType == RainDbType.Float64 => SumFloat64(col, selectedRows, selectedCount, nb, values, options),
-                AggregateKind.Sum when col.PhysicalType == RainDbType.Int32 => SumInt32(selectedRows, selectedCount, col.HasNulls, nb, values),
-                AggregateKind.Sum when col.PhysicalType == RainDbType.Int64 => SumInt64(selectedRows, selectedCount, col.HasNulls, nb, values),
+                AggregateKind.Sum when col.PhysicalType == RainDbType.Int32 =>
+                    SumInt32(col, selectedRows, selectedCount, col.HasNulls, nb, values, options),
+                AggregateKind.Sum when col.PhysicalType == RainDbType.Int64 =>
+                    SumInt64(col, selectedRows, selectedCount, col.HasNulls, nb, values, options),
                 AggregateKind.Min or AggregateKind.Max when col.PhysicalType == RainDbType.Float64 =>
-                    MinMaxFloat64(kind, selectedRows, selectedCount, col.HasNulls, nb, values),
+                    MinMaxFloat64(kind, col, selectedRows, selectedCount, col.HasNulls, nb, values, options),
                 _ => throw new NotSupportedException($"Aggregate on {col.PhysicalType} is not supported."),
             };
         }
@@ -466,12 +468,23 @@ public static class VectorizedScanEngine
         }
 
         private static PartialAgg SumInt32(
+            IColumnChunk col,
             ReadOnlySpan<int> selectedRows,
             int selectedCount,
             bool hasNulls,
             ReadOnlySpan<byte> nb,
-            ReadOnlySpan<byte> values)
+            ReadOnlySpan<byte> values,
+            VectorizedScanExecutionOptions options)
         {
+            if (selectedCount == 0)
+                return new PartialAgg(0, 0d, 0d, 0d, 0L, false, false, 0);
+
+            if (selectedRows.IsEmpty && !col.HasNulls && options.UseAvx2IntegerSum)
+            {
+                var sum = AggregateIntrinsics.SumInt32(values, allowSimd: true);
+                return new PartialAgg(selectedCount, 0d, 0d, 0d, sum, false, false, 0);
+            }
+
             long s = 0;
             long contrib = 0;
             for (var i = 0; i < selectedCount; i++)
@@ -487,12 +500,23 @@ public static class VectorizedScanEngine
         }
 
         private static PartialAgg SumInt64(
+            IColumnChunk col,
             ReadOnlySpan<int> selectedRows,
             int selectedCount,
             bool hasNulls,
             ReadOnlySpan<byte> nb,
-            ReadOnlySpan<byte> values)
+            ReadOnlySpan<byte> values,
+            VectorizedScanExecutionOptions options)
         {
+            if (selectedCount == 0)
+                return new PartialAgg(0, 0d, 0d, 0d, 0L, false, false, 0);
+
+            if (selectedRows.IsEmpty && !col.HasNulls && options.UseAvx2IntegerSum)
+            {
+                var sum = AggregateIntrinsics.SumInt64(values, allowAvx2: true);
+                return new PartialAgg(selectedCount, 0d, 0d, 0d, sum, false, false, 0);
+            }
+
             long s = 0;
             long contrib = 0;
             for (var i = 0; i < selectedCount; i++)
@@ -509,12 +533,27 @@ public static class VectorizedScanEngine
 
         private static PartialAgg MinMaxFloat64(
             AggregateKind kind,
+            IColumnChunk col,
             ReadOnlySpan<int> selectedRows,
             int selectedCount,
             bool hasNulls,
             ReadOnlySpan<byte> nb,
-            ReadOnlySpan<byte> values)
+            ReadOnlySpan<byte> values,
+            VectorizedScanExecutionOptions options)
         {
+            if (selectedCount == 0)
+                return new PartialAgg(0, 0d, 0d, 0d, 0L, false, false, 0);
+
+            if (selectedRows.IsEmpty && !col.HasNulls && options.UseAvx2DoubleMinMax)
+            {
+                var x = kind == AggregateKind.Min
+                    ? AggregateIntrinsics.MinFloat64(values, allowAvx2: true)
+                    : AggregateIntrinsics.MaxFloat64(values, allowAvx2: true);
+                return kind == AggregateKind.Min
+                    ? new PartialAgg(selectedCount, 0d, x, 0d, 0L, true, false, 0)
+                    : new PartialAgg(selectedCount, 0d, 0d, x, 0L, false, true, 0);
+            }
+
             double? cur = null;
             long contrib = 0;
             for (var i = 0; i < selectedCount; i++)
@@ -532,10 +571,10 @@ public static class VectorizedScanEngine
 
             if (!cur.HasValue)
                 return new PartialAgg(0, 0d, 0d, 0d, 0L, false, false, 0);
-            var x = cur.Value;
+            var scalar = cur.Value;
             return kind == AggregateKind.Min
-                ? new PartialAgg(contrib, 0d, x, 0d, 0L, true, false, 0)
-                : new PartialAgg(contrib, 0d, 0d, x, 0L, false, true, 0);
+                ? new PartialAgg(contrib, 0d, scalar, 0d, 0L, true, false, 0)
+                : new PartialAgg(contrib, 0d, 0d, scalar, 0L, false, true, 0);
         }
 
         private static int Row(ReadOnlySpan<int> selectedRows, int i) => selectedRows.IsEmpty ? i : selectedRows[i];

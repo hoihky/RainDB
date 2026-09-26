@@ -67,4 +67,10 @@ public readonly record struct VectorizedScanExecutionOptions
 
     /// <summary>Use AVX2 horizontal reduction for <see cref="RainDB.Schema.RainDbType.Float64"/> <see cref="AggregateKind.Sum"/> when available.</summary>
     public bool UseAvx2DoubleSum { get; init; }
+
+    /// <summary>Use AVX min/max for null-free full-column <see cref="RainDB.Schema.RainDbType.Float64"/> <see cref="AggregateKind.Min"/> / <see cref="AggregateKind.Max"/>.</summary>
+    public bool UseAvx2DoubleMinMax { get; init; }
+
+    /// <summary>Use SIMD integer sum for null-free full-column <see cref="RainDB.Schema.RainDbType.Int32"/> / <see cref="RainDB.Schema.RainDbType.Int64"/> <see cref="AggregateKind.Sum"/>.</summary>
+    public bool UseAvx2IntegerSum { get; init; }
 }

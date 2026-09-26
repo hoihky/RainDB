@@ -45,10 +45,12 @@ This roadmap turns the DuckDB-class gap analysis into a sequenced plan for RainD
 
 **Exit criteria:** Join + `GROUP BY` workloads on medium cardinality complete without proportional spike in peak RSS vs output size.
 
-### A4. SIMD and native boundaries
+### A4. SIMD and native boundaries — **implemented**
 
-- Extend intrinsics beyond `SumFloat64`: min/max on `Float64`, optional integer sum paths, hash combine helpers for fixed-width keys.
-- Introduce optional **`RainDB.Native`** (or similar) only when C# intrinsics are insufficient; keep `AggregateIntrinsics`-style entry points in Core.
+- **`AggregateIntrinsics`**: AVX2 **`MinFloat64`** / **`MaxFloat64`**; **`SumInt32`** (Vector128 lanes) and **`SumInt64`** (AVX2); scalar fallbacks when hardware is unavailable or `allowAvx2` / `allowSimd` is false.
+- **`VectorizedScanExecutionOptions`**: **`UseAvx2DoubleMinMax`**, **`UseAvx2IntegerSum`** gate full-column null-free fast paths (same pattern as **`UseAvx2DoubleSum`**).
+- **`MixHash`**: stable 64-bit combine helper for future key hashing (scalar).
+- Optional **`RainDB.Native`** deferred until C# intrinsics are insufficient.
 
 **Exit criteria:** AVX2 paths are opt-in and tested; scalar fallbacks always available.
 

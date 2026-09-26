@@ -223,7 +223,7 @@ Output: `ColumnarBatch` with `PooledFixedWidthColumnChunk` or UTF-8 chunk types.
 - Deterministic combine across batches.
 - `COUNT(*)`: filtered row count; `COUNT(col)`: non-null among selected rows.
 - `SUM` / `MIN` / `MAX`: `IAggregateQueryResult.ValueIsNull` when no contributing non-null values.
-- Optional AVX2 `SumFloat64` when `UseAvx2DoubleSum`, no nulls, full-column scan without selection.
+- Optional SIMD via `AggregateIntrinsics` when scan options are set and the aggregate runs on a null-free full column (no row selection): `UseAvx2DoubleSum` → `SumFloat64`; `UseAvx2DoubleMinMax` → `MinFloat64` / `MaxFloat64`; `UseAvx2IntegerSum` → `SumInt32` / `SumInt64`. Each intrinsic falls back to scalar when hardware is unavailable or the caller disables acceleration.
 
 ---
 

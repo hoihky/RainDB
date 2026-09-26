@@ -293,6 +293,8 @@ var plan = new VectorizedScanPhysicalPlan(
         MaxDegreeOfParallelism = Environment.ProcessorCount,
         UseChannelScheduler = false,
         UseAvx2DoubleSum = true,
+        UseAvx2DoubleMinMax = true,
+        UseAvx2IntegerSum = true,
     });
 
 await using var result = await engine.ExecutePhysicalAsync(plan);
