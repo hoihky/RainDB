@@ -1,10 +1,10 @@
 using System.Buffers;
-using System.Buffers.Binary;
 using System.IO;
 using RainDB.Catalog;
 using RainDB.Columnar;
 using RainDB.Core.Columnar;
 using RainDB.Execution;
+using RainDB.Query.Execution.Sorting;
 using RainDB.Query.Plans;
 using RainDB.Query.Results;
 using RainDB.Query.Vectorized;
@@ -31,11 +31,13 @@ public static class SortTopNEngine
         var batches = table.Batches;
         var ct = context.CancellationToken;
         var rows = CollectFilteredRows(batches, plan.Filters, ct);
-        if (plan.SortKeys.Length > 0)
-            Array.Sort(rows, new RowLocComparer(table.Schema, plan.SortKeys, batches));
-
-        var take = plan.Limit is { } lim ? Math.Min(lim, rows.Length) : rows.Length;
-        var batch = MaterializeRows(batches, table.Schema, rows.AsSpan(0, take), plan.OutputColumnIndices);
+        var ordered = SortTopNRowSelection.SelectInSortOrder(
+            rows,
+            plan.SortKeys,
+            plan.Limit,
+            table.Schema,
+            batches);
+        var batch = MaterializeRows(batches, table.Schema, ordered, plan.OutputColumnIndices);
         return new ValueTask<IQueryResult>(new ColumnarMaterializedQueryResult([batch]));
     }
 
@@ -56,14 +58,16 @@ public static class SortTopNEngine
         var schema = plan.Join.OutputSchema;
         ValidateSortKeys(schema, plan.SortKeys);
         var rows = CollectAllRows(batches, context.CancellationToken);
-        if (plan.SortKeys.Length > 0)
-            Array.Sort(rows, new RowLocComparer(schema, plan.SortKeys, batches));
-
-        var take = plan.Limit is { } lim ? Math.Min(lim, rows.Length) : rows.Length;
+        var ordered = SortTopNRowSelection.SelectInSortOrder(
+            rows,
+            plan.SortKeys,
+            plan.Limit,
+            schema,
+            batches);
         var outIx = new int[schema.Columns.Count];
         for (var i = 0; i < outIx.Length; i++)
             outIx[i] = i;
-        var batch = MaterializeRows(batches, schema, rows.AsSpan(0, take), outIx);
+        var batch = MaterializeRows(batches, schema, ordered, outIx);
         return new ColumnarMaterializedQueryResult([batch]);
     }
 
@@ -97,7 +101,7 @@ public static class SortTopNEngine
         }
     }
 
-    private static RowLoc[] CollectFilteredRows(
+    private static RowLocation[] CollectFilteredRows(
         IReadOnlyList<IColumnarBatch> batches,
         ColumnCompareFilter[]? filters,
         CancellationToken ct)
@@ -109,7 +113,7 @@ public static class SortTopNEngine
         var tmp = rent.Rent(Math.Max(total, 16));
         try
         {
-            var list = new List<RowLoc>(total);
+            var list = new List<RowLocation>(total);
             for (var bi = 0; bi < batches.Count; bi++)
             {
                 ct.ThrowIfCancellationRequested();
@@ -119,12 +123,12 @@ public static class SortTopNEngine
                 {
                     k = SelectionEvaluator.FillSelectedRowsConjunctive(batch, fa, tmp.AsSpan(0, batch.RowCount));
                     for (var i = 0; i < k; i++)
-                        list.Add(new RowLoc(bi, tmp[i]));
+                        list.Add(new RowLocation(bi, tmp[i]));
                 }
                 else
                 {
                     for (var r = 0; r < batch.RowCount; r++)
-                        list.Add(new RowLoc(bi, r));
+                        list.Add(new RowLocation(bi, r));
                 }
             }
 
@@ -136,15 +140,15 @@ public static class SortTopNEngine
         }
     }
 
-    private static RowLoc[] CollectAllRows(IReadOnlyList<IColumnarBatch> batches, CancellationToken ct)
+    private static RowLocation[] CollectAllRows(IReadOnlyList<IColumnarBatch> batches, CancellationToken ct)
     {
-        var list = new List<RowLoc>();
+        var list = new List<RowLocation>();
         for (var bi = 0; bi < batches.Count; bi++)
         {
             ct.ThrowIfCancellationRequested();
             var batch = batches[bi];
             for (var r = 0; r < batch.RowCount; r++)
-                list.Add(new RowLoc(bi, r));
+                list.Add(new RowLocation(bi, r));
         }
 
         return list.ToArray();
@@ -153,7 +157,7 @@ public static class SortTopNEngine
     private static ColumnarBatch MaterializeRows(
         IReadOnlyList<IColumnarBatch> batches,
         TableSchema schema,
-        ReadOnlySpan<RowLoc> rows,
+        ReadOnlySpan<RowLocation> rows,
         ReadOnlySpan<int> outputColumnIndices)
     {
         var n = rows.Length;
@@ -174,7 +178,7 @@ public static class SortTopNEngine
         IReadOnlyList<IColumnarBatch> batches,
         int colIx,
         RainDbType type,
-        ReadOnlySpan<RowLoc> rows)
+        ReadOnlySpan<RowLocation> rows)
     {
         var w = ColumnTypeSizes.FixedWidthBytes(type);
         var values = new byte[checked(rows.Length * w)];
@@ -184,8 +188,8 @@ public static class SortTopNEngine
         for (var o = 0; o < rows.Length; o++)
         {
             var loc = rows[o];
-            var col = batches[loc.BatchIdx].Columns[colIx];
-            var r = loc.RowIdx;
+            var col = batches[loc.BatchIndex].Columns[colIx];
+            var r = loc.RowIndex;
             var srcNb = col.HasNulls ? col.NullBitmap.Span : ReadOnlySpan<byte>.Empty;
             if (SelectionEvaluator.IsNull(srcNb, r, col.HasNulls))
             {
@@ -200,7 +204,7 @@ public static class SortTopNEngine
         return new FixedWidthColumnChunk(type, rows.Length, values, nb, anyNull);
     }
 
-    private static IColumnChunk GatherUtf8Column(IReadOnlyList<IColumnarBatch> batches, int colIx, ReadOnlySpan<RowLoc> rows)
+    private static IColumnChunk GatherUtf8Column(IReadOnlyList<IColumnarBatch> batches, int colIx, ReadOnlySpan<RowLocation> rows)
     {
         var offsets = new int[rows.Length + 1];
         using var blob = new MemoryStream();
@@ -211,8 +215,8 @@ public static class SortTopNEngine
         {
             offsets[o] = (int)blob.Length;
             var loc = rows[o];
-            var col = batches[loc.BatchIdx].Columns[colIx];
-            var r = loc.RowIdx;
+            var col = batches[loc.BatchIndex].Columns[colIx];
+            var r = loc.RowIndex;
             var srcNb = col.HasNulls ? col.NullBitmap.Span : ReadOnlySpan<byte>.Empty;
             if (SelectionEvaluator.IsNull(srcNb, r, col.HasNulls))
             {
@@ -238,97 +242,5 @@ public static class SortTopNEngine
     {
         var b = row >> 3;
         nb[b] |= (byte)(1 << (row & 7));
-    }
-
-    private readonly struct RowLoc
-    {
-        public RowLoc(int batchIdx, int rowIdx)
-        {
-            BatchIdx = batchIdx;
-            RowIdx = rowIdx;
-        }
-
-        public int BatchIdx { get; }
-
-        public int RowIdx { get; }
-    }
-
-    private sealed class RowLocComparer : IComparer<RowLoc>
-    {
-        private readonly TableSchema _schema;
-        private readonly SortKeyPhysicalSpec[] _keys;
-        private readonly IReadOnlyList<IColumnarBatch> _batches;
-
-        public RowLocComparer(TableSchema schema, SortKeyPhysicalSpec[] keys, IReadOnlyList<IColumnarBatch> batches)
-        {
-            _schema = schema;
-            _keys = keys;
-            _batches = batches;
-        }
-
-        public int Compare(RowLoc x, RowLoc y)
-        {
-            foreach (var spec in _keys)
-            {
-                var c = CompareAtColumn(spec.ColumnIndex, x, y);
-                if (c != 0)
-                    return spec.Descending ? -c : c;
-            }
-
-            return 0;
-        }
-
-        private int CompareAtColumn(int colIx, RowLoc a, RowLoc b)
-        {
-            var colA = _batches[a.BatchIdx].Columns[colIx];
-            var colB = _batches[b.BatchIdx].Columns[colIx];
-            var t = _schema.Columns[colIx].Type;
-            var na = colA.HasNulls && SelectionEvaluator.IsNull(colA.NullBitmap.Span, a.RowIdx, true);
-            var nb = colB.HasNulls && SelectionEvaluator.IsNull(colB.NullBitmap.Span, b.RowIdx, true);
-            if (na && nb)
-                return 0;
-            if (na)
-                return -1;
-            if (nb)
-                return 1;
-
-            return t switch
-            {
-                RainDbType.Utf8 => CompareUtf8(colA, a.RowIdx, colB, b.RowIdx),
-                RainDbType.Int32 => ReadI32(colA, a.RowIdx).CompareTo(ReadI32(colB, b.RowIdx)),
-                RainDbType.Int64 => ReadI64(colA, a.RowIdx).CompareTo(ReadI64(colB, b.RowIdx)),
-                RainDbType.Float64 => ReadF64(colA, a.RowIdx).CompareTo(ReadF64(colB, b.RowIdx)),
-                RainDbType.Boolean => ReadBool(colA, a.RowIdx).CompareTo(ReadBool(colB, b.RowIdx)),
-                _ => 0,
-            };
-        }
-
-        private static int CompareUtf8(IColumnChunk ca, int ra, IColumnChunk cb, int rb)
-        {
-            ReadOnlySpan<byte> sa = ca switch
-            {
-                Utf8ColumnChunk u => u.Values.Span[u.Offsets.Span[ra]..u.Offsets.Span[ra + 1]],
-                Utf8LengthPrefixedColumnChunk lp => lp.GetPayloadSpan(ra),
-                _ => throw new InvalidOperationException(),
-            };
-            ReadOnlySpan<byte> sb = cb switch
-            {
-                Utf8ColumnChunk u => u.Values.Span[u.Offsets.Span[rb]..u.Offsets.Span[rb + 1]],
-                Utf8LengthPrefixedColumnChunk lp => lp.GetPayloadSpan(rb),
-                _ => throw new InvalidOperationException(),
-            };
-            return sa.SequenceCompareTo(sb);
-        }
-
-        private static int ReadI32(IColumnChunk c, int row) =>
-            BinaryPrimitives.ReadInt32LittleEndian(c.Values.Span.Slice(row * sizeof(int), sizeof(int)));
-
-        private static long ReadI64(IColumnChunk c, int row) =>
-            BinaryPrimitives.ReadInt64LittleEndian(c.Values.Span.Slice(row * sizeof(long), sizeof(long)));
-
-        private static double ReadF64(IColumnChunk c, int row) =>
-            BitConverter.Int64BitsToDouble(BinaryPrimitives.ReadInt64LittleEndian(c.Values.Span.Slice(row * sizeof(double), sizeof(double))));
-
-        private static int ReadBool(IColumnChunk c, int row) => c.Values.Span[row] != 0 ? 1 : 0;
     }
 }

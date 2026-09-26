@@ -29,11 +29,11 @@ This roadmap turns the DuckDB-class gap analysis into a sequenced plan for RainD
 - **Tests**: `VectorizedSelectionPerformanceTests` (1M-row correctness + time budget).
 
 
-### A2. True top-N and sort discipline
+### A2. True top-N and sort discipline — **implemented**
 
-- When `ORDER BY` + `LIMIT` are present, use **partial sort / heap top-N** instead of full `Array.Sort` over all rows.
-- Retain full sort only when required (no limit, or sort keys need global order without a small k).
-- Document memory bounds: O(n) vs O(k) for limited queries.
+- When `ORDER BY` + `LIMIT` are present and `k < row count`, `SortTopNRowSelection` uses **`BoundedTopKHeap`** (O(n log k) time, O(k) row locations) then sorts the k winners for output order.
+- Full `Array.Sort` remains when there is **no LIMIT**, or when **k ≥ row count**, or when there are **no sort keys** (LIMIT-only truncation).
+- `SchemaRowLocationComparer` centralizes null-aware multi-key ORDER BY semantics (shared with the previous full-sort path).
 
 **Exit criteria:** `ORDER BY … LIMIT k` on large tables stays bounded by k and key width, not full row count.
 

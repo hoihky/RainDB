@@ -280,8 +280,8 @@ If `ISpillWriter.IsEnabled` and `SpillPartialEntryThreshold` exceeded, engine wr
 ## 9. Sort and limit (`SortTopNEngine`)
 
 1. Collect row locations `(batchIdx, rowIdx)` from all batches (apply `WHERE` if present).
-2. If sort keys present: `Array.Sort` with `RowLocComparer` (null-aware, type-specific compare for Int32/Int64/Float64/Boolean/Utf8).
-3. Apply `LIMIT` by truncating sorted row list (full sort today; heap top-N is roadmap Phase A2).
+2. `SortTopNRowSelection`: if sort keys present and `LIMIT k` with `k < n`, use **`BoundedTopKHeap`** (O(k) retained rows) then sort the k winners; otherwise full `Array.Sort` via **`SchemaRowLocationComparer`** (null-aware Int32/Int64/Float64/Boolean/Utf8).
+3. If there are no sort keys, `LIMIT` truncates in stable batch/row collection order.
 4. Materialize projected columns into output batch.
 
 Join variant: execute join first, then sort/limit on join output schema.
