@@ -83,17 +83,29 @@ public static class HashAggregateEngine
         return new ColumnarMaterializedQueryResult([outBatch]);
     }
 
+    internal static void ValidatePlanForInputSchema(HashAggregatePhysicalPlan plan, TableSchema schema)
+    {
+        ArgumentNullException.ThrowIfNull(plan);
+        ArgumentNullException.ThrowIfNull(schema);
+        ValidatePlanColumns(plan, schema);
+    }
+
     private static void ValidatePlan(HashAggregatePhysicalPlan plan, IColumnarTableSource table)
     {
         if (plan.TableId != table.Id)
             throw new ArgumentException("Physical plan table id does not match resolved table.", nameof(table));
 
-        var colCount = table.Schema.Columns.Count;
+        ValidatePlanColumns(plan, table.Schema);
+    }
+
+    private static void ValidatePlanColumns(HashAggregatePhysicalPlan plan, TableSchema schema)
+    {
+        var colCount = schema.Columns.Count;
         foreach (var idx in plan.GroupKeyColumnIndices)
         {
             if ((uint)idx >= (uint)colCount)
                 throw new ArgumentException($"Group key column index {idx} is out of range.", nameof(plan));
-            var kt = table.Schema.Columns[idx].Type;
+            var kt = schema.Columns[idx].Type;
             if (kt != RainDbType.Utf8 && !ColumnTypeSizes.IsFixedWidth(kt))
                 throw new NotSupportedException($"Group key type {kt} is not supported.");
         }
@@ -113,9 +125,100 @@ public static class HashAggregateEngine
                 throw new ArgumentException($"Aggregate column index {a.SourceColumnIndex} is out of range.", nameof(plan));
             if (a.Kind == AggregateKind.Count && a.SourceColumnIndex < 0)
                 continue;
-            var t = table.Schema.Columns[a.SourceColumnIndex].Type;
+            var t = schema.Columns[a.SourceColumnIndex].Type;
             ValidateAggregate(t, a.Kind);
         }
+    }
+
+    internal static Dictionary<GroupKey, AggregateAccumulator[]> AccumulateBatchForGrouped(
+        IColumnarBatch batch,
+        HashAggregatePhysicalPlan plan,
+        CancellationToken cancellationToken) =>
+        AccumulateBatch(batch, plan, cancellationToken);
+
+    internal static Dictionary<CompositeJoinKey, AggregateAccumulator[]> AccumulateBatchCompositeForGrouped(
+        IColumnarBatch batch,
+        HashAggregatePhysicalPlan plan,
+        TableSchema schema,
+        CancellationToken cancellationToken) =>
+        AccumulateBatchComposite(batch, plan, schema, cancellationToken);
+
+    internal static void MergePartialIntoGlobal(
+        Dictionary<GroupKey, AggregateAccumulator[]> global,
+        Dictionary<GroupKey, AggregateAccumulator[]> partial,
+        AggregateSpec[] specs)
+    {
+        var aggCount = specs.Length;
+        foreach (var kv in partial)
+        {
+            if (!global.TryGetValue(kv.Key, out var merged))
+            {
+                merged = new AggregateAccumulator[aggCount];
+                for (var j = 0; j < aggCount; j++)
+                    merged[j] = kv.Value[j];
+                global[new GroupKey(kv.Key.Parts.ToArray(), kv.Key.NullMask)] = merged;
+            }
+            else
+            {
+                for (var j = 0; j < aggCount; j++)
+                    merged[j] = AggregateRowOps.Combine(merged[j], kv.Value[j], specs[j].Kind);
+            }
+        }
+    }
+
+    internal static void MergePartialIntoGlobalComposite(
+        Dictionary<CompositeJoinKey, AggregateAccumulator[]> global,
+        Dictionary<CompositeJoinKey, AggregateAccumulator[]> partial,
+        AggregateSpec[] specs)
+    {
+        var aggCount = specs.Length;
+        foreach (var kv in partial)
+        {
+            if (!global.TryGetValue(kv.Key, out var merged))
+            {
+                merged = new AggregateAccumulator[aggCount];
+                for (var j = 0; j < aggCount; j++)
+                    merged[j] = kv.Value[j];
+                global[kv.Key.DeepClone()] = merged;
+            }
+            else
+            {
+                for (var j = 0; j < aggCount; j++)
+                    merged[j] = AggregateRowOps.Combine(merged[j], kv.Value[j], specs[j].Kind);
+            }
+        }
+    }
+
+    internal static ValueTask<IQueryResult> MaterializeFromGlobalAsync(
+        HashAggregatePhysicalPlan plan,
+        TableSchema inputSchema,
+        Dictionary<GroupKey, AggregateAccumulator[]> global)
+    {
+        if (global.Count == 0)
+        {
+            var emptyCols = MaterializeEmptyOutput(plan, inputSchema);
+            return new ValueTask<IQueryResult>(new ColumnarMaterializedQueryResult([new ColumnarBatch(0, emptyCols)]));
+        }
+
+        var sortedKeys = SortKeys(global.Keys, inputSchema, plan.GroupKeyColumnIndices);
+        var outBatch = MaterializeOutput(sortedKeys, global, plan, inputSchema);
+        return new ValueTask<IQueryResult>(new ColumnarMaterializedQueryResult([outBatch]));
+    }
+
+    internal static ValueTask<IQueryResult> MaterializeFromGlobalCompositeAsync(
+        HashAggregatePhysicalPlan plan,
+        TableSchema inputSchema,
+        Dictionary<CompositeJoinKey, AggregateAccumulator[]> global)
+    {
+        if (global.Count == 0)
+        {
+            var emptyCols = MaterializeEmptyOutput(plan, inputSchema);
+            return new ValueTask<IQueryResult>(new ColumnarMaterializedQueryResult([new ColumnarBatch(0, emptyCols)]));
+        }
+
+        var sortedKeys = SortCompositeKeys(global.Keys, inputSchema, plan.GroupKeyColumnIndices);
+        var outBatch = MaterializeOutputComposite(sortedKeys, global, plan, inputSchema);
+        return new ValueTask<IQueryResult>(new ColumnarMaterializedQueryResult([outBatch]));
     }
 
     private static void ValidateAggregate(RainDbType columnType, AggregateKind kind)
@@ -202,26 +305,9 @@ public static class HashAggregateEngine
         Dictionary<GroupKey, AggregateAccumulator[]>[] partials,
         AggregateSpec[] specs)
     {
-        var aggCount = specs.Length;
         var global = new Dictionary<GroupKey, AggregateAccumulator[]>();
         for (var bi = 0; bi < partials.Length; bi++)
-        {
-            foreach (var kv in partials[bi])
-            {
-                if (!global.TryGetValue(kv.Key, out var merged))
-                {
-                    merged = new AggregateAccumulator[aggCount];
-                    for (var j = 0; j < aggCount; j++)
-                        merged[j] = kv.Value[j];
-                    global[new GroupKey(kv.Key.Parts.ToArray(), kv.Key.NullMask)] = merged;
-                }
-                else
-                {
-                    for (var j = 0; j < aggCount; j++)
-                        merged[j] = AggregateRowOps.Combine(merged[j], kv.Value[j], specs[j].Kind);
-                }
-            }
-        }
+            MergePartialIntoGlobal(global, partials[bi], specs);
 
         return global;
     }
@@ -432,6 +518,9 @@ public static class HashAggregateEngine
         return cols;
     }
 
+    internal static bool UsesCompositeGroupKeys(HashAggregatePhysicalPlan plan, TableSchema schema) =>
+        AnyUtf8GroupKey(plan, schema);
+
     private static bool AnyUtf8GroupKey(HashAggregatePhysicalPlan plan, TableSchema schema)
     {
         foreach (var ix in plan.GroupKeyColumnIndices)
@@ -565,26 +654,9 @@ public static class HashAggregateEngine
         Dictionary<CompositeJoinKey, AggregateAccumulator[]>[] partials,
         AggregateSpec[] specs)
     {
-        var aggCount = specs.Length;
         var global = new Dictionary<CompositeJoinKey, AggregateAccumulator[]>();
         for (var bi = 0; bi < partials.Length; bi++)
-        {
-            foreach (var kv in partials[bi])
-            {
-                if (!global.TryGetValue(kv.Key, out var merged))
-                {
-                    merged = new AggregateAccumulator[aggCount];
-                    for (var j = 0; j < aggCount; j++)
-                        merged[j] = kv.Value[j];
-                    global[kv.Key.DeepClone()] = merged;
-                }
-                else
-                {
-                    for (var j = 0; j < aggCount; j++)
-                        merged[j] = AggregateRowOps.Combine(merged[j], kv.Value[j], specs[j].Kind);
-                }
-            }
-        }
+            MergePartialIntoGlobalComposite(global, partials[bi], specs);
 
         return global;
     }

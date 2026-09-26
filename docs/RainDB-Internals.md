@@ -263,8 +263,8 @@ If `ISpillWriter.IsEnabled` and `SpillPartialEntryThreshold` exceeded, engine wr
 ### 8.2 Hash join
 
 1. **Build phase:** scan right (build) batches; insert `(GroupKey or CompositeJoinKey) → List<RowRef(batchIdx, rowIdx)>` skipping null keys.
-2. **Probe phase:** scan left batches; for each probe row, lookup key and emit `(probe, build)` pairs into `List<RowRefMatch>`.
-3. **Materialize** wide output batch (left columns then right, or explicit `JoinOutputColumnRef` order).
+2. **Probe phase:** scan left batches; for each probe row, lookup key and append `(probe, build)` pairs to a **chunk buffer** (`JoinMatchChunkEmitter`, default 8192 rows).
+3. **Materialize** each chunk into a wide `ColumnarBatch` (left columns then right, or explicit `JoinOutputColumnRef` order). `ExecuteAsync` collects chunks; `ExecuteStreaming` invokes a caller-supplied sink per chunk.
 
 ### 8.3 Sort-merge join
 
@@ -273,7 +273,7 @@ If `ISpillWriter.IsEnabled` and `SpillPartialEntryThreshold` exceeded, engine wr
 
 ### 8.4 Grouped join plan
 
-`GroupedJoinPhysicalPlan`: run join → wrap result in `EphemeralColumnarTableSource` → `HashAggregateEngine` on ephemeral table. Full join rowset is materialized in memory.
+`GroupedJoinPhysicalPlan`: **`GroupedJoinExecutionEngine`** runs **`JoinExecutionEngine.ExecuteStreaming`** and feeds each join output batch into incremental hash aggregation (`HashAggregateEngine.MergePartialIntoGlobal*`) without retaining the full join rowset in an ephemeral table.
 
 ---
 

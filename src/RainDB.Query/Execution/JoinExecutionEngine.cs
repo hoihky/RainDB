@@ -2,6 +2,7 @@ using RainDB.Catalog;
 using RainDB.Columnar;
 using RainDB.Core.Columnar;
 using RainDB.Execution;
+using RainDB.Query.Execution.Joining;
 using RainDB.Query.Plans;
 using RainDB.Query.Results;
 using RainDB.Query.Vectorized;
@@ -14,8 +15,6 @@ public static class JoinExecutionEngine
 {
     private readonly record struct RowRef(int BatchIdx, int RowIdx);
 
-    private readonly record struct RowRefMatch(int LeftBatchIdx, int LeftRow, int RightBatchIdx, int RightRow);
-
     private sealed class SortEntryFixed
     {
         public required GroupKey Key { get; init; }
@@ -25,16 +24,20 @@ public static class JoinExecutionEngine
         public int RowIdx { get; init; }
     }
 
-    public static ValueTask<IQueryResult> ExecuteAsync(
+    /// <summary>Probe-driven join: emits output in fixed-size chunks (no full <c>List&lt;match&gt;</c>).</summary>
+    internal static void ExecuteStreaming(
         JoinPhysicalPlan plan,
         IColumnarTableSource probeTable,
         IColumnarTableSource buildTable,
-        IExecutionContext context)
+        IExecutionContext context,
+        Action<ColumnarBatch> emitBatch,
+        int matchChunkRowCount = JoinMatchChunkEmitter.DefaultChunkRowCount)
     {
         ArgumentNullException.ThrowIfNull(plan);
         ArgumentNullException.ThrowIfNull(probeTable);
         ArgumentNullException.ThrowIfNull(buildTable);
         ArgumentNullException.ThrowIfNull(context);
+        ArgumentNullException.ThrowIfNull(emitBatch);
         Validate(plan, probeTable, buildTable);
 
         var probeSchema = probeTable.Schema;
@@ -43,20 +46,49 @@ public static class JoinExecutionEngine
         var buildBatches = buildTable.Batches;
         var ct = context.CancellationToken;
 
-        var utf8JoinKeys = JoinKeysIncludeUtf8(probeSchema, plan.ProbeKeyColumnIndices);
-        List<RowRefMatch> matches = plan.Algorithm switch
-        {
-            PhysicalJoinAlgorithm.Hash => utf8JoinKeys
-                ? ComputeHashMatchesUtf8(plan, probeBatches, buildBatches, probeSchema, buildSchema, ct)
-                : ComputeHashMatchesFixed(plan, probeBatches, buildBatches, ct),
-            PhysicalJoinAlgorithm.SortMerge => utf8JoinKeys
-                ? ComputeSortMergeMatchesUtf8(plan, probeBatches, buildBatches, probeSchema, buildSchema, ct)
-                : ComputeSortMergeMatchesFixed(plan, probeBatches, buildBatches, probeSchema, ct),
-            _ => throw new ArgumentOutOfRangeException(nameof(plan)),
-        };
+        var emitter = new JoinMatchChunkEmitter(
+            plan,
+            probeBatches,
+            buildBatches,
+            probeSchema,
+            buildSchema,
+            emitBatch,
+            matchChunkRowCount);
 
-        var batch = MaterializeMatches(plan, probeBatches, buildBatches, probeSchema, buildSchema, matches);
-        IQueryResult r = new ColumnarMaterializedQueryResult([batch]);
+        var utf8JoinKeys = JoinKeysIncludeUtf8(probeSchema, plan.ProbeKeyColumnIndices);
+        switch (plan.Algorithm)
+        {
+            case PhysicalJoinAlgorithm.Hash:
+                if (utf8JoinKeys)
+                    RunHashJoinUtf8(plan, probeBatches, buildBatches, probeSchema, buildSchema, ct, emitter);
+                else
+                    RunHashJoinFixed(plan, probeBatches, buildBatches, ct, emitter);
+                break;
+            case PhysicalJoinAlgorithm.SortMerge:
+                if (utf8JoinKeys)
+                    RunSortMergeJoinUtf8(plan, probeBatches, buildBatches, probeSchema, buildSchema, ct, emitter);
+                else
+                    RunSortMergeJoinFixed(plan, probeBatches, buildBatches, probeSchema, ct, emitter);
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(plan));
+        }
+
+        emitter.Flush();
+    }
+
+    public static ValueTask<IQueryResult> ExecuteAsync(
+        JoinPhysicalPlan plan,
+        IColumnarTableSource probeTable,
+        IColumnarTableSource buildTable,
+        IExecutionContext context)
+    {
+        var batches = new List<ColumnarBatch>();
+        ExecuteStreaming(plan, probeTable, buildTable, context, batches.Add);
+        if (batches.Count == 0)
+            batches.Add(JoinBatchMaterializer.EmptyBatch(plan));
+
+        IQueryResult r = new ColumnarMaterializedQueryResult(batches);
         return new ValueTask<IQueryResult>(r);
     }
 
@@ -136,9 +168,19 @@ public static class JoinExecutionEngine
         return true;
     }
 
-    private static List<RowRefMatch> ComputeHashMatchesFixed(
+    private static void RunHashJoinFixed(
         JoinPhysicalPlan plan,
         IReadOnlyList<IColumnarBatch> probeBatches,
+        IReadOnlyList<IColumnarBatch> buildBatches,
+        CancellationToken ct,
+        JoinMatchChunkEmitter emitter)
+    {
+        var dict = BuildHashIndexFixed(plan, buildBatches, ct);
+        ProbeHashJoinFixed(plan, probeBatches, dict, ct, emitter);
+    }
+
+    private static Dictionary<GroupKey, List<RowRef>> BuildHashIndexFixed(
+        JoinPhysicalPlan plan,
         IReadOnlyList<IColumnarBatch> buildBatches,
         CancellationToken ct)
     {
@@ -165,8 +207,17 @@ public static class JoinExecutionEngine
             }
         }
 
-        var matches = new List<RowRefMatch>();
-        scratch = new ulong[plan.ProbeKeyColumnIndices.Length];
+        return dict;
+    }
+
+    private static void ProbeHashJoinFixed(
+        JoinPhysicalPlan plan,
+        IReadOnlyList<IColumnarBatch> probeBatches,
+        Dictionary<GroupKey, List<RowRef>> dict,
+        CancellationToken ct,
+        JoinMatchChunkEmitter emitter)
+    {
+        var scratch = new ulong[plan.ProbeKeyColumnIndices.Length];
         for (var bi = 0; bi < probeBatches.Count; bi++)
         {
             ct.ThrowIfCancellationRequested();
@@ -181,18 +232,27 @@ public static class JoinExecutionEngine
                 if (!dict.TryGetValue(key, out var list))
                     continue;
                 foreach (var br in list)
-                    matches.Add(new RowRefMatch(bi, row, br.BatchIdx, br.RowIdx));
+                    emitter.Add(new JoinRowMatch(bi, row, br.BatchIdx, br.RowIdx));
             }
         }
-
-        return matches;
     }
 
-    private static List<RowRefMatch> ComputeHashMatchesUtf8(
+    private static void RunHashJoinUtf8(
         JoinPhysicalPlan plan,
         IReadOnlyList<IColumnarBatch> probeBatches,
         IReadOnlyList<IColumnarBatch> buildBatches,
         TableSchema probeSchema,
+        TableSchema buildSchema,
+        CancellationToken ct,
+        JoinMatchChunkEmitter emitter)
+    {
+        var dict = BuildHashIndexUtf8(plan, buildBatches, buildSchema, ct);
+        ProbeHashJoinUtf8(plan, probeBatches, probeSchema, dict, ct, emitter);
+    }
+
+    private static Dictionary<CompositeJoinKey, List<RowRef>> BuildHashIndexUtf8(
+        JoinPhysicalPlan plan,
+        IReadOnlyList<IColumnarBatch> buildBatches,
         TableSchema buildSchema,
         CancellationToken ct)
     {
@@ -218,7 +278,17 @@ public static class JoinExecutionEngine
             }
         }
 
-        var matches = new List<RowRefMatch>();
+        return dict;
+    }
+
+    private static void ProbeHashJoinUtf8(
+        JoinPhysicalPlan plan,
+        IReadOnlyList<IColumnarBatch> probeBatches,
+        TableSchema probeSchema,
+        Dictionary<CompositeJoinKey, List<RowRef>> dict,
+        CancellationToken ct,
+        JoinMatchChunkEmitter emitter)
+    {
         for (var bi = 0; bi < probeBatches.Count; bi++)
         {
             ct.ThrowIfCancellationRequested();
@@ -233,19 +303,18 @@ public static class JoinExecutionEngine
                 if (!dict.TryGetValue(key, out var list))
                     continue;
                 foreach (var br in list)
-                    matches.Add(new RowRefMatch(bi, row, br.BatchIdx, br.RowIdx));
+                    emitter.Add(new JoinRowMatch(bi, row, br.BatchIdx, br.RowIdx));
             }
         }
-
-        return matches;
     }
 
-    private static List<RowRefMatch> ComputeSortMergeMatchesFixed(
+    private static void RunSortMergeJoinFixed(
         JoinPhysicalPlan plan,
         IReadOnlyList<IColumnarBatch> probeBatches,
         IReadOnlyList<IColumnarBatch> buildBatches,
         TableSchema probeSchema,
-        CancellationToken ct)
+        CancellationToken ct,
+        JoinMatchChunkEmitter emitter)
     {
         var comparer = new GroupKeyComparer(probeSchema, plan.ProbeKeyColumnIndices);
         var left = FlattenNonNullFixedKeys(probeBatches, plan.ProbeKeyColumnIndices, plan.ProbeSideFilters, ct);
@@ -254,16 +323,17 @@ public static class JoinExecutionEngine
         left.Sort((a, b) => comparer.Compare(a.Key, b.Key));
         right.Sort((a, b) => comparer.Compare(a.Key, b.Key));
 
-        return MergeSortedKeyRuns(left, right, comparer, ct);
+        MergeSortedKeyRuns(left, right, comparer, ct, emitter);
     }
 
-    private static List<RowRefMatch> ComputeSortMergeMatchesUtf8(
+    private static void RunSortMergeJoinUtf8(
         JoinPhysicalPlan plan,
         IReadOnlyList<IColumnarBatch> probeBatches,
         IReadOnlyList<IColumnarBatch> buildBatches,
         TableSchema probeSchema,
         TableSchema buildSchema,
-        CancellationToken ct)
+        CancellationToken ct,
+        JoinMatchChunkEmitter emitter)
     {
         var comparer = new CompositeJoinKeyComparer(probeSchema, plan.ProbeKeyColumnIndices);
         var left = FlattenNonNullCompositeKeys(probeBatches, plan.ProbeKeyColumnIndices, plan.ProbeSideFilters, probeSchema, ct);
@@ -272,16 +342,16 @@ public static class JoinExecutionEngine
         left.Sort((a, b) => comparer.Compare(a.Key, b.Key));
         right.Sort((a, b) => comparer.Compare(a.Key, b.Key));
 
-        return MergeSortedCompositeRuns(left, right, comparer, ct);
+        MergeSortedCompositeRuns(left, right, comparer, ct, emitter);
     }
 
-    private static List<RowRefMatch> MergeSortedKeyRuns(
+    private static void MergeSortedKeyRuns(
         List<SortEntryFixed> left,
         List<SortEntryFixed> right,
         GroupKeyComparer comparer,
-        CancellationToken ct)
+        CancellationToken ct,
+        JoinMatchChunkEmitter emitter)
     {
-        var matches = new List<RowRefMatch>();
         var i = 0;
         var j = 0;
         while (i < left.Count && j < right.Count)
@@ -311,7 +381,7 @@ public static class JoinExecutionEngine
             {
                 for (var jj = jStart; jj < j; jj++)
                 {
-                    matches.Add(new RowRefMatch(
+                    emitter.Add(new JoinRowMatch(
                         left[ii].BatchIdx,
                         left[ii].RowIdx,
                         right[jj].BatchIdx,
@@ -319,17 +389,15 @@ public static class JoinExecutionEngine
                 }
             }
         }
-
-        return matches;
     }
 
-    private static List<RowRefMatch> MergeSortedCompositeRuns(
+    private static void MergeSortedCompositeRuns(
         List<SortEntryUtf8> left,
         List<SortEntryUtf8> right,
         CompositeJoinKeyComparer comparer,
-        CancellationToken ct)
+        CancellationToken ct,
+        JoinMatchChunkEmitter emitter)
     {
-        var matches = new List<RowRefMatch>();
         var i = 0;
         var j = 0;
         while (i < left.Count && j < right.Count)
@@ -359,7 +427,7 @@ public static class JoinExecutionEngine
             {
                 for (var jj = jStart; jj < j; jj++)
                 {
-                    matches.Add(new RowRefMatch(
+                    emitter.Add(new JoinRowMatch(
                         left[ii].BatchIdx,
                         left[ii].RowIdx,
                         right[jj].BatchIdx,
@@ -367,8 +435,6 @@ public static class JoinExecutionEngine
                 }
             }
         }
-
-        return matches;
     }
 
     private sealed class SortEntryUtf8
@@ -431,186 +497,4 @@ public static class JoinExecutionEngine
 
         return list;
     }
-
-    private static ColumnarBatch MaterializeMatches(
-        JoinPhysicalPlan plan,
-        IReadOnlyList<IColumnarBatch> probeBatches,
-        IReadOnlyList<IColumnarBatch> buildBatches,
-        TableSchema probeSchema,
-        TableSchema buildSchema,
-        List<RowRefMatch> matches)
-    {
-        var n = matches.Count;
-        var outSchema = plan.OutputSchema;
-        var totalCols = outSchema.Columns.Count;
-        if (n == 0)
-        {
-            var empty = new IColumnChunk[totalCols];
-            for (var c = 0; c < totalCols; c++)
-                empty[c] = EmptyColumnChunk(outSchema.Columns[c].Type);
-            return new ColumnarBatch(0, empty);
-        }
-
-        var cols = new IColumnChunk[totalCols];
-        var order = plan.OutputColumnOrder;
-        var leftColCount = probeSchema.Columns.Count;
-        if (order is null)
-        {
-            for (var c = 0; c < leftColCount; c++)
-                cols[c] = MaterializeOneColumn(probeBatches, probeSchema.Columns[c].Type, c, matches, useProbeSide: true);
-
-            for (var c = 0; c < buildSchema.Columns.Count; c++)
-                cols[leftColCount + c] = MaterializeOneColumn(
-                    buildBatches,
-                    buildSchema.Columns[c].Type,
-                    c,
-                    matches,
-                    useProbeSide: false);
-        }
-        else
-        {
-            for (var ocol = 0; ocol < order.Length; ocol++)
-            {
-                var r = order[ocol];
-                var typ = outSchema.Columns[ocol].Type;
-                cols[ocol] = r.IsProbe
-                    ? MaterializeOneColumn(probeBatches, typ, r.ColumnIndex, matches, useProbeSide: true)
-                    : MaterializeOneColumn(buildBatches, typ, r.ColumnIndex, matches, useProbeSide: false);
-            }
-        }
-
-        return new ColumnarBatch(n, cols);
-    }
-
-    private static IColumnChunk EmptyColumnChunk(RainDbType type)
-    {
-        if (type == RainDbType.Utf8)
-            return new Utf8ColumnChunk(0, new[] { 0 }, Array.Empty<byte>(), ReadOnlyMemory<byte>.Empty, false);
-
-        var w = ColumnTypeSizes.FixedWidthBytes(type);
-        return new FixedWidthColumnChunk(type, 0, Array.Empty<byte>(), ReadOnlyMemory<byte>.Empty, false);
-    }
-
-    private static IColumnChunk MaterializeOneColumn(
-        IReadOnlyList<IColumnarBatch> batches,
-        RainDbType type,
-        int colIndex,
-        List<RowRefMatch> matches,
-        bool useProbeSide)
-    {
-        if (type == RainDbType.Utf8)
-            return MaterializeUtf8Column(batches, colIndex, matches, useProbeSide);
-
-        var w = ColumnTypeSizes.FixedWidthBytes(type);
-        var n = matches.Count;
-        var outVals = new byte[checked(n * w)];
-        var nbBytes = ColumnTypeSizes.NullBitmapBytes(n);
-        var outNb = new byte[nbBytes];
-        var anyNull = false;
-
-        for (var o = 0; o < n; o++)
-        {
-            var m = matches[o];
-            var bi = useProbeSide ? m.LeftBatchIdx : m.RightBatchIdx;
-            var ri = useProbeSide ? m.LeftRow : m.RightRow;
-            var batch = batches[bi];
-            var col = batch.Columns[colIndex];
-            var srcNb = col.HasNulls ? col.NullBitmap.Span : ReadOnlySpan<byte>.Empty;
-            if (SelectionEvaluator.IsNull(srcNb, ri, col.HasNulls))
-            {
-                anyNull = true;
-                SetNullBit(outNb.AsSpan(), o);
-                continue;
-            }
-
-            var srcVals = col.Values.Span;
-            srcVals.Slice(ri * w, w).CopyTo(outVals.AsSpan(o * w, w));
-        }
-
-        return new FixedWidthColumnChunk(
-            type,
-            n,
-            outVals,
-            anyNull ? outNb : ReadOnlyMemory<byte>.Empty,
-            anyNull);
-    }
-
-    private static IColumnChunk MaterializeUtf8Column(
-        IReadOnlyList<IColumnarBatch> batches,
-        int colIndex,
-        List<RowRefMatch> matches,
-        bool useProbeSide)
-    {
-        var n = matches.Count;
-        if (n == 0)
-            return new Utf8ColumnChunk(0, new[] { 0 }, Array.Empty<byte>(), ReadOnlyMemory<byte>.Empty, hasNulls: false);
-
-        var offsetsMem = new int[n + 1];
-        var offsets = offsetsMem.AsSpan();
-        var blob = new List<byte>(Math.Max(0, n * 4));
-        var anyNull = false;
-        byte[]? nbBuf = null;
-        if (Utf8ColumnMayHaveNulls(batches, colIndex, matches, useProbeSide))
-            nbBuf = new byte[ColumnTypeSizes.NullBitmapBytes(n)];
-
-        for (var o = 0; o < n; o++)
-        {
-            offsets[o] = blob.Count;
-            var m = matches[o];
-            var bi = useProbeSide ? m.LeftBatchIdx : m.RightBatchIdx;
-            var ri = useProbeSide ? m.LeftRow : m.RightRow;
-            var col = batches[bi].Columns[colIndex];
-            var srcNb = col.HasNulls ? col.NullBitmap.Span : ReadOnlySpan<byte>.Empty;
-            if (SelectionEvaluator.IsNull(srcNb, ri, col.HasNulls))
-            {
-                anyNull = true;
-                if (nbBuf != null)
-                    SetNullBit(nbBuf.AsSpan(), o);
-                continue;
-            }
-
-            foreach (var b in ReadUtf8Payload(col, ri))
-                blob.Add(b);
-        }
-
-        offsets[n] = blob.Count;
-        ReadOnlyMemory<byte> nbOut = nbBuf != null ? nbBuf : ReadOnlyMemory<byte>.Empty;
-        return new Utf8ColumnChunk(n, offsetsMem, blob.ToArray(), nbOut, anyNull);
-    }
-
-    private static bool Utf8ColumnMayHaveNulls(
-        IReadOnlyList<IColumnarBatch> batches,
-        int colIndex,
-        List<RowRefMatch> matches,
-        bool useProbeSide)
-    {
-        foreach (var m in matches)
-        {
-            var bi = useProbeSide ? m.LeftBatchIdx : m.RightBatchIdx;
-            if (batches[bi].Columns[colIndex].HasNulls)
-                return true;
-        }
-
-        return false;
-    }
-
-    private static ReadOnlySpan<byte> ReadUtf8Payload(IColumnChunk col, int row)
-    {
-        return col switch
-        {
-            Utf8ColumnChunk utf8 => ReadUtf8ArrowPayload(utf8, row),
-            Utf8LengthPrefixedColumnChunk lp => lp.GetPayloadSpan(row),
-            _ => throw new NotSupportedException($"Unexpected UTF-8 chunk type {col.GetType().Name}."),
-        };
-    }
-
-    private static ReadOnlySpan<byte> ReadUtf8ArrowPayload(Utf8ColumnChunk src, int row)
-    {
-        var off = src.Offsets.Span;
-        var start = off[row];
-        var end = off[row + 1];
-        return src.Values.Span.Slice(start, end - start);
-    }
-
-    private static void SetNullBit(Span<byte> nb, int row) => nb[row >> 3] |= (byte)(1 << (row & 7));
 }

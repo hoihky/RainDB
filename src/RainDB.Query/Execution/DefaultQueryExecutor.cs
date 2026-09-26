@@ -51,22 +51,7 @@ public sealed class DefaultQueryExecutor : IQueryExecutor
         {
             var probeCols = RequireColumnarTable(context, grouped.Join.ProbeTableId);
             var buildCols = RequireColumnarTable(context, grouped.Join.BuildTableId);
-            var joinResult = await JoinExecutionEngine.ExecuteAsync(grouped.Join, probeCols, buildCols, context).ConfigureAwait(false);
-            try
-            {
-                if (joinResult is not IColumnarQueryResult colResult)
-                    throw new InvalidOperationException("Join execution must return a columnar result for grouped join.");
-                var ephemeral = new EphemeralColumnarTableSource(
-                    grouped.Aggregate.TableId,
-                    "_grouped_join_",
-                    grouped.Join.OutputSchema,
-                    colResult.Batches);
-                return await HashAggregateEngine.ExecuteAsync(grouped.Aggregate, ephemeral, context).ConfigureAwait(false);
-            }
-            finally
-            {
-                await joinResult.DisposeAsync().ConfigureAwait(false);
-            }
+            return await GroupedJoinExecutionEngine.ExecuteAsync(grouped, probeCols, buildCols, context).ConfigureAwait(false);
         }
 
         if (plan is ExplainOnlyPhysicalPlan explain)

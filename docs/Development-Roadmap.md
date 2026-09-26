@@ -37,11 +37,11 @@ This roadmap turns the DuckDB-class gap analysis into a sequenced plan for RainD
 
 **Exit criteria:** `ORDER BY … LIMIT k` on large tables stays bounded by k and key width, not full row count.
 
-### A3. Join and grouped-join memory model
+### A3. Join and grouped-join memory model — **implemented**
 
-- Stream join output where possible (probe-driven batches) instead of materializing `List<RowRefMatch>` for all matches up front.
-- For `GroupedJoinPhysicalPlan`, prefer **pipeline or single-pass** strategies (join batches fed into hash agg) before falling back to full ephemeral tables.
-- Preserve correct inner-join NULL-key behavior.
+- **`JoinExecutionEngine.ExecuteStreaming`**: probe-driven hash/sort-merge join emits fixed-size output batches via **`JoinMatchChunkEmitter`** (default 8192 rows) instead of a full `List<match>` plus one giant batch.
+- **`GroupedJoinExecutionEngine`**: pipelines join chunks directly into hash aggregation (`MergePartialIntoGlobal*`) without **`EphemeralColumnarTableSource`** holding the full join rowset.
+- Preserve correct inner-join NULL-key behavior (unchanged key-null skip rules).
 
 **Exit criteria:** Join + `GROUP BY` workloads on medium cardinality complete without proportional spike in peak RSS vs output size.
 
