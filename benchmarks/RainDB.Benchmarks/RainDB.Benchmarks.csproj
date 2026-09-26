@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>RainDB.Benchmarks</RootNamespace>
+    <AssemblyName>RainDB.Benchmarks</AssemblyName>
+    <Description>BenchmarkDotNet workloads for RainDB OLAP operators (manual baselines).</Description>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="BenchmarkDotNet" Version="0.14.0" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\RainDB.Driver\RainDB.Driver.csproj" />
+    <ProjectReference Include="..\..\src\RainDB.Query\RainDB.Query.csproj" />
+  </ItemGroup>
+</Project>

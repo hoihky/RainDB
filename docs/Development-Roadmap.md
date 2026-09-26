@@ -52,10 +52,11 @@ This roadmap turns the DuckDB-class gap analysis into a sequenced plan for RainD
 
 **Exit criteria:** AVX2 paths are opt-in and tested; scalar fallbacks always available.
 
-### A5. Micro-benchmarks
+### A5. Micro-benchmarks — **implemented (manual)**
 
-- Add **BenchmarkDotNet** projects for scan, filter+project, hash agg, hash join, sort/top-N.
-- Record baseline numbers in CI or a documented manual run (no need for perf gates in CI initially).
+- **`benchmarks/RainDB.Benchmarks`**: BenchmarkDotNet exe for scan, filter+project, hash agg, hash join, sort/top-N (`BenchmarkPhysicalPlans` + `SyntheticColumnarDataFactory`).
+- **`BenchmarkWorkloadRunner`**: same workloads without BDN (smoke-tested from `RainDB.Tests`).
+- Record baselines manually in [BENCHMARK-BASELINES.md](BENCHMARK-BASELINES.md); no CI perf gates yet.
 
 **Exit criteria:** Repeatable benchmarks exist; at least one “before/after” comparison per A1–A3 change.
 

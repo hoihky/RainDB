@@ -18,5 +18,9 @@
     <ProjectReference Include="..\..\src\RainDB.Query\RainDB.Query.csproj" />
     <ProjectReference Include="..\..\src\RainDB.Driver\RainDB.Driver.csproj" />
     <ProjectReference Include="..\..\src\RainDB.Sql\RainDB.Sql.csproj" />
+    <ProjectReference Include="..\..\benchmarks\RainDB.Benchmarks\RainDB.Benchmarks.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="BenchmarkDotNet" Version="0.14.0" />
   </ItemGroup>
 </Project>

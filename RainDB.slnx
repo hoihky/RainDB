@@ -13,4 +13,7 @@
   <Folder Name="/samples/">
     <Project Path="samples/RainDB.AnalyticsDemo/RainDB.AnalyticsDemo.csproj" />
   </Folder>
+  <Folder Name="/benchmarks/">
+    <Project Path="benchmarks/RainDB.Benchmarks/RainDB.Benchmarks.csproj" />
+  </Folder>
 </Solution>

@@ -122,6 +122,7 @@ Architecture and algorithms are documented in **[RainDB Internals](docs/RainDB-I
 | [RainDB Internals](docs/RainDB-Internals.md) | Architecture, algorithms, and data structures |
 | [Implementation Status](docs/Implementation-Status.md) | What is implemented and the phased delivery plan |
 | [Development Roadmap](docs/Development-Roadmap.md) | Forward-looking sequencing toward production |
+| [Benchmark baselines](docs/BENCHMARK-BASELINES.md) | Manual BenchmarkDotNet numbers (`benchmarks/RainDB.Benchmarks`) |
 
 ---
 
