@@ -76,7 +76,7 @@ public class RainDbPersistenceTests
         }
         finally
         {
-            TryDeleteDir(root);
+            TestDataBuilders.TryDeleteDir(root);
         }
     }
 
@@ -102,20 +102,8 @@ public class RainDbPersistenceTests
         }
         finally
         {
-            TryDeleteDir(root);
+            TestDataBuilders.TryDeleteDir(root);
         }
     }
 
-    private static void TryDeleteDir(string path)
-    {
-        try
-        {
-            if (Directory.Exists(path))
-                Directory.Delete(path, recursive: true);
-        }
-        catch
-        {
-            // temp cleanup best-effort
-        }
-    }
 }

@@ -14,58 +14,44 @@ public sealed class DefaultQueryExecutor : IQueryExecutor
         ArgumentNullException.ThrowIfNull(context);
         ArgumentNullException.ThrowIfNull(context.AlignedBufferPool);
         _ = plan.Explain();
+
         if (plan is VectorizedScanPhysicalPlan vs)
         {
-            if (!context.Catalog.TryGetTable(vs.TableId, out var ts) || ts is not IColumnarTableSource cols)
-                throw new InvalidOperationException($"Columnar table {vs.TableId} was not found in the catalog.");
+            var cols = RequireColumnarTable(context, vs.TableId);
             return await VectorizedScanEngine.ExecuteAsync(vs, cols, context).ConfigureAwait(false);
         }
 
         if (plan is HashAggregatePhysicalPlan ha)
         {
-            if (!context.Catalog.TryGetTable(ha.TableId, out var ts2) || ts2 is not IColumnarTableSource cols2)
-                throw new InvalidOperationException($"Columnar table {ha.TableId} was not found in the catalog.");
-            return await HashAggregateEngine.ExecuteAsync(ha, cols2, context).ConfigureAwait(false);
+            var cols = RequireColumnarTable(context, ha.TableId);
+            return await HashAggregateEngine.ExecuteAsync(ha, cols, context).ConfigureAwait(false);
         }
 
         if (plan is JoinPhysicalPlan join)
         {
-            if (!context.Catalog.TryGetTable(join.ProbeTableId, out var probeTs)
-                || probeTs is not IColumnarTableSource probeCols)
-                throw new InvalidOperationException($"Columnar probe table {join.ProbeTableId} was not found in the catalog.");
-            if (!context.Catalog.TryGetTable(join.BuildTableId, out var buildTs)
-                || buildTs is not IColumnarTableSource buildCols)
-                throw new InvalidOperationException($"Columnar build table {join.BuildTableId} was not found in the catalog.");
+            var probeCols = RequireColumnarTable(context, join.ProbeTableId);
+            var buildCols = RequireColumnarTable(context, join.BuildTableId);
             return await JoinExecutionEngine.ExecuteAsync(join, probeCols, buildCols, context).ConfigureAwait(false);
         }
 
         if (plan is SortTopNPhysicalPlan st)
         {
-            if (!context.Catalog.TryGetTable(st.TableId, out var ts) || ts is not IColumnarTableSource cols)
-                throw new InvalidOperationException($"Columnar table {st.TableId} was not found in the catalog.");
+            var cols = RequireColumnarTable(context, st.TableId);
             return await SortTopNEngine.ExecuteTableAsync(st, cols, context).ConfigureAwait(false);
         }
 
         if (plan is JoinSortTopNPhysicalPlan jst)
         {
-            if (!context.Catalog.TryGetTable(jst.Join.ProbeTableId, out var probeTs3)
-                || probeTs3 is not IColumnarTableSource probeCols3)
-                throw new InvalidOperationException($"Columnar probe table {jst.Join.ProbeTableId} was not found in the catalog.");
-            if (!context.Catalog.TryGetTable(jst.Join.BuildTableId, out var buildTs3)
-                || buildTs3 is not IColumnarTableSource buildCols3)
-                throw new InvalidOperationException($"Columnar build table {jst.Join.BuildTableId} was not found in the catalog.");
-            return await SortTopNEngine.ExecuteJoinAsync(jst, probeCols3, buildCols3, context).ConfigureAwait(false);
+            var probeCols = RequireColumnarTable(context, jst.Join.ProbeTableId);
+            var buildCols = RequireColumnarTable(context, jst.Join.BuildTableId);
+            return await SortTopNEngine.ExecuteJoinAsync(jst, probeCols, buildCols, context).ConfigureAwait(false);
         }
 
         if (plan is GroupedJoinPhysicalPlan grouped)
         {
-            if (!context.Catalog.TryGetTable(grouped.Join.ProbeTableId, out var probeTs2)
-                || probeTs2 is not IColumnarTableSource probeCols2)
-                throw new InvalidOperationException($"Columnar probe table {grouped.Join.ProbeTableId} was not found in the catalog.");
-            if (!context.Catalog.TryGetTable(grouped.Join.BuildTableId, out var buildTs2)
-                || buildTs2 is not IColumnarTableSource buildCols2)
-                throw new InvalidOperationException($"Columnar build table {grouped.Join.BuildTableId} was not found in the catalog.");
-            var joinResult = await JoinExecutionEngine.ExecuteAsync(grouped.Join, probeCols2, buildCols2, context).ConfigureAwait(false);
+            var probeCols = RequireColumnarTable(context, grouped.Join.ProbeTableId);
+            var buildCols = RequireColumnarTable(context, grouped.Join.BuildTableId);
+            var joinResult = await JoinExecutionEngine.ExecuteAsync(grouped.Join, probeCols, buildCols, context).ConfigureAwait(false);
             try
             {
                 if (joinResult is not IColumnarQueryResult colResult)
@@ -83,7 +69,16 @@ public sealed class DefaultQueryExecutor : IQueryExecutor
             }
         }
 
-        IQueryResult r = new EmptyQueryResult(0);
-        return r;
+        if (plan is ExplainOnlyPhysicalPlan explain)
+            throw new NotSupportedException($"Physical plan '{explain.Label}' cannot be executed. Use EXPLAIN-style APIs or implement the operator.");
+
+        throw new NotSupportedException($"Unsupported physical plan type: {plan.GetType().Name}.");
+    }
+
+    private static IColumnarTableSource RequireColumnarTable(IExecutionContext context, TableId tableId)
+    {
+        if (!context.Catalog.TryGetTable(tableId, out var ts) || ts is not IColumnarTableSource cols)
+            throw new InvalidOperationException($"Columnar table {tableId} was not found in the catalog.");
+        return cols;
     }
 }

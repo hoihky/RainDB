@@ -17,20 +17,20 @@ public class SqlFeatureCorrectnessTests
     public async Task Where_null_cell_never_matches_equality_predicate()
     {
         var engine = RainDbEngine.CreateDefault();
-        var t = TableWithInt32Column("t", "x", [(1, false), (2, true)]);
+        var t = TestDataBuilders.TableWithInt32Column("t", "x", [(1, false), (2, true)]);
         engine.Catalog.Register(t);
 
         await using var r = await engine.ExecuteSqlAsync("SELECT x FROM t WHERE x = 1");
         var col = Assert.IsAssignableFrom<IColumnarQueryResult>(r);
         Assert.Equal(1, col.RowCount);
-        Assert.Equal(1, ReadInt32(col.Batches[0].Columns[0], 0));
+        Assert.Equal(1, TestDataBuilders.ReadInt32(col.Batches[0].Columns[0], 0));
     }
 
     [Fact]
     public async Task Global_sum_empty_table_is_sql_null()
     {
         var engine = RainDbEngine.CreateDefault();
-        engine.Catalog.Register(EmptyTable("t", RainDbType.Float64, "amt"));
+        engine.Catalog.Register(TestDataBuilders.EmptyTable("t", RainDbType.Float64, "amt"));
 
         await using var r = await engine.ExecuteSqlAsync("SELECT SUM(amt) FROM t");
         var agg = Assert.IsAssignableFrom<IAggregateQueryResult>(r);
@@ -41,7 +41,7 @@ public class SqlFeatureCorrectnessTests
     public async Task Global_count_star_empty_table_is_zero_not_null()
     {
         var engine = RainDbEngine.CreateDefault();
-        engine.Catalog.Register(EmptyTable("t", RainDbType.Int32, "x"));
+        engine.Catalog.Register(TestDataBuilders.EmptyTable("t", RainDbType.Int32, "x"));
 
         await using var r = await engine.ExecuteSqlAsync("SELECT COUNT(*) FROM t");
         var agg = Assert.IsAssignableFrom<IAggregateQueryResult>(r);
@@ -53,7 +53,7 @@ public class SqlFeatureCorrectnessTests
     public async Task Count_column_skips_null_rows()
     {
         var engine = RainDbEngine.CreateDefault();
-        var t = TableWithInt32Column("t", "x", [(1, false), (2, true), (3, false)]);
+        var t = TestDataBuilders.TableWithInt32Column("t", "x", [(1, false), (2, true), (3, false)]);
         engine.Catalog.Register(t);
 
         await using var r = await engine.ExecuteSqlAsync("SELECT COUNT(x) FROM t");
@@ -114,9 +114,9 @@ public class SqlFeatureCorrectnessTests
     {
         var engine = RainDbEngine.CreateDefault();
         var left = new MemoryTable("L", new TableSchema([new ColumnDef("id", RainDbType.Int32)]));
-        left.AppendBatch(SingleInt32Batch(1));
+        left.AppendBatch(TestDataBuilders.SingleInt32Batch(1));
         var right = new MemoryTable("R", new TableSchema([new ColumnDef("id", RainDbType.Int32)]));
-        right.AppendBatch(SingleInt32Batch(99));
+        right.AppendBatch(TestDataBuilders.SingleInt32Batch(99));
         engine.Catalog.Register(left);
         engine.Catalog.Register(right);
 
@@ -142,8 +142,8 @@ public class SqlFeatureCorrectnessTests
         await using var r = await engine.ExecuteSqlAsync("SELECT x FROM t ORDER BY x DESC LIMIT 2");
         var col = Assert.IsAssignableFrom<IColumnarQueryResult>(r);
         Assert.Equal(2, col.RowCount);
-        Assert.Equal(3, ReadInt32(col.Batches[0].Columns[0], 0));
-        Assert.Equal(2, ReadInt32(col.Batches[0].Columns[0], 1));
+        Assert.Equal(3, TestDataBuilders.ReadInt32(col.Batches[0].Columns[0], 0));
+        Assert.Equal(2, TestDataBuilders.ReadInt32(col.Batches[0].Columns[0], 1));
     }
 
     [Fact]
@@ -151,15 +151,15 @@ public class SqlFeatureCorrectnessTests
     {
         var engine = RainDbEngine.CreateDefault();
         var t = new MemoryTable("t", new TableSchema([new ColumnDef("x", RainDbType.Int32)]));
-        t.AppendBatch(SingleInt32Batch(10));
-        t.AppendBatch(SingleInt32Batch(20));
+        t.AppendBatch(TestDataBuilders.SingleInt32Batch(10));
+        t.AppendBatch(TestDataBuilders.SingleInt32Batch(20));
         engine.Catalog.Register(t);
 
         await using var r = await engine.ExecuteSqlAsync("SELECT x FROM t");
         var col = Assert.IsAssignableFrom<IColumnarQueryResult>(r);
         Assert.Equal(2, col.Batches.Count);
-        Assert.Equal(10, ReadInt32(col.Batches[0].Columns[0], 0));
-        Assert.Equal(20, ReadInt32(col.Batches[1].Columns[0], 0));
+        Assert.Equal(10, TestDataBuilders.ReadInt32(col.Batches[0].Columns[0], 0));
+        Assert.Equal(20, TestDataBuilders.ReadInt32(col.Batches[1].Columns[0], 0));
     }
 
     [Fact]
@@ -236,7 +236,7 @@ public class SqlFeatureCorrectnessTests
     {
         var engine = RainDbEngine.CreateDefault();
         var t = new MemoryTable("t", new TableSchema([new ColumnDef("x", RainDbType.Int32)]));
-        t.AppendBatch(SingleInt32Batch(1));
+        t.AppendBatch(TestDataBuilders.SingleInt32Batch(1));
         engine.Catalog.Register(t);
 
         var r = await engine.ExecuteSqlAsync("SELECT x FROM t");
@@ -246,38 +246,4 @@ public class SqlFeatureCorrectnessTests
         await r.DisposeAsync();
     }
 
-    private static MemoryTable EmptyTable(string name, RainDbType type, string colName)
-    {
-        var t = new MemoryTable(name, new TableSchema([new ColumnDef(colName, type)]));
-        return t;
-    }
-
-    private static MemoryTable TableWithInt32Column(string name, string colName, (int value, bool isNull)[] rows)
-    {
-        var t = new MemoryTable(name, new TableSchema([new ColumnDef(colName, RainDbType.Int32)]));
-        var vals = new byte[rows.Length * 4];
-        var anyNull = rows.Any(r => r.isNull);
-        byte[]? nb = anyNull ? new byte[(rows.Length + 7) >> 3] : null;
-        for (var i = 0; i < rows.Length; i++)
-        {
-            BinaryPrimitives.WriteInt32LittleEndian(vals.AsSpan(i * 4, 4), rows[i].value);
-            if (rows[i].isNull && nb is not null)
-                nb[i >> 3] |= (byte)(1 << (i & 7));
-        }
-
-        t.AppendBatch(new ColumnarBatch(rows.Length, [
-            new FixedWidthColumnChunk(RainDbType.Int32, rows.Length, vals, nb ?? ReadOnlyMemory<byte>.Empty, anyNull),
-        ]));
-        return t;
-    }
-
-    private static ColumnarBatch SingleInt32Batch(int value)
-    {
-        var b = new byte[4];
-        BinaryPrimitives.WriteInt32LittleEndian(b, value);
-        return new ColumnarBatch(1, [new FixedWidthColumnChunk(RainDbType.Int32, 1, b, ReadOnlyMemory<byte>.Empty, false)]);
-    }
-
-    private static int ReadInt32(IColumnChunk col, int row) =>
-        BinaryPrimitives.ReadInt32LittleEndian(col.Values.Span.Slice(row * 4, 4));
 }

@@ -42,9 +42,9 @@ public class RobustnessAndEdgeCaseTests
         var col = Assert.IsAssignableFrom<IColumnarQueryResult>(r);
         Assert.Equal(3, col.Batches[0].RowCount);
         var outKeys = col.Batches[0].Columns[0];
-        Assert.Equal(-2.0, ReadF64(outKeys, 0));
-        Assert.Equal(-1.0, ReadF64(outKeys, 1));
-        Assert.Equal(0.0, ReadF64(outKeys, 2));
+        Assert.Equal(-2.0, TestDataBuilders.ReadF64(outKeys, 0));
+        Assert.Equal(-1.0, TestDataBuilders.ReadF64(outKeys, 1));
+        Assert.Equal(0.0, TestDataBuilders.ReadF64(outKeys, 2));
     }
 
     [Fact]
@@ -89,7 +89,7 @@ public class RobustnessAndEdgeCaseTests
             new FixedWidthColumnChunk(RainDbType.Int32, 1, k, new byte[] { 0b0000_0001 }, hasNulls: true),
         ]));
         var right = new MemoryTable("R", new TableSchema([new ColumnDef("id", RainDbType.Int32)]));
-        right.AppendBatch(SingleInt32Batch(1));
+        right.AppendBatch(TestDataBuilders.SingleInt32Batch(1));
         engine.Catalog.Register(left);
         engine.Catalog.Register(right);
 
@@ -186,7 +186,7 @@ public class RobustnessAndEdgeCaseTests
         t.AppendBatch(new ColumnarBatch(0, [
             new FixedWidthColumnChunk(RainDbType.Int32, 0, Array.Empty<byte>(), ReadOnlyMemory<byte>.Empty, false),
         ]));
-        t.AppendBatch(SingleInt32Batch(42));
+        t.AppendBatch(TestDataBuilders.SingleInt32Batch(42));
         engine.Catalog.Register(t);
 
         await using var r = await engine.ExecuteSqlAsync("SELECT SUM(x) FROM t");
@@ -199,7 +199,7 @@ public class RobustnessAndEdgeCaseTests
     {
         var schema = new TableSchema([new ColumnDef("x", RainDbType.Int32)]);
         var table = new MemoryTable("t", schema, options: new MemoryTableOptions(BatchPersistence: new ThrowingPersistence()));
-        var batch = SingleInt32Batch(1);
+        var batch = TestDataBuilders.SingleInt32Batch(1);
         Assert.Throws<IOException>(() => table.AppendBatch(batch));
         Assert.Equal(0, table.RowCount);
         Assert.Empty(table.Batches);
@@ -210,7 +210,7 @@ public class RobustnessAndEdgeCaseTests
     {
         var engine = RainDbEngine.CreateDefault();
         var t = new MemoryTable("t", new TableSchema([new ColumnDef("x", RainDbType.Int32)]));
-        t.AppendBatch(SingleInt32Batch(1));
+        t.AppendBatch(TestDataBuilders.SingleInt32Batch(1));
         engine.Catalog.Register(t);
 
         var plan = new VectorizedScanPhysicalPlan(
@@ -234,15 +234,5 @@ public class RobustnessAndEdgeCaseTests
     }
 
     private static void WriteF64(byte[] buf, int offset, double v) =>
-        BinaryPrimitives.WriteInt64LittleEndian(buf.AsSpan(offset, 8), BitConverter.DoubleToInt64Bits(v));
-
-    private static double ReadF64(IColumnChunk col, int row) =>
-        BitConverter.Int64BitsToDouble(BinaryPrimitives.ReadInt64LittleEndian(col.Values.Span.Slice(row * 8, 8)));
-
-    private static ColumnarBatch SingleInt32Batch(int value)
-    {
-        var b = new byte[4];
-        BinaryPrimitives.WriteInt32LittleEndian(b, value);
-        return new ColumnarBatch(1, [new FixedWidthColumnChunk(RainDbType.Int32, 1, b, ReadOnlyMemory<byte>.Empty, false)]);
-    }
+        TestDataBuilders.WriteF64(buf, offset, v);
 }
