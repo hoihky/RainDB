@@ -1,4 +1,5 @@
 using RainDB.Catalog;
+using RainDB.Columnar;
 using RainDB.Execution;
 using RainDB.Query.Execution.Operators;
 using RainDB.Query.Plans;
@@ -60,6 +61,24 @@ public sealed class DefaultQueryExecutor : IQueryExecutor
             var probeCols = RequireColumnarTable(context, grouped.Join.ProbeTableId);
             var buildCols = RequireColumnarTable(context, grouped.Join.BuildTableId);
             return await _operators.GroupedJoin.ExecuteAsync(grouped, probeCols, buildCols, context).ConfigureAwait(false);
+        }
+
+        if (plan is UnionAllPhysicalPlan union)
+        {
+            var batches = new List<IColumnarBatch>();
+            foreach (var input in union.Inputs)
+            {
+                var child = await ExecuteAsync(input, context).ConfigureAwait(false);
+                if (child is IColumnarQueryResult col)
+                {
+                    foreach (var b in col.Batches)
+                        batches.Add(b);
+                }
+                else
+                    throw new NotSupportedException("UNION ALL branches must return columnar row sets.");
+            }
+
+            return new ColumnarMaterializedQueryResult(batches);
         }
 
         if (plan is ExplainOnlyPhysicalPlan explain)

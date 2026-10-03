@@ -101,6 +101,13 @@ internal sealed class JoinBatchMaterializer
         for (var o = 0; o < n; o++)
         {
             var m = matches[o];
+            if (!useProbeSide && !m.HasRight)
+            {
+                anyNull = true;
+                SetNullBit(outNb.AsSpan(), o);
+                continue;
+            }
+
             var bi = useProbeSide ? m.LeftBatchIdx : m.RightBatchIdx;
             var ri = useProbeSide ? m.LeftRow : m.RightRow;
             var batch = batches[bi];
@@ -140,13 +147,22 @@ internal sealed class JoinBatchMaterializer
         var blob = new List<byte>(Math.Max(0, n * 4));
         var anyNull = false;
         byte[]? nbBuf = null;
-        if (Utf8ColumnMayHaveNulls(batches, colIndex, matches, useProbeSide))
+        var outerBuildNulls = !useProbeSide && OuterBuildNullPresent(matches);
+        if (Utf8ColumnMayHaveNulls(batches, colIndex, matches, useProbeSide) || outerBuildNulls)
             nbBuf = new byte[ColumnTypeSizes.NullBitmapBytes(n)];
 
         for (var o = 0; o < n; o++)
         {
             offsets[o] = blob.Count;
             var m = matches[o];
+            if (!useProbeSide && !m.HasRight)
+            {
+                anyNull = true;
+                if (nbBuf != null)
+                    SetNullBit(nbBuf.AsSpan(), o);
+                continue;
+            }
+
             var bi = useProbeSide ? m.LeftBatchIdx : m.RightBatchIdx;
             var ri = useProbeSide ? m.LeftRow : m.RightRow;
             var col = batches[bi].Columns[colIndex];
@@ -168,6 +184,17 @@ internal sealed class JoinBatchMaterializer
         return new Utf8ColumnChunk(n, offsetsMem, blob.ToArray(), nbOut, anyNull);
     }
 
+    private static bool OuterBuildNullPresent(IReadOnlyList<JoinRowMatch> matches)
+    {
+        for (var i = 0; i < matches.Count; i++)
+        {
+            if (!matches[i].HasRight)
+                return true;
+        }
+
+        return false;
+    }
+
     private static bool Utf8ColumnMayHaveNulls(
         IReadOnlyList<IColumnarBatch> batches,
         int colIndex,
@@ -177,6 +204,8 @@ internal sealed class JoinBatchMaterializer
         for (var i = 0; i < matches.Count; i++)
         {
             var m = matches[i];
+            if (!useProbeSide && !m.HasRight)
+                continue;
             var bi = useProbeSide ? m.LeftBatchIdx : m.RightBatchIdx;
             if (batches[bi].Columns[colIndex].HasNulls)
                 return true;

@@ -37,11 +37,19 @@ public class SqlParserValidationTests
     }
 
     [Fact]
-    public void Outer_join_is_rejected()
+    public void Right_join_is_rejected()
     {
         Assert.Throws<SqlCompileException>(() =>
             StrictSqlSubset.ParseLogicalPlan(
-                "SELECT * FROM a LEFT JOIN b ON a.id = b.id"));
+                "SELECT * FROM a RIGHT JOIN b ON a.id = b.id"));
+    }
+
+    [Fact]
+    public void Left_join_parses()
+    {
+        var plan = StrictSqlSubset.ParseLogicalPlan("SELECT * FROM a LEFT JOIN b ON a.id = b.id");
+        var join = Assert.IsType<RainDB.Logical.LogicalInnerJoin>(plan.Root);
+        Assert.Equal(RainDB.Logical.LogicalJoinSemantics.LeftOuter, join.Semantics);
     }
 
     [Fact]

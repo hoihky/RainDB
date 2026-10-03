@@ -35,6 +35,31 @@ public sealed class SqlParser
         {
             _cur = _lexer.NextToken();
             _explainLevel = TryParseExplainPrefix();
+            var root = ParseUnionAllChain(ParseOneSelectRoot());
+            ExpectEnd();
+            return new LogicalPlan(root, _explainLevel);
+        }
+
+        private ILogicalRoot ParseUnionAllChain(ILogicalRoot first)
+        {
+            if (_cur.Kind != SqlTokenKind.Identifier || !LexemeEqualsIgnoreCase(_cur, "UNION"))
+                return first;
+
+            var branches = new List<ILogicalRoot> { first };
+            while (_cur.Kind == SqlTokenKind.Identifier && LexemeEqualsIgnoreCase(_cur, "UNION"))
+            {
+                Advance();
+                if (_cur.Kind != SqlTokenKind.Identifier || !LexemeEqualsIgnoreCase(_cur, "ALL"))
+                    throw new SqlCompileException("Only UNION ALL is supported; DISTINCT UNION is not implemented.");
+                Advance();
+                branches.Add(ParseOneSelectRoot());
+            }
+
+            return new LogicalUnionAll { Branches = branches };
+        }
+
+        private ILogicalRoot ParseOneSelectRoot()
+        {
             Expect(SqlTokenKind.KwSelect, "SELECT");
             var selectItems = ParseSelectItems(out var starOnly);
             Expect(SqlTokenKind.KwFrom, "FROM");
@@ -52,19 +77,18 @@ public sealed class SqlParser
                         throw new SqlCompileException("GROUP BY requires an explicit SELECT list.");
                     ValidateGroupedSelectJoin(selectItems, groupByCols, jf.Left, jf.Right);
                     RejectOrderByLimitAfterGrouped();
-                    return new LogicalPlan(
-                        new LogicalInnerJoin
-                        {
-                            LeftTableName = jf.Left,
-                            RightTableName = jf.Right,
-                            LeftKeyColumns = jf.LeftKeys,
-                            RightKeyColumns = jf.RightKeys,
-                            WhereConjuncts = joinWhereConjuncts,
-                            SelectProjection = null,
-                            GroupByColumns = groupByCols,
-                            SelectList = selectItems,
-                        },
-                        _explainLevel);
+                    return new LogicalInnerJoin
+                    {
+                        Semantics = jf.Semantics,
+                        LeftTableName = jf.Left,
+                        RightTableName = jf.Right,
+                        LeftKeyColumns = jf.LeftKeys,
+                        RightKeyColumns = jf.RightKeys,
+                        WhereConjuncts = joinWhereConjuncts,
+                        SelectProjection = null,
+                        GroupByColumns = groupByCols,
+                        SelectList = selectItems,
+                    };
                 }
 
                 List<LogicalColumnProjection>? joinProj = null;
@@ -79,20 +103,18 @@ public sealed class SqlParser
 
                 var joinOrderBy = TryParseOrderBy();
                 var joinLimit = TryParseLimit();
-                ExpectEnd();
-                return new LogicalPlan(
-                    new LogicalInnerJoin
-                    {
-                        LeftTableName = jf.Left,
-                        RightTableName = jf.Right,
-                        LeftKeyColumns = jf.LeftKeys,
-                        RightKeyColumns = jf.RightKeys,
-                        WhereConjuncts = joinWhereConjuncts,
-                        SelectProjection = joinProj,
-                        OrderBy = joinOrderBy,
-                        Limit = joinLimit,
-                    },
-                    _explainLevel);
+                return new LogicalInnerJoin
+                {
+                    Semantics = jf.Semantics,
+                    LeftTableName = jf.Left,
+                    RightTableName = jf.Right,
+                    LeftKeyColumns = jf.LeftKeys,
+                    RightKeyColumns = jf.RightKeys,
+                    WhereConjuncts = joinWhereConjuncts,
+                    SelectProjection = joinProj,
+                    OrderBy = joinOrderBy,
+                    Limit = joinLimit,
+                };
             }
 
             var table = ((SingleTableFrom)from).TableName;
@@ -108,64 +130,54 @@ public sealed class SqlParser
                 ValidateGroupedSelect(selectItems, groupByColsSingle, table);
                 var havingConjuncts = TryParseHavingClause();
                 RejectOrderByLimitAfterGrouped();
-                return new LogicalPlan(
-                    new LogicalTableScan
-                    {
-                        TableName = table,
-                        WhereConjuncts = whereConjuncts,
-                        GroupByColumns = groupByColsSingle,
-                        SelectList = selectItems,
-                        HavingConjuncts = havingConjuncts,
-                    },
-                    _explainLevel);
+                return new LogicalTableScan
+                {
+                    TableName = table,
+                    WhereConjuncts = whereConjuncts,
+                    GroupByColumns = groupByColsSingle,
+                    SelectList = selectItems,
+                    HavingConjuncts = havingConjuncts,
+                };
             }
 
             if (starOnly)
             {
                 var ob = TryParseOrderBy();
                 var lim = TryParseLimit();
-                ExpectEnd();
-                return new LogicalPlan(
-                    new LogicalTableScan
-                    {
-                        TableName = table,
-                        WhereConjuncts = whereConjuncts,
-                        Projection = null,
-                        OrderBy = ob,
-                        Limit = lim,
-                    },
-                    _explainLevel);
+                return new LogicalTableScan
+                {
+                    TableName = table,
+                    WhereConjuncts = whereConjuncts,
+                    Projection = null,
+                    OrderBy = ob,
+                    Limit = lim,
+                };
             }
 
             if (selectItems.Count == 1 && selectItems[0] is LogicalAggregationCall lone)
             {
                 ValidateAggregationCall(lone);
                 RejectOrderByLimitAfterGrouped();
-                return new LogicalPlan(
-                    new LogicalTableScan
-                    {
-                        TableName = table,
-                        WhereConjuncts = whereConjuncts,
-                        Aggregate = new LogicalAggregate { Kind = lone.Kind, ColumnName = lone.ArgumentColumnName },
-                    },
-                    _explainLevel);
+                return new LogicalTableScan
+                {
+                    TableName = table,
+                    WhereConjuncts = whereConjuncts,
+                    Aggregate = new LogicalAggregate { Kind = lone.Kind, ColumnName = lone.ArgumentColumnName },
+                };
             }
 
             if (selectItems.TrueForAll(static x => x is LogicalColumnProjection or LogicalScalarProjection))
             {
                 var ob2 = TryParseOrderBy();
                 var lim2 = TryParseLimit();
-                ExpectEnd();
-                return new LogicalPlan(
-                    new LogicalTableScan
-                    {
-                        TableName = table,
-                        WhereConjuncts = whereConjuncts,
-                        SelectList = selectItems,
-                        OrderBy = ob2,
-                        Limit = lim2,
-                    },
-                    _explainLevel);
+                return new LogicalTableScan
+                {
+                    TableName = table,
+                    WhereConjuncts = whereConjuncts,
+                    SelectList = selectItems,
+                    OrderBy = ob2,
+                    Limit = lim2,
+                };
             }
 
             throw new SqlCompileException("Mixing aggregate functions with bare columns requires GROUP BY.");
@@ -198,7 +210,12 @@ public sealed class SqlParser
             public string TableName { get; } = tableName;
         }
 
-        private sealed class JoinFrom(string left, string right, List<LogicalQualifiedColumn> leftKeys, List<LogicalQualifiedColumn> rightKeys)
+        private sealed class JoinFrom(
+            string left,
+            string right,
+            List<LogicalQualifiedColumn> leftKeys,
+            List<LogicalQualifiedColumn> rightKeys,
+            LogicalJoinSemantics semantics)
             : FromClause
         {
             public string Left { get; } = left;
@@ -208,22 +225,55 @@ public sealed class SqlParser
             public List<LogicalQualifiedColumn> LeftKeys { get; } = leftKeys;
 
             public List<LogicalQualifiedColumn> RightKeys { get; } = rightKeys;
+
+            public LogicalJoinSemantics Semantics { get; } = semantics;
         }
 
         private FromClause ParseFromClause()
         {
             var left = ExpectIdentifier("table name");
-            if (_cur.Kind != SqlTokenKind.KwInner)
+            if (!TryParseJoinIntro(out var semantics))
                 return new SingleTableFrom(left);
 
-            Advance();
-            Expect(SqlTokenKind.KwJoin, "JOIN");
             var right = ExpectIdentifier("table name");
             Expect(SqlTokenKind.KwOn, "ON");
             var leftKeys = new List<LogicalQualifiedColumn>();
             var rightKeys = new List<LogicalQualifiedColumn>();
             ParseJoinEquiConditions(left, right, leftKeys, rightKeys);
-            return new JoinFrom(left, right, leftKeys, rightKeys);
+            return new JoinFrom(left, right, leftKeys, rightKeys, semantics);
+        }
+
+        private bool TryParseJoinIntro(out LogicalJoinSemantics semantics)
+        {
+            semantics = LogicalJoinSemantics.Inner;
+            if (_cur.Kind == SqlTokenKind.KwInner)
+            {
+                Advance();
+                Expect(SqlTokenKind.KwJoin, "JOIN");
+                return true;
+            }
+
+            if (_cur.Kind == SqlTokenKind.Identifier && LexemeEqualsIgnoreCase(_cur, "LEFT"))
+            {
+                Advance();
+                if (_cur.Kind == SqlTokenKind.Identifier && LexemeEqualsIgnoreCase(_cur, "OUTER"))
+                    Advance();
+                Expect(SqlTokenKind.KwJoin, "JOIN");
+                semantics = LogicalJoinSemantics.LeftOuter;
+                return true;
+            }
+
+            if (_cur.Kind == SqlTokenKind.Identifier
+                && (LexemeEqualsIgnoreCase(_cur, "RIGHT") || LexemeEqualsIgnoreCase(_cur, "FULL")))
+                throw new SqlCompileException("Only INNER JOIN and LEFT JOIN are supported.");
+
+            if (_cur.Kind == SqlTokenKind.KwJoin)
+            {
+                Advance();
+                return true;
+            }
+
+            return false;
         }
 
         private void ParseJoinEquiConditions(

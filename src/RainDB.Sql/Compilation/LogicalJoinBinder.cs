@@ -63,6 +63,9 @@ public sealed class LogicalJoinBinder
             }
         }
 
+        if (join.Semantics == LogicalJoinSemantics.LeftOuter && join.GroupByColumns is { Count: > 0 })
+            throw new SqlCompileException("LEFT JOIN with GROUP BY is not supported yet.");
+
         if (join.GroupByColumns is { Count: > 0 })
             return BindGroupedJoin(join, leftCol, rightCol, leftTs, rightTs, probeIx, buildIx, algorithm, scanOptions);
 
@@ -78,7 +81,8 @@ public sealed class LogicalJoinBinder
             outputSchema,
             outputColumnOrder: outputOrder,
             probeSideFilters: probeFilters,
-            buildSideFilters: buildFilters);
+            buildSideFilters: buildFilters,
+            semantics: join.Semantics);
         if (join.OrderBy is not { Count: > 0 } && join.Limit is null)
             return joinPlan;
 

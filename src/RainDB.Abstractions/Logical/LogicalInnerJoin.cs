@@ -3,9 +3,11 @@ using RainDB.Execution;
 
 namespace RainDB.Logical;
 
-/// <summary>Inner join of two base tables with one or more AND-ed equi-predicates (<c>tbl.col = tbl.col</c>).</summary>
+/// <summary>Equi-join of two base tables with one or more AND-ed predicates (<c>tbl.col = tbl.col</c>).</summary>
 public sealed class LogicalInnerJoin : ILogicalRoot
 {
+    public LogicalJoinSemantics Semantics { get; init; } = LogicalJoinSemantics.Inner;
+
     public required string LeftTableName { get; init; }
 
     public required string RightTableName { get; init; }
@@ -46,7 +48,8 @@ public sealed class LogicalInnerJoin : ILogicalRoot
     public string Explain(string indent = "")
     {
         var sb = new StringBuilder();
-        sb.Append(indent).Append("LogicalInnerJoin(").Append(LeftTableName).Append(", ").Append(RightTableName).Append(") ON ");
+        var kind = Semantics == LogicalJoinSemantics.LeftOuter ? "LogicalLeftJoin" : "LogicalInnerJoin";
+        sb.Append(indent).Append(kind).Append('(').Append(LeftTableName).Append(", ").Append(RightTableName).Append(") ON ");
         for (var i = 0; i < LeftKeyColumns.Count; i++)
         {
             if (i > 0)

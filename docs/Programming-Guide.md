@@ -109,6 +109,15 @@ Example scripts (run against `TestDataBuilders.RegisterAnalyticsDemoTables` or `
 
 `HAVING` must reference columns or aggregates that appear in the `SELECT` list. `ORDER BY` with only computed `SELECT` columns is not supported yet (use a base table column in `ORDER BY`).
 
+### 2.2.3 LEFT JOIN and UNION ALL (Phase D3)
+
+| File | Topic |
+|------|--------|
+| `samples/sql/12_left_join.sql` | `LEFT JOIN` null-padding |
+| `samples/sql/13_union_all.sql` | `UNION ALL` between compatible SELECTs |
+
+Only `INNER JOIN` and `LEFT JOIN` are supported for joins; `UNION` without `ALL` is rejected. `LEFT JOIN` with `GROUP BY` is not supported yet.
+
 ### 2.3 Custom catalog
 
 ```csharp

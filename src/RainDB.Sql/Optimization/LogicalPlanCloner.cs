@@ -1,5 +1,6 @@
 using RainDB.Execution;
 using RainDB.Logical;
+using System.Linq;
 
 namespace RainDB.Sql.Optimization;
 
@@ -14,6 +15,10 @@ internal sealed class LogicalPlanCloner
         {
             LogicalTableScan s => CloneTableScan(s),
             LogicalInnerJoin j => CloneJoin(j),
+            LogicalUnionAll u => new LogicalUnionAll
+            {
+                Branches = u.Branches.Select(CloneRoot).ToArray(),
+            },
             _ => throw new InvalidOperationException($"Unsupported logical root {root.GetType().Name}."),
         };
 
@@ -43,6 +48,7 @@ internal sealed class LogicalPlanCloner
         IReadOnlyList<SimpleWhereClause>? buildWhereOverride = null) =>
         new()
         {
+            Semantics = j.Semantics,
             LeftTableName = j.LeftTableName,
             RightTableName = j.RightTableName,
             LeftKeyColumns = CloneQualifiedColumns(j.LeftKeyColumns),

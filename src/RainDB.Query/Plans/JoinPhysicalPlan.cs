@@ -1,5 +1,6 @@
 using RainDB.Catalog;
 using RainDB.Execution;
+using RainDB.Logical;
 using RainDB.Schema;
 
 namespace RainDB.Query.Plans;
@@ -28,7 +29,8 @@ public sealed class JoinPhysicalPlan : IPhysicalPlan
         TableSchema outputSchema,
         JoinOutputColumnRef[]? outputColumnOrder = null,
         ColumnCompareFilter[]? probeSideFilters = null,
-        ColumnCompareFilter[]? buildSideFilters = null)
+        ColumnCompareFilter[]? buildSideFilters = null,
+        LogicalJoinSemantics semantics = LogicalJoinSemantics.Inner)
     {
         ArgumentNullException.ThrowIfNull(probeKeyColumnIndices);
         ArgumentNullException.ThrowIfNull(buildKeyColumnIndices);
@@ -44,9 +46,12 @@ public sealed class JoinPhysicalPlan : IPhysicalPlan
         OutputColumnOrder = outputColumnOrder is { Length: > 0 } ? (JoinOutputColumnRef[])outputColumnOrder.Clone() : null;
         ProbeSideFilters = probeSideFilters is { Length: > 0 } ? (ColumnCompareFilter[])probeSideFilters.Clone() : null;
         BuildSideFilters = buildSideFilters is { Length: > 0 } ? (ColumnCompareFilter[])buildSideFilters.Clone() : null;
+        Semantics = semantics;
     }
 
     public PhysicalJoinAlgorithm Algorithm { get; }
+
+    public LogicalJoinSemantics Semantics { get; }
 
     /// <summary>Left / probe table.</summary>
     public TableId ProbeTableId { get; }
@@ -73,6 +78,8 @@ public sealed class JoinPhysicalPlan : IPhysicalPlan
     public string Explain(string indent = "")
     {
         var algo = Algorithm == PhysicalJoinAlgorithm.Hash ? "HashJoin" : "SortMergeJoin";
+        if (Semantics == LogicalJoinSemantics.LeftOuter)
+            algo = "LeftOuter" + algo;
         var proj = OutputColumnOrder is { Length: > 0 } o ? $" OUT[{o.Length}]" : "";
         var pf = ProbeSideFilters is { Length: > 0 } pl
             ? $" PROBE_FILTER[{string.Join(" AND ", Array.ConvertAll(pl, x => $"col{x.ColumnIndex}{x.Op}"))}]"

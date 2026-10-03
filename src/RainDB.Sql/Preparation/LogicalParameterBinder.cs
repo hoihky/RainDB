@@ -36,6 +36,14 @@ public sealed class LogicalParameterBinder
                 CollectFromWhere(j.ProbeSideWhereConjuncts, set);
                 CollectFromWhere(j.BuildSideWhereConjuncts, set);
                 break;
+            case LogicalUnionAll u:
+                foreach (var b in u.Branches)
+                {
+                    foreach (var n in CollectParameterNames(b))
+                        set.Add(n);
+                }
+
+                break;
         }
 
         return set.OrderBy(static n => n, StringComparer.OrdinalIgnoreCase).ToArray();
@@ -46,6 +54,10 @@ public sealed class LogicalParameterBinder
         {
             LogicalTableScan s => BindTableScan(s, parameters),
             LogicalInnerJoin j => BindJoin(j, parameters),
+            LogicalUnionAll u => new LogicalUnionAll
+            {
+                Branches = u.Branches.Select(b => BindRoot(b, parameters)).ToArray(),
+            },
             _ => throw new InvalidOperationException($"Unsupported logical root {root.GetType().Name}."),
         };
 

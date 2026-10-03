@@ -65,8 +65,9 @@ This document tracks what RainDB implements today and the original phased delive
 16. **EXPLAIN (Phase B4)** — `EXPLAIN` / `EXPLAIN LOGICAL` / `EXPLAIN PHYSICAL` SQL; `ExplainBundlePhysicalPlan` → `ExplainTextQueryResult`.
 17. **Scalar expressions (Phase D1)** — `ScalarExpressionBindingPipeline` binds Int32/Float64 arithmetic, `CAST`, `CASE`, and comparisons; used in **`WHERE`**, **`SELECT`**, and **`ORDER BY`** (expression keys). Samples: `samples/sql/08_*.sql`, `09_*.sql`.
 18. **HAVING + MIN/MAX (Phase D2)** — post-aggregate filters via `GroupedHavingBinder` / `GroupHavingEvaluator`; `MIN`/`MAX` on Int32, Int64, Float64, and Utf8 in hash aggregation. Samples: `samples/sql/10_*.sql`, `11_*.sql`. Automated coverage: `PhaseD1D2Tests.cs`.
+19. **LEFT JOIN + UNION ALL (Phase D3)** — `LogicalJoinSemantics` on equi-joins (hash + sort-merge) with null-padded build columns; `LogicalUnionAll` / `UnionAllPhysicalPlan` concatenates branch results with schema checks. Samples: `samples/sql/12_*.sql`, `13_*.sql`. Tests: `PhaseD3Tests.cs`.
 
-> **Note:** Remaining Phase D (DISTINCT, outer joins, subqueries), cost model histograms, and `EXPLAIN ANALYZE` timers remain on the [Development Roadmap](Development-Roadmap.md).
+> **Note:** Remaining Phase D (RIGHT/FULL outer, DISTINCT UNION, subqueries), cost model histograms, and `EXPLAIN ANALYZE` timers remain on the [Development Roadmap](Development-Roadmap.md).
 
 ---
 

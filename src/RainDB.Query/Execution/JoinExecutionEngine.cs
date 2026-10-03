@@ -7,6 +7,7 @@ using RainDB.Query.Execution.Operators;
 using RainDB.Query.Plans;
 using RainDB.Query.Results;
 using RainDB.Query.Vectorized;
+using RainDB.Logical;
 using RainDB.Schema;
 
 namespace RainDB.Query.Execution;
@@ -239,12 +240,7 @@ public sealed class JoinOperator : Operators.IJoinOperator
                 if (!RowPassesAll(batch, plan.ProbeSideFilters, row))
                     continue;
                 var key = _deps.GroupKeys.BuildKey(batch, row, plan.ProbeKeyColumnIndices, scratch);
-                if (key.NullMask != 0)
-                    continue;
-                if (!dict.TryGetValue(key, out var list))
-                    continue;
-                foreach (var br in list)
-                    emitter.Add(new JoinRowMatch(bi, row, br.BatchIdx, br.RowIdx));
+                EmitHashProbeMatchesFixed(plan, emitter, bi, row, key.NullMask != 0, dict, key);
             }
         }
     }
@@ -310,14 +306,63 @@ public sealed class JoinOperator : Operators.IJoinOperator
                 if (!RowPassesAll(batch, plan.ProbeSideFilters, row))
                     continue;
                 var key = _deps.CompositeJoinKeys.Build(probeSchema, batch, row, plan.ProbeKeyColumnIndices);
-                if (key.NullMask != 0)
-                    continue;
-                if (!dict.TryGetValue(key, out var list))
-                    continue;
-                foreach (var br in list)
-                    emitter.Add(new JoinRowMatch(bi, row, br.BatchIdx, br.RowIdx));
+                EmitHashProbeMatchesUtf8(plan, emitter, bi, row, key.NullMask != 0, dict, key);
             }
         }
+    }
+
+    private static void EmitHashProbeMatchesFixed(
+        JoinPhysicalPlan plan,
+        JoinMatchChunkEmitter emitter,
+        int probeBatchIdx,
+        int probeRow,
+        bool probeKeyIsNull,
+        Dictionary<GroupKey, List<RowRef>> dict,
+        GroupKey key)
+    {
+        if (probeKeyIsNull)
+        {
+            if (plan.Semantics == LogicalJoinSemantics.LeftOuter)
+                emitter.Add(JoinRowMatch.ProbeOnly(probeBatchIdx, probeRow));
+            return;
+        }
+
+        if (!dict.TryGetValue(key, out var list) || list.Count == 0)
+        {
+            if (plan.Semantics == LogicalJoinSemantics.LeftOuter)
+                emitter.Add(JoinRowMatch.ProbeOnly(probeBatchIdx, probeRow));
+            return;
+        }
+
+        foreach (var br in list)
+            emitter.Add(new JoinRowMatch(probeBatchIdx, probeRow, br.BatchIdx, br.RowIdx));
+    }
+
+    private static void EmitHashProbeMatchesUtf8(
+        JoinPhysicalPlan plan,
+        JoinMatchChunkEmitter emitter,
+        int probeBatchIdx,
+        int probeRow,
+        bool probeKeyIsNull,
+        Dictionary<CompositeJoinKey, List<RowRef>> dict,
+        CompositeJoinKey key)
+    {
+        if (probeKeyIsNull)
+        {
+            if (plan.Semantics == LogicalJoinSemantics.LeftOuter)
+                emitter.Add(JoinRowMatch.ProbeOnly(probeBatchIdx, probeRow));
+            return;
+        }
+
+        if (!dict.TryGetValue(key, out var list) || list.Count == 0)
+        {
+            if (plan.Semantics == LogicalJoinSemantics.LeftOuter)
+                emitter.Add(JoinRowMatch.ProbeOnly(probeBatchIdx, probeRow));
+            return;
+        }
+
+        foreach (var br in list)
+            emitter.Add(new JoinRowMatch(probeBatchIdx, probeRow, br.BatchIdx, br.RowIdx));
     }
 
     private void RunSortMergeJoinFixed(
@@ -335,7 +380,7 @@ public sealed class JoinOperator : Operators.IJoinOperator
         left.Sort((a, b) => comparer.Compare(a.Key, b.Key));
         right.Sort((a, b) => comparer.Compare(a.Key, b.Key));
 
-        MergeSortedKeyRuns(left, right, comparer, ct, emitter);
+        MergeSortedKeyRuns(plan, left, right, comparer, ct, emitter);
     }
 
     private void RunSortMergeJoinUtf8(
@@ -354,10 +399,11 @@ public sealed class JoinOperator : Operators.IJoinOperator
         left.Sort((a, b) => comparer.Compare(a.Key, b.Key));
         right.Sort((a, b) => comparer.Compare(a.Key, b.Key));
 
-        MergeSortedCompositeRuns(left, right, comparer, ct, emitter);
+        MergeSortedCompositeRuns(plan, left, right, comparer, ct, emitter);
     }
 
     private void MergeSortedKeyRuns(
+        JoinPhysicalPlan plan,
         List<SortEntryFixed> left,
         List<SortEntryFixed> right,
         GroupKeyComparer comparer,
@@ -372,6 +418,8 @@ public sealed class JoinOperator : Operators.IJoinOperator
             var c = comparer.Compare(left[i].Key, right[j].Key);
             if (c < 0)
             {
+                if (plan.Semantics == LogicalJoinSemantics.LeftOuter)
+                    emitter.Add(JoinRowMatch.ProbeOnly(left[i].BatchIdx, left[i].RowIdx));
                 i++;
                 continue;
             }
@@ -401,9 +449,16 @@ public sealed class JoinOperator : Operators.IJoinOperator
                 }
             }
         }
+
+        if (plan.Semantics == LogicalJoinSemantics.LeftOuter)
+        {
+            for (; i < left.Count; i++)
+                emitter.Add(JoinRowMatch.ProbeOnly(left[i].BatchIdx, left[i].RowIdx));
+        }
     }
 
     private void MergeSortedCompositeRuns(
+        JoinPhysicalPlan plan,
         List<SortEntryUtf8> left,
         List<SortEntryUtf8> right,
         CompositeJoinKeyComparer comparer,
@@ -418,6 +473,8 @@ public sealed class JoinOperator : Operators.IJoinOperator
             var c = comparer.Compare(left[i].Key, right[j].Key);
             if (c < 0)
             {
+                if (plan.Semantics == LogicalJoinSemantics.LeftOuter)
+                    emitter.Add(JoinRowMatch.ProbeOnly(left[i].BatchIdx, left[i].RowIdx));
                 i++;
                 continue;
             }
@@ -446,6 +503,12 @@ public sealed class JoinOperator : Operators.IJoinOperator
                         right[jj].RowIdx));
                 }
             }
+        }
+
+        if (plan.Semantics == LogicalJoinSemantics.LeftOuter)
+        {
+            for (; i < left.Count; i++)
+                emitter.Add(JoinRowMatch.ProbeOnly(left[i].BatchIdx, left[i].RowIdx));
         }
     }
 
