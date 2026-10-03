@@ -92,6 +92,8 @@ public sealed class JoinPhysicalPlan : IPhysicalPlan
         var algo = Algorithm == PhysicalJoinAlgorithm.Hash ? "HashJoin" : "SortMergeJoin";
         if (Semantics == LogicalJoinSemantics.LeftOuter)
             algo = "LeftOuter" + algo;
+        else if (Semantics == LogicalJoinSemantics.FullOuter)
+            algo = "FullOuter" + algo;
         var proj = OutputColumnOrder is { Length: > 0 } o ? $" OUT[{o.Length}]" : "";
         var pf = ProbeSideFilters is { Length: > 0 } pl
             ? $" PROBE_FILTER[{string.Join(" AND ", Array.ConvertAll(pl, x => $"col{x.ColumnIndex}{x.Op}"))}]"

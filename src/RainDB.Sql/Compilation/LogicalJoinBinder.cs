@@ -24,6 +24,7 @@ public sealed class LogicalJoinBinder
     {
         ArgumentNullException.ThrowIfNull(join);
         ArgumentNullException.ThrowIfNull(catalog);
+        join = NormalizeRightOuterJoin(join);
         if (join.LeftKeyColumns.Count != join.RightKeyColumns.Count || join.LeftKeyColumns.Count == 0)
             throw new SqlCompileException("JOIN requires at least one AND-separated equi-predicate.");
 
@@ -112,8 +113,6 @@ public sealed class LogicalJoinBinder
             throw new SqlCompileException("GROUP BY join requires a SELECT list.");
         if (join.SelectProjection is not null)
             throw new SqlCompileException("Internal error: grouped join logical plan must omit SelectProjection.");
-        if (join.OrderBy is { Count: > 0 } || join.Limit is not null)
-            throw new SqlCompileException("ORDER BY and LIMIT are not supported with GROUP BY on a join.");
 
         var (probeFilters, buildFilters) = ResolveJoinWhere(join, leftTs, rightTs);
         var joinSubqueries = BindJoinSubqueries(join, catalog, leftTs, rightTs, scanOptions, algorithm);
@@ -398,6 +397,30 @@ public sealed class LogicalJoinBinder
         }
 
         return (refs.ToArray(), new TableSchema(cols));
+    }
+
+    private static LogicalInnerJoin NormalizeRightOuterJoin(LogicalInnerJoin join)
+    {
+        if (join.Semantics != LogicalJoinSemantics.RightOuter)
+            return join;
+
+        return new LogicalInnerJoin
+        {
+            Semantics = LogicalJoinSemantics.LeftOuter,
+            LeftTableName = join.RightTableName,
+            RightTableName = join.LeftTableName,
+            LeftKeyColumns = join.RightKeyColumns,
+            RightKeyColumns = join.LeftKeyColumns,
+            SelectProjection = join.SelectProjection,
+            WhereConjuncts = join.WhereConjuncts,
+            SubqueryPredicates = join.SubqueryPredicates,
+            ProbeSideWhereConjuncts = join.BuildSideWhereConjuncts,
+            BuildSideWhereConjuncts = join.ProbeSideWhereConjuncts,
+            GroupByColumns = join.GroupByColumns,
+            SelectList = join.SelectList,
+            OrderBy = join.OrderBy,
+            Limit = join.Limit,
+        };
     }
 
     private JoinSubqueryPhysicalSpecs BindJoinSubqueries(

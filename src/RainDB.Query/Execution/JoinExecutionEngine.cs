@@ -218,6 +218,12 @@ public sealed class JoinOperator : Operators.IJoinOperator
         return false;
     }
 
+    private static bool PreserveUnmatchedProbe(LogicalJoinSemantics semantics) =>
+        semantics is LogicalJoinSemantics.LeftOuter or LogicalJoinSemantics.FullOuter;
+
+    private static bool PreserveUnmatchedBuild(LogicalJoinSemantics semantics) =>
+        semantics is LogicalJoinSemantics.FullOuter;
+
     private static void ValidateIndices(TableSchema schema, int[] ix)
     {
         foreach (var i in ix)
@@ -264,16 +270,20 @@ public sealed class JoinOperator : Operators.IJoinOperator
         CancellationToken ct,
         JoinMatchChunkEmitter emitter)
     {
-        var dict = BuildHashIndexFixed(plan, buildBatches, ct);
-        ProbeHashJoinFixed(plan, probeBatches, dict, ct, emitter);
+        var (dict, buildRows) = BuildHashIndexFixed(plan, buildBatches, ct);
+        HashSet<RowRef>? matchedBuild = PreserveUnmatchedBuild(plan.Semantics) ? [] : null;
+        ProbeHashJoinFixed(plan, probeBatches, dict, matchedBuild, ct, emitter);
+        if (matchedBuild is not null)
+            EmitUnmatchedBuildRows(plan, buildRows, matchedBuild, emitter);
     }
 
-    private Dictionary<GroupKey, List<RowRef>> BuildHashIndexFixed(
+    private (Dictionary<GroupKey, List<RowRef>> Dict, List<RowRef> AllIndexedRows) BuildHashIndexFixed(
         JoinPhysicalPlan plan,
         IReadOnlyList<IColumnarBatch> buildBatches,
         CancellationToken ct)
     {
         var dict = new Dictionary<GroupKey, List<RowRef>>();
+        var allIndexed = new List<RowRef>();
         var scratch = new ulong[plan.BuildKeyColumnIndices.Length];
         for (var bi = 0; bi < buildBatches.Count; bi++)
         {
@@ -292,17 +302,20 @@ public sealed class JoinOperator : Operators.IJoinOperator
                     dict[key] = list;
                 }
 
-                list.Add(new RowRef(bi, row));
+                var rr = new RowRef(bi, row);
+                list.Add(rr);
+                allIndexed.Add(rr);
             }
         }
 
-        return dict;
+        return (dict, allIndexed);
     }
 
     private void ProbeHashJoinFixed(
         JoinPhysicalPlan plan,
         IReadOnlyList<IColumnarBatch> probeBatches,
         Dictionary<GroupKey, List<RowRef>> dict,
+        HashSet<RowRef>? matchedBuild,
         CancellationToken ct,
         JoinMatchChunkEmitter emitter)
     {
@@ -316,8 +329,21 @@ public sealed class JoinOperator : Operators.IJoinOperator
                 if (!RowPassesProbe(batch, plan.ProbeSideFilters, row))
                     continue;
                 var key = _deps.GroupKeys.BuildKey(batch, row, plan.ProbeKeyColumnIndices, scratch);
-                EmitHashProbeMatchesFixed(plan, emitter, bi, row, key.NullMask != 0, dict, key);
+                EmitHashProbeMatchesFixed(plan, emitter, bi, row, key.NullMask != 0, dict, key, matchedBuild);
             }
+        }
+    }
+
+    private static void EmitUnmatchedBuildRows(
+        JoinPhysicalPlan plan,
+        List<RowRef> indexedBuildRows,
+        HashSet<RowRef> matchedBuild,
+        JoinMatchChunkEmitter emitter)
+    {
+        foreach (var br in indexedBuildRows)
+        {
+            if (!matchedBuild.Contains(br))
+                emitter.Add(JoinRowMatch.BuildOnly(br.BatchIdx, br.RowIdx));
         }
     }
 
@@ -330,17 +356,21 @@ public sealed class JoinOperator : Operators.IJoinOperator
         CancellationToken ct,
         JoinMatchChunkEmitter emitter)
     {
-        var dict = BuildHashIndexUtf8(plan, buildBatches, buildSchema, ct);
-        ProbeHashJoinUtf8(plan, probeBatches, probeSchema, dict, ct, emitter);
+        var (dict, buildRows) = BuildHashIndexUtf8(plan, buildBatches, buildSchema, ct);
+        HashSet<RowRef>? matchedBuild = PreserveUnmatchedBuild(plan.Semantics) ? [] : null;
+        ProbeHashJoinUtf8(plan, probeBatches, probeSchema, dict, matchedBuild, ct, emitter);
+        if (matchedBuild is not null)
+            EmitUnmatchedBuildRows(plan, buildRows, matchedBuild, emitter);
     }
 
-    private Dictionary<CompositeJoinKey, List<RowRef>> BuildHashIndexUtf8(
+    private (Dictionary<CompositeJoinKey, List<RowRef>> Dict, List<RowRef> AllIndexedRows) BuildHashIndexUtf8(
         JoinPhysicalPlan plan,
         IReadOnlyList<IColumnarBatch> buildBatches,
         TableSchema buildSchema,
         CancellationToken ct)
     {
         var dict = new Dictionary<CompositeJoinKey, List<RowRef>>();
+        var allIndexed = new List<RowRef>();
         for (var bi = 0; bi < buildBatches.Count; bi++)
         {
             ct.ThrowIfCancellationRequested();
@@ -358,11 +388,13 @@ public sealed class JoinOperator : Operators.IJoinOperator
                     dict[key] = list;
                 }
 
-                list.Add(new RowRef(bi, row));
+                var rr = new RowRef(bi, row);
+                list.Add(rr);
+                allIndexed.Add(rr);
             }
         }
 
-        return dict;
+        return (dict, allIndexed);
     }
 
     private void ProbeHashJoinUtf8(
@@ -370,6 +402,7 @@ public sealed class JoinOperator : Operators.IJoinOperator
         IReadOnlyList<IColumnarBatch> probeBatches,
         TableSchema probeSchema,
         Dictionary<CompositeJoinKey, List<RowRef>> dict,
+        HashSet<RowRef>? matchedBuild,
         CancellationToken ct,
         JoinMatchChunkEmitter emitter)
     {
@@ -382,7 +415,7 @@ public sealed class JoinOperator : Operators.IJoinOperator
                 if (!RowPassesProbe(batch, plan.ProbeSideFilters, row))
                     continue;
                 var key = _deps.CompositeJoinKeys.Build(probeSchema, batch, row, plan.ProbeKeyColumnIndices);
-                EmitHashProbeMatchesUtf8(plan, emitter, bi, row, key.NullMask != 0, dict, key);
+                EmitHashProbeMatchesUtf8(plan, emitter, bi, row, key.NullMask != 0, dict, key, matchedBuild);
             }
         }
     }
@@ -394,24 +427,28 @@ public sealed class JoinOperator : Operators.IJoinOperator
         int probeRow,
         bool probeKeyIsNull,
         Dictionary<GroupKey, List<RowRef>> dict,
-        GroupKey key)
+        GroupKey key,
+        HashSet<RowRef>? matchedBuild)
     {
         if (probeKeyIsNull)
         {
-            if (plan.Semantics == LogicalJoinSemantics.LeftOuter)
+            if (PreserveUnmatchedProbe(plan.Semantics))
                 emitter.Add(JoinRowMatch.ProbeOnly(probeBatchIdx, probeRow));
             return;
         }
 
         if (!dict.TryGetValue(key, out var list) || list.Count == 0)
         {
-            if (plan.Semantics == LogicalJoinSemantics.LeftOuter)
+            if (PreserveUnmatchedProbe(plan.Semantics))
                 emitter.Add(JoinRowMatch.ProbeOnly(probeBatchIdx, probeRow));
             return;
         }
 
         foreach (var br in list)
+        {
+            matchedBuild?.Add(br);
             emitter.Add(new JoinRowMatch(probeBatchIdx, probeRow, br.BatchIdx, br.RowIdx));
+        }
     }
 
     private static void EmitHashProbeMatchesUtf8(
@@ -421,24 +458,28 @@ public sealed class JoinOperator : Operators.IJoinOperator
         int probeRow,
         bool probeKeyIsNull,
         Dictionary<CompositeJoinKey, List<RowRef>> dict,
-        CompositeJoinKey key)
+        CompositeJoinKey key,
+        HashSet<RowRef>? matchedBuild)
     {
         if (probeKeyIsNull)
         {
-            if (plan.Semantics == LogicalJoinSemantics.LeftOuter)
+            if (PreserveUnmatchedProbe(plan.Semantics))
                 emitter.Add(JoinRowMatch.ProbeOnly(probeBatchIdx, probeRow));
             return;
         }
 
         if (!dict.TryGetValue(key, out var list) || list.Count == 0)
         {
-            if (plan.Semantics == LogicalJoinSemantics.LeftOuter)
+            if (PreserveUnmatchedProbe(plan.Semantics))
                 emitter.Add(JoinRowMatch.ProbeOnly(probeBatchIdx, probeRow));
             return;
         }
 
         foreach (var br in list)
+        {
+            matchedBuild?.Add(br);
             emitter.Add(new JoinRowMatch(probeBatchIdx, probeRow, br.BatchIdx, br.RowIdx));
+        }
     }
 
     private void RunSortMergeJoinFixed(
@@ -494,7 +535,7 @@ public sealed class JoinOperator : Operators.IJoinOperator
             var c = comparer.Compare(left[i].Key, right[j].Key);
             if (c < 0)
             {
-                if (plan.Semantics == LogicalJoinSemantics.LeftOuter)
+                if (PreserveUnmatchedProbe(plan.Semantics))
                     emitter.Add(JoinRowMatch.ProbeOnly(left[i].BatchIdx, left[i].RowIdx));
                 i++;
                 continue;
@@ -502,6 +543,8 @@ public sealed class JoinOperator : Operators.IJoinOperator
 
             if (c > 0)
             {
+                if (PreserveUnmatchedBuild(plan.Semantics))
+                    emitter.Add(JoinRowMatch.BuildOnly(right[j].BatchIdx, right[j].RowIdx));
                 j++;
                 continue;
             }
@@ -526,10 +569,16 @@ public sealed class JoinOperator : Operators.IJoinOperator
             }
         }
 
-        if (plan.Semantics == LogicalJoinSemantics.LeftOuter)
+        if (PreserveUnmatchedProbe(plan.Semantics))
         {
             for (; i < left.Count; i++)
                 emitter.Add(JoinRowMatch.ProbeOnly(left[i].BatchIdx, left[i].RowIdx));
+        }
+
+        if (PreserveUnmatchedBuild(plan.Semantics))
+        {
+            for (; j < right.Count; j++)
+                emitter.Add(JoinRowMatch.BuildOnly(right[j].BatchIdx, right[j].RowIdx));
         }
     }
 
@@ -549,7 +598,7 @@ public sealed class JoinOperator : Operators.IJoinOperator
             var c = comparer.Compare(left[i].Key, right[j].Key);
             if (c < 0)
             {
-                if (plan.Semantics == LogicalJoinSemantics.LeftOuter)
+                if (PreserveUnmatchedProbe(plan.Semantics))
                     emitter.Add(JoinRowMatch.ProbeOnly(left[i].BatchIdx, left[i].RowIdx));
                 i++;
                 continue;
@@ -557,6 +606,8 @@ public sealed class JoinOperator : Operators.IJoinOperator
 
             if (c > 0)
             {
+                if (PreserveUnmatchedBuild(plan.Semantics))
+                    emitter.Add(JoinRowMatch.BuildOnly(right[j].BatchIdx, right[j].RowIdx));
                 j++;
                 continue;
             }
@@ -581,10 +632,16 @@ public sealed class JoinOperator : Operators.IJoinOperator
             }
         }
 
-        if (plan.Semantics == LogicalJoinSemantics.LeftOuter)
+        if (PreserveUnmatchedProbe(plan.Semantics))
         {
             for (; i < left.Count; i++)
                 emitter.Add(JoinRowMatch.ProbeOnly(left[i].BatchIdx, left[i].RowIdx));
+        }
+
+        if (PreserveUnmatchedBuild(plan.Semantics))
+        {
+            for (; j < right.Count; j++)
+                emitter.Add(JoinRowMatch.BuildOnly(right[j].BatchIdx, right[j].RowIdx));
         }
     }
 

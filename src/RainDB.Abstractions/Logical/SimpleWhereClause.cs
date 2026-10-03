@@ -19,6 +19,9 @@ public sealed class SimpleWhereClause
     /// <summary>Literal compare value when the predicate is not parameterized.</summary>
     public SqlLiteral? Literal { get; init; }
 
+    /// <summary>Column compare (<c>col = other.col</c>) when set instead of <see cref="Literal"/>.</summary>
+    public LogicalColumnScalarRef? CompareColumn { get; init; }
+
     /// <summary>Parameter name (without <c>@</c>) when the predicate uses <c>@name</c> instead of a literal.</summary>
     public string? ParameterName { get; init; }
 

@@ -17,6 +17,8 @@ internal static class PhysicalPlanOutputSchema
         return plan switch
         {
             UnionAllPhysicalPlan u => u.OutputSchema,
+            DistinctPhysicalPlan d => d.OutputSchema,
+            GroupedSortTopNPhysicalPlan g => g.OutputSchema,
             JoinPhysicalPlan j => j.OutputSchema,
             JoinSortTopNPhysicalPlan jst => jst.Join.OutputSchema,
             GroupedJoinPhysicalPlan => throw new SqlCompileException("UNION ALL cannot include grouped join queries."),

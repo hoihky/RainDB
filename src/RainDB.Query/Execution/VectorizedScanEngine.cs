@@ -43,7 +43,9 @@ public sealed class VectorizedScanOperator : Operators.IVectorizedScanOperator
         if (subFilters.IsDenyAll)
             return new ColumnarMaterializedQueryResult(Array.Empty<IColumnarBatch>());
 
-        var batches = await ProjectAllBatchesAsync(plan, table, context, subFilters).ConfigureAwait(false);
+        var batches = subFilters.CorrelatedExists is { Length: > 0 } || subFilters.CorrelatedIn is { Length: > 0 }
+            ? await ProjectAllBatchesCorrelatedAsync(plan, table, context, subFilters).ConfigureAwait(false)
+            : await ProjectAllBatchesAsync(plan, table, context, subFilters).ConfigureAwait(false);
         return new ColumnarMaterializedQueryResult(batches);
     }
 
@@ -105,6 +107,86 @@ public sealed class VectorizedScanOperator : Operators.IVectorizedScanOperator
                 }
             }
         }
+    }
+
+    private async ValueTask<IReadOnlyList<IColumnarBatch>> ProjectAllBatchesCorrelatedAsync(
+        VectorizedScanPhysicalPlan plan,
+        IColumnarTableSource table,
+        IExecutionContext context,
+        ResolvedSubqueryFilters subqueryFilters)
+    {
+        if (context is not RainDbExecutionContext { NestedExecutor: { } executor })
+            throw new InvalidOperationException("Correlated subqueries require NestedExecutor.");
+
+        var existsSpecs = subqueryFilters.CorrelatedExists;
+        var inSpecs = subqueryFilters.CorrelatedIn;
+        var batches = table.Batches;
+        var outList = new List<IColumnarBatch>();
+        foreach (var batch in batches)
+        {
+            var processed = ProcessOneBatch(plan, batch, 0, context, subqueryFilters);
+            if (processed.RowCount == 0)
+                continue;
+            var rent = ArrayPool<int>.Shared.Rent(processed.RowCount);
+            try
+            {
+                var kept = 0;
+                for (var r = 0; r < processed.RowCount; r++)
+                {
+                    var ok = true;
+                    if (existsSpecs is { Length: > 0 })
+                    {
+                        foreach (var spec in existsSpecs)
+                        {
+                            if (!await CorrelatedSubqueryExecutor.ExistsForOuterRowAsync(spec, processed, r, executor, context)
+                                    .ConfigureAwait(false))
+                            {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (ok && inSpecs is { Length: > 0 })
+                    {
+                        foreach (var spec in inSpecs)
+                        {
+                            if (!await CorrelatedSubqueryExecutor.InForOuterRowAsync(
+                                    spec,
+                                    processed,
+                                    r,
+                                    executor,
+                                    context,
+                                    _deps.Selection).ConfigureAwait(false))
+                            {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (ok)
+                        rent[kept++] = r;
+                }
+
+                if (kept == 0)
+                    continue;
+                outList.Add(_deps.ProjectGather.Project(
+                    processed,
+                    plan.OutputColumns.AsSpan(),
+                    useRowSelection: true,
+                    selectedRows: rent.AsSpan(0, kept),
+                    kept,
+                    context.BufferPool,
+                    context.AlignedBufferPool));
+            }
+            finally
+            {
+                ArrayPool<int>.Shared.Return(rent);
+            }
+        }
+
+        return outList;
     }
 
     private async ValueTask<IReadOnlyList<IColumnarBatch>> ProjectAllBatchesAsync(

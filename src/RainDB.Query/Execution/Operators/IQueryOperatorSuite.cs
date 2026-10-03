@@ -12,4 +12,6 @@ public interface IQueryOperatorSuite
     ISortTopNOperator SortTopN { get; }
 
     IGroupedJoinOperator GroupedJoin { get; }
+
+    IDistinctOperator Distinct { get; }
 }

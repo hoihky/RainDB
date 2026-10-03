@@ -51,7 +51,23 @@ public sealed class SortTopNOperator : Operators.ISortTopNOperator
 
         var batches = table.Batches;
         var ct = context.CancellationToken;
-        var rows = CollectFilteredRows(batches, plan.Filters, subFilters, ct);
+        RowLocation[] rows;
+        if (subFilters.CorrelatedExists is { Length: > 0 } || subFilters.CorrelatedIn is { Length: > 0 })
+        {
+            if (context is not RainDbExecutionContext { NestedExecutor: { } nested })
+                throw new InvalidOperationException("Correlated subqueries require NestedExecutor.");
+            rows = await CollectFilteredRowsCorrelatedAsync(
+                batches,
+                plan.Filters,
+                subFilters,
+                nested,
+                context,
+                ct).ConfigureAwait(false);
+        }
+        else
+        {
+            rows = CollectFilteredRows(batches, plan.Filters, subFilters, ct);
+        }
         var ordered = _deps.SortTopNSelection.SelectInSortOrder(
             rows,
             plan.SortKeys,
@@ -133,6 +149,98 @@ public sealed class SortTopNOperator : Operators.ISortTopNOperator
             var t = schema.Columns[k.ColumnIndex].Type;
             if (t != RainDbType.Utf8 && !ColumnTypeSizes.IsFixedWidth(t))
                 throw new NotSupportedException($"ORDER BY on type {t} is not supported.");
+        }
+    }
+
+    private async ValueTask<RowLocation[]> CollectFilteredRowsCorrelatedAsync(
+        IReadOnlyList<IColumnarBatch> batches,
+        ColumnCompareFilter[]? filters,
+        ResolvedSubqueryFilters subqueryFilters,
+        IQueryExecutor executor,
+        IExecutionContext context,
+        CancellationToken ct)
+    {
+        var exists = subqueryFilters.CorrelatedExists;
+        var inSpecs = subqueryFilters.CorrelatedIn;
+        var list = new List<RowLocation>();
+        var compare = filters ?? Array.Empty<ColumnCompareFilter>();
+        var inFilters = subqueryFilters.InFilters ?? Array.Empty<ColumnInSetFilter>();
+        var rent = ArrayPool<int>.Shared;
+        var tmp = rent.Rent(4096);
+        try
+        {
+            for (var bi = 0; bi < batches.Count; bi++)
+            {
+                ct.ThrowIfCancellationRequested();
+                var batch = batches[bi];
+                var cap = Math.Max(batch.RowCount, 1);
+                if (tmp.Length < cap)
+                {
+                    rent.Return(tmp);
+                    tmp = rent.Rent(cap);
+                }
+
+                int k;
+                if (compare.Length > 0 || inFilters.Length > 0)
+                {
+                    k = _deps.Selection.FillSelectedRowsConjunctive(
+                        batch,
+                        compare.AsSpan(),
+                        inFilters.AsSpan(),
+                        tmp.AsSpan(0, batch.RowCount));
+                }
+                else
+                {
+                    k = batch.RowCount;
+                    for (var r = 0; r < k; r++)
+                        tmp[r] = r;
+                }
+
+                for (var i = 0; i < k; i++)
+                {
+                    var r = tmp[i];
+                    var ok = true;
+                    if (exists is { Length: > 0 })
+                    {
+                        foreach (var spec in exists)
+                        {
+                            if (!await CorrelatedSubqueryExecutor.ExistsForOuterRowAsync(spec, batch, r, executor, context)
+                                    .ConfigureAwait(false))
+                            {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (ok && inSpecs is { Length: > 0 })
+                    {
+                        foreach (var spec in inSpecs)
+                        {
+                            if (!await CorrelatedSubqueryExecutor.InForOuterRowAsync(
+                                    spec,
+                                    batch,
+                                    r,
+                                    executor,
+                                    context,
+                                    _deps.Selection).ConfigureAwait(false))
+                            {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (ok)
+                        list.Add(new RowLocation(bi, r));
+                }
+            }
+
+            return list.ToArray();
+        }
+        finally
+        {
+            rent.Return(tmp);
         }
     }
 

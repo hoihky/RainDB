@@ -63,6 +63,7 @@ public sealed class LogicalParameterBinder
             LogicalUnionAll u => new LogicalUnionAll
             {
                 Branches = u.Branches.Select(b => BindRoot(b, parameters)).ToArray(),
+                UnionAll = u.UnionAll,
             },
             LogicalDerivedTableScan d => BindDerivedScan(d, parameters),
             _ => throw new InvalidOperationException($"Unsupported logical root {root.GetType().Name}."),

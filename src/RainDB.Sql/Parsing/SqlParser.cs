@@ -46,21 +46,29 @@ public sealed class SqlParser
                 return first;
 
             var branches = new List<ILogicalRoot> { first };
+            var unionAll = true;
             while (_cur.Kind == SqlTokenKind.Identifier && LexemeEqualsIgnoreCase(_cur, "UNION"))
             {
                 Advance();
-                if (_cur.Kind != SqlTokenKind.Identifier || !LexemeEqualsIgnoreCase(_cur, "ALL"))
-                    throw new SqlCompileException("Only UNION ALL is supported; DISTINCT UNION is not implemented.");
-                Advance();
+                unionAll = _cur.Kind == SqlTokenKind.Identifier && LexemeEqualsIgnoreCase(_cur, "ALL");
+                if (unionAll)
+                    Advance();
                 branches.Add(ParseOneSelectRoot());
             }
 
-            return new LogicalUnionAll { Branches = branches };
+            return new LogicalUnionAll { Branches = branches, UnionAll = unionAll };
         }
 
         private ILogicalRoot ParseOneSelectRoot()
         {
             Expect(SqlTokenKind.KwSelect, "SELECT");
+            var distinct = false;
+            if (_cur.Kind == SqlTokenKind.Identifier && LexemeEqualsIgnoreCase(_cur, "DISTINCT"))
+            {
+                distinct = true;
+                Advance();
+            }
+
             var selectItems = ParseSelectItems(out var starOnly);
             Expect(SqlTokenKind.KwFrom, "FROM");
             var from = ParseFromClause();
@@ -76,7 +84,9 @@ public sealed class SqlParser
                     if (selectItems.Count == 0)
                         throw new SqlCompileException("GROUP BY requires an explicit SELECT list.");
                     ValidateGroupedSelectJoin(selectItems, groupByCols, jf.Left, jf.Right);
-                    RejectOrderByLimitAfterGrouped();
+                    var joinGbOrder = TryParseOrderBy();
+                    var joinGbLimit = TryParseLimit();
+                    ExpectEnd();
                     return new LogicalInnerJoin
                     {
                         Semantics = jf.Semantics,
@@ -89,6 +99,8 @@ public sealed class SqlParser
                         SelectProjection = null,
                         GroupByColumns = groupByCols,
                         SelectList = selectItems,
+                        OrderBy = joinGbOrder,
+                        Limit = joinGbLimit,
                     };
                 }
 
@@ -175,15 +187,20 @@ public sealed class SqlParser
                     throw new SqlCompileException("GROUP BY requires an explicit SELECT list.");
                 ValidateGroupedSelect(selectItems, groupByColsSingle, table);
                 var havingConjuncts = TryParseHavingClause();
-                RejectOrderByLimitAfterGrouped();
+                var gbOrder = TryParseOrderBy();
+                var gbLimit = TryParseLimit();
+                ExpectEnd();
                 return new LogicalTableScan
                 {
                     TableName = table,
+                    SelectDistinct = distinct,
                     WhereConjuncts = whereConjuncts,
                     SubqueryPredicates = subqueryPreds,
                     GroupByColumns = groupByColsSingle,
                     SelectList = selectItems,
                     HavingConjuncts = havingConjuncts,
+                    OrderBy = gbOrder,
+                    Limit = gbLimit,
                 };
             }
 
@@ -194,6 +211,7 @@ public sealed class SqlParser
                 return new LogicalTableScan
                 {
                     TableName = table,
+                    SelectDistinct = distinct,
                     WhereConjuncts = whereConjuncts,
                     SubqueryPredicates = subqueryPreds,
                     Projection = null,
@@ -209,6 +227,7 @@ public sealed class SqlParser
                 return new LogicalTableScan
                 {
                     TableName = table,
+                    SelectDistinct = distinct,
                     WhereConjuncts = whereConjuncts,
                     SubqueryPredicates = subqueryPreds,
                     Aggregate = new LogicalAggregate { Kind = lone.Kind, ColumnName = lone.ArgumentColumnName },
@@ -222,6 +241,7 @@ public sealed class SqlParser
                 return new LogicalTableScan
                 {
                     TableName = table,
+                    SelectDistinct = distinct,
                     WhereConjuncts = whereConjuncts,
                     SubqueryPredicates = subqueryPreds,
                     SelectList = selectItems,
@@ -329,9 +349,25 @@ public sealed class SqlParser
                 return true;
             }
 
-            if (_cur.Kind == SqlTokenKind.Identifier
-                && (LexemeEqualsIgnoreCase(_cur, "RIGHT") || LexemeEqualsIgnoreCase(_cur, "FULL")))
-                throw new SqlCompileException("Only INNER JOIN and LEFT JOIN are supported.");
+            if (_cur.Kind == SqlTokenKind.Identifier && LexemeEqualsIgnoreCase(_cur, "RIGHT"))
+            {
+                Advance();
+                if (_cur.Kind == SqlTokenKind.Identifier && LexemeEqualsIgnoreCase(_cur, "OUTER"))
+                    Advance();
+                Expect(SqlTokenKind.KwJoin, "JOIN");
+                semantics = LogicalJoinSemantics.RightOuter;
+                return true;
+            }
+
+            if (_cur.Kind == SqlTokenKind.Identifier && LexemeEqualsIgnoreCase(_cur, "FULL"))
+            {
+                Advance();
+                if (_cur.Kind == SqlTokenKind.Identifier && LexemeEqualsIgnoreCase(_cur, "OUTER"))
+                    Advance();
+                Expect(SqlTokenKind.KwJoin, "JOIN");
+                semantics = LogicalJoinSemantics.FullOuter;
+                return true;
+            }
 
             if (_cur.Kind == SqlTokenKind.KwJoin)
             {
@@ -546,11 +582,22 @@ public sealed class SqlParser
 
             Advance();
             var kind = ToAggregateKind(_lexer.Lexeme(saveTok));
+            var isDistinct = false;
+            if (_cur.Kind == SqlTokenKind.Identifier && LexemeEqualsIgnoreCase(_cur, "DISTINCT"))
+            {
+                if (kind != AggregateKind.Count)
+                    throw new SqlCompileException("DISTINCT is only supported with COUNT.");
+                isDistinct = true;
+                Advance();
+            }
+
             string? arg = null;
             string? argQual = null;
             if (_cur.Kind == SqlTokenKind.Star)
             {
                 Advance();
+                if (isDistinct)
+                    throw new SqlCompileException("COUNT(DISTINCT *) is not supported.");
                 if (kind != AggregateKind.Count)
                 {
                     throw new SqlCompileException($"*{kind} is not supported; use COUNT(*) only.");
@@ -579,6 +626,7 @@ public sealed class SqlParser
                 Kind = kind,
                 ArgumentColumnName = arg,
                 ArgumentQualifierTableName = argQual,
+                IsDistinct = isDistinct,
             };
             return true;
         }
@@ -833,19 +881,60 @@ public sealed class SqlParser
                 throw new SqlCompileException("Parameterized predicates on expressions are not supported yet.");
             }
 
-            var lit = ParseLiteral();
-            if (leftExpr is LogicalColumnScalarRef colOnly)
+            if (leftExpr is LogicalColumnScalarRef colOnly
+                && op is ScalarCompareOp.Eq or ScalarCompareOp.Ne
+                && _cur.Kind == SqlTokenKind.Identifier
+                && !IsBooleanLiteralToken(_cur)
+                && TryParseColumnScalarRef(out var rightCol))
             {
                 return new SimpleWhereClause
                 {
                     QualifierTableName = colOnly.QualifierTableName,
                     ColumnName = colOnly.ColumnName,
                     Operator = op,
+                    CompareColumn = rightCol,
+                };
+            }
+
+            var lit = ParseLiteral();
+            if (leftExpr is LogicalColumnScalarRef colLit)
+            {
+                return new SimpleWhereClause
+                {
+                    QualifierTableName = colLit.QualifierTableName,
+                    ColumnName = colLit.ColumnName,
+                    Operator = op,
                     Literal = lit,
                 };
             }
 
             return new SimpleWhereClause { LeftExpression = leftExpr, Operator = op, Literal = lit };
+        }
+
+        private bool IsBooleanLiteralToken(SqlToken token) =>
+            token.Kind == SqlTokenKind.Identifier
+            && (LexemeEqualsIgnoreCase(token, "true") || LexemeEqualsIgnoreCase(token, "false"));
+
+        private bool TryParseColumnScalarRef(out LogicalColumnScalarRef column)
+        {
+            column = null!;
+            if (_cur.Kind != SqlTokenKind.Identifier)
+                return false;
+            var id1 = _lexer.Lexeme(_cur);
+            Advance();
+            if (_cur.Kind == SqlTokenKind.Dot)
+            {
+                Advance();
+                if (_cur.Kind != SqlTokenKind.Identifier)
+                    return false;
+                var id2 = _lexer.Lexeme(_cur);
+                Advance();
+                column = new LogicalColumnScalarRef { QualifierTableName = id1.ToString(), ColumnName = id2.ToString() };
+                return true;
+            }
+
+            column = new LogicalColumnScalarRef { ColumnName = id1.ToString() };
+            return true;
         }
 
         private LogicalSelectListItem ParseSelectListItem()

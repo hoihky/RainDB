@@ -9,7 +9,18 @@ public readonly record struct SubqueryInPhysicalSpec(
     RainDbType ColumnType,
     bool Negated,
     IPhysicalPlan Subquery,
-    int SubqueryResultColumnIndex);
+    int SubqueryResultColumnIndex,
+    CorrelatedEqualityBinding[]? Correlations = null);
 
-/// <summary>Uncorrelated <c>EXISTS</c> / <c>NOT EXISTS</c>.</summary>
-public readonly record struct SubqueryExistsPhysicalSpec(bool Negated, IPhysicalPlan Subquery);
+/// <summary>Equality between one outer column and one inner column (correlated execution).</summary>
+public readonly record struct CorrelatedEqualityBinding(int OuterColumnIndex, int InnerColumnIndex, RainDbType CompareType);
+
+/// <summary><c>EXISTS</c> / <c>NOT EXISTS</c> (uncorrelated or correlated).</summary>
+public sealed class SubqueryExistsPhysicalSpec
+{
+    public required bool Negated { get; init; }
+
+    public required IPhysicalPlan Subquery { get; init; }
+
+    public CorrelatedEqualityBinding[]? Correlations { get; init; }
+}

@@ -15,7 +15,7 @@ public sealed class LogicalUnionAllBinder
     public LogicalUnionAllBinder(LogicalPlanCompiler compiler) =>
         _compiler = compiler ?? throw new ArgumentNullException(nameof(compiler));
 
-    public UnionAllPhysicalPlan BindAndLower(
+    public IPhysicalPlan BindAndLower(
         LogicalUnionAll union,
         ICatalog catalog,
         VectorizedScanExecutionOptions scanOptions = default,
@@ -39,6 +39,10 @@ public sealed class LogicalUnionAllBinder
             inputs[i] = physical;
         }
 
-        return new UnionAllPhysicalPlan(inputs, schema!);
+        var concat = new UnionAllPhysicalPlan(inputs, schema!);
+        if (union.UnionAll)
+            return concat;
+
+        return new DistinctPhysicalPlan(concat, schema!);
     }
 }

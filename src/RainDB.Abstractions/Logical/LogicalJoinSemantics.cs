@@ -5,4 +5,6 @@ public enum LogicalJoinSemantics
 {
     Inner,
     LeftOuter,
+    RightOuter,
+    FullOuter,
 }

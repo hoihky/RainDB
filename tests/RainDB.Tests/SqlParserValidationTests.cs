@@ -1,3 +1,4 @@
+using RainDB.Logical;
 using RainDB.Sql;
 
 namespace RainDB.Tests;
@@ -37,11 +38,11 @@ public class SqlParserValidationTests
     }
 
     [Fact]
-    public void Right_join_is_rejected()
+    public void Right_join_parses()
     {
-        Assert.Throws<SqlCompileException>(() =>
-            StrictSqlSubset.ParseLogicalPlan(
-                "SELECT * FROM a RIGHT JOIN b ON a.id = b.id"));
+        var plan = StrictSqlSubset.ParseLogicalPlan("SELECT * FROM a RIGHT JOIN b ON a.id = b.id");
+        var join = Assert.IsType<LogicalInnerJoin>(plan.Root);
+        Assert.Equal(LogicalJoinSemantics.RightOuter, join.Semantics);
     }
 
     [Fact]

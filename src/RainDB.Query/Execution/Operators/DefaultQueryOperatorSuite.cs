@@ -48,6 +48,7 @@ public sealed class DefaultQueryOperatorSuite : IQueryOperatorSuite
         Scan = scan ?? new VectorizedScanOperator(deps);
         SortTopN = sortTopN ?? new SortTopNOperator(joinOperator, deps);
         GroupedJoin = groupedJoin ?? new GroupedJoinOperator(joinOperator, hashGrouping);
+        Distinct = new DistinctOperator();
     }
 
     internal QueryOperatorDependencies Dependencies { get; }
@@ -61,4 +62,6 @@ public sealed class DefaultQueryOperatorSuite : IQueryOperatorSuite
     public ISortTopNOperator SortTopN { get; }
 
     public IGroupedJoinOperator GroupedJoin { get; }
+
+    public IDistinctOperator Distinct { get; }
 }

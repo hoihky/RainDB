@@ -95,10 +95,10 @@ public class SqlOrderByLimitTests
     }
 
     [Fact]
-    public void Group_by_with_order_by_throws_at_parse()
+    public void Group_by_with_order_by_parses()
     {
-        var ex = Assert.Throws<SqlCompileException>(() =>
-            StrictSqlSubset.ParseLogicalPlan("SELECT k, SUM(v) FROM m GROUP BY k ORDER BY k"));
-        Assert.Contains("ORDER BY", ex.Message, StringComparison.OrdinalIgnoreCase);
+        var plan = StrictSqlSubset.ParseLogicalPlan("SELECT k, SUM(v) FROM m GROUP BY k ORDER BY k");
+        var scan = Assert.IsType<LogicalTableScan>(plan.Root);
+        Assert.NotNull(scan.OrderBy);
     }
 }

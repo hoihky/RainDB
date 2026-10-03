@@ -35,4 +35,7 @@ public sealed class LogicalAggregationCall : LogicalSelectListItem
 
     /// <summary>Target column for <c>SUM</c>/<c>MIN</c>/<c>MAX</c>/<c>COUNT(col)</c>; <see langword="null"/> for <c>COUNT(*)</c>.</summary>
     public string? ArgumentColumnName { get; init; }
+
+    /// <summary><c>COUNT(DISTINCT …)</c> and similar (only <c>COUNT</c> supported today).</summary>
+    public bool IsDistinct { get; init; }
 }

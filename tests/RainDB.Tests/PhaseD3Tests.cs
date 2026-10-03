@@ -98,10 +98,11 @@ public class PhaseD3Tests
     }
 
     [Fact]
-    public void Union_without_all_is_rejected()
+    public void Union_distinct_parses_without_all_keyword()
     {
-        Assert.Throws<SqlCompileException>(() =>
-            StrictSqlSubset.ParseLogicalPlan("SELECT x FROM a UNION SELECT x FROM b"));
+        var plan = StrictSqlSubset.ParseLogicalPlan("SELECT x FROM a UNION SELECT x FROM b");
+        var union = Assert.IsType<LogicalUnionAll>(plan.Root);
+        Assert.False(union.UnionAll);
     }
 
     [Fact]

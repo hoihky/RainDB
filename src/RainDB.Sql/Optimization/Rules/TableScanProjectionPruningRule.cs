@@ -26,6 +26,8 @@ internal sealed class TableScanProjectionPruningRule : ILogicalRewriteRule
         {
             foreach (var k in ob)
             {
+                if (k.Column is null)
+                    continue;
                 if (k.Column.QualifierTableName is not null
                     && !k.Column.QualifierTableName.Equals(scan.TableName, StringComparison.OrdinalIgnoreCase))
                     continue;

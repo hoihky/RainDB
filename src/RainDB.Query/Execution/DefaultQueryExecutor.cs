@@ -68,6 +68,12 @@ public sealed class DefaultQueryExecutor : IQueryExecutor
         if (plan is DerivedTableScanPhysicalPlan derived)
             return await ExecuteDerivedTableAsync(derived, context).ConfigureAwait(false);
 
+        if (plan is DistinctPhysicalPlan distinct)
+            return await _operators.Distinct.ExecuteAsync(distinct, this, context).ConfigureAwait(false);
+
+        if (plan is GroupedSortTopNPhysicalPlan groupedSort)
+            return await ExecuteGroupedSortTopNAsync(groupedSort, context).ConfigureAwait(false);
+
         if (plan is UnionAllPhysicalPlan union)
         {
             var batches = new List<IColumnarBatch>();
@@ -118,6 +124,32 @@ public sealed class DefaultQueryExecutor : IQueryExecutor
             }
             : throw new InvalidOperationException("Derived table execution requires RainDbExecutionContext.");
         return await ExecuteAsync(plan.OuterPlan, scoped).ConfigureAwait(false);
+    }
+
+    private async ValueTask<IQueryResult> ExecuteGroupedSortTopNAsync(
+        GroupedSortTopNPhysicalPlan plan,
+        IExecutionContext context)
+    {
+        var aggRes = await ExecuteAsync(plan.Aggregate, context).ConfigureAwait(false);
+        if (aggRes is not IColumnarQueryResult col)
+            throw new InvalidOperationException("Grouped sort input must be columnar.");
+        var batchList = new List<IColumnarBatch>();
+        foreach (var b in col.Batches)
+            batchList.Add(b);
+        var ephemeralId = new TableId(Guid.NewGuid());
+        var ephemeral = new EphemeralColumnarTableSource(ephemeralId, "grouped", plan.OutputSchema, batchList);
+        if (context is not RainDbExecutionContext rc)
+            throw new InvalidOperationException("Grouped sort requires RainDbExecutionContext.");
+        var overlay = new OverlayCatalog(context.Catalog, [ephemeral]);
+        var scoped = new RainDbExecutionContext(overlay, rc.BufferPool, rc.AlignedBufferPool, rc.SpillWriter, rc.CancellationToken, rc.MappedBatchScanObserver)
+        {
+            NestedExecutor = rc.NestedExecutor ?? this,
+        };
+        var outIx = new int[plan.OutputSchema.Columns.Count];
+        for (var i = 0; i < outIx.Length; i++)
+            outIx[i] = i;
+        var sortPlan = new SortTopNPhysicalPlan(ephemeralId, outIx, null, plan.SortKeys, plan.Limit, plan.Options);
+        return await _operators.SortTopN.ExecuteTableAsync(sortPlan, ephemeral, scoped).ConfigureAwait(false);
     }
 
     private static IColumnarTableSource RequireColumnarTable(IExecutionContext context, TableId tableId)

@@ -256,7 +256,7 @@ public sealed class HashAggregateOperator : Operators.IHashAggregateOperator, Op
     {
         switch (kind)
         {
-            case AggregateKind.Count:
+            case AggregateKind.Count or AggregateKind.CountDistinct:
                 return;
             case AggregateKind.Sum when columnType is RainDbType.Int32 or RainDbType.Int64 or RainDbType.Float64:
                 return;
@@ -312,6 +312,8 @@ public sealed class HashAggregateOperator : Operators.IHashAggregateOperator, Op
                         var spec = specs[a];
                         if (spec.Kind == AggregateKind.Count && spec.SourceColumnIndex < 0)
                             AggregateRowOps.AddCountStar(ref slot);
+                        else if (spec.Kind == AggregateKind.CountDistinct)
+                            AggregateRowOps.AddCountDistinctInt32(ref slot, _deps.Selection, batch.Columns[spec.SourceColumnIndex], row);
                         else if (spec.Kind == AggregateKind.Count)
                             AggregateRowOps.AddCountColumn(ref slot, _deps.Selection, batch.Columns[spec.SourceColumnIndex], row);
                         else
@@ -509,7 +511,7 @@ public sealed class HashAggregateOperator : Operators.IHashAggregateOperator, Op
             AggregateKind.Sum => acc.ContributingRows == 0,
             AggregateKind.Min => !acc.HasMin,
             AggregateKind.Max => !acc.HasMax,
-            AggregateKind.Count => false,
+            AggregateKind.Count or AggregateKind.CountDistinct => false,
             _ => false,
         };
     }
@@ -520,7 +522,8 @@ public sealed class HashAggregateOperator : Operators.IHashAggregateOperator, Op
         switch (spec.Kind)
         {
             case AggregateKind.Count:
-                BinaryPrimitives.WriteInt64LittleEndian(dest, acc.Count);
+            case AggregateKind.CountDistinct:
+                BinaryPrimitives.WriteInt64LittleEndian(dest, acc.DistinctInt32?.Count ?? acc.Count);
                 break;
             case AggregateKind.Sum when srcType == RainDbType.Float64:
                 BinaryPrimitives.WriteInt64LittleEndian(dest, BitConverter.DoubleToInt64Bits(acc.FloatSum));
@@ -554,7 +557,7 @@ public sealed class HashAggregateOperator : Operators.IHashAggregateOperator, Op
     private static RainDbType AggregateResultType(AggregateSpec spec, TableSchema schema) =>
         spec.Kind switch
         {
-            AggregateKind.Count => RainDbType.Int64,
+            AggregateKind.Count or AggregateKind.CountDistinct => RainDbType.Int64,
             AggregateKind.Sum when spec.SourceColumnIndex >= 0 && schema.Columns[spec.SourceColumnIndex].Type == RainDbType.Float64 => RainDbType.Float64,
             AggregateKind.Sum => RainDbType.Int64,
             AggregateKind.Min or AggregateKind.Max when spec.SourceColumnIndex >= 0 => schema.Columns[spec.SourceColumnIndex].Type,
@@ -920,6 +923,8 @@ internal struct AggregateAccumulator
 {
     public long ContributingRows;
     public long Count;
+
+    public HashSet<int>? DistinctInt32;
     public double FloatSum;
     public double FloatMin;
     public double FloatMax;
@@ -938,6 +943,22 @@ internal struct AggregateAccumulator
 internal static class AggregateRowOps
 {
     public static void AddCountStar(ref AggregateAccumulator acc) => acc.Count++;
+
+    public static void AddCountDistinctInt32(
+        ref AggregateAccumulator acc,
+        SelectionEvaluator selection,
+        IColumnChunk col,
+        int row)
+    {
+        if (col.PhysicalType != RainDbType.Int32)
+            throw new NotSupportedException("COUNT(DISTINCT) supports Int32 columns in this release.");
+        var nb = col.HasNulls ? col.NullBitmap.Span : ReadOnlySpan<byte>.Empty;
+        if (selection.IsNull(nb, row, col.HasNulls))
+            return;
+        acc.DistinctInt32 ??= new HashSet<int>();
+        var v = BinaryPrimitives.ReadInt32LittleEndian(col.Values.Span.Slice(row * sizeof(int), sizeof(int)));
+        acc.DistinctInt32.Add(v);
+    }
 
     public static void AddCountColumn(
         ref AggregateAccumulator acc,
@@ -1104,10 +1125,21 @@ internal static class AggregateRowOps
         }
     }
 
+    private static AggregateAccumulator CombineDistinct(AggregateAccumulator a, AggregateAccumulator b)
+    {
+        if (a.DistinctInt32 is null)
+            return b;
+        if (b.DistinctInt32 is null)
+            return a;
+        a.DistinctInt32.UnionWith(b.DistinctInt32);
+        return a;
+    }
+
     public static AggregateAccumulator Combine(AggregateAccumulator a, AggregateAccumulator b, AggregateKind kind) =>
         kind switch
         {
             AggregateKind.Count => new AggregateAccumulator { Count = a.Count + b.Count },
+            AggregateKind.CountDistinct => CombineDistinct(a, b),
             AggregateKind.Sum => new AggregateAccumulator
             {
                 ContributingRows = a.ContributingRows + b.ContributingRows,

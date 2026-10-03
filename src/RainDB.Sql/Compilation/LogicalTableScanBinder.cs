@@ -38,7 +38,7 @@ public sealed class LogicalTableScanBinder
         var schema = ts.Schema;
 
         if (scan.GroupByColumns is { Count: > 0 })
-            return BindHashAggregate(scan, colTable, schema, scanOptions);
+            return BindHashAggregate(scan, colTable, schema, catalog, scanOptions);
 
         return BindVectorizedScan(scan, colTable.Id, schema, scan.TableName, catalog, scanOptions, joinAlgorithm);
     }
@@ -64,10 +64,11 @@ public sealed class LogicalTableScanBinder
         return BindVectorizedScan(pseudo, ephemeralTableId, derivedSchema, scan.Alias, catalog, scanOptions, joinAlgorithm);
     }
 
-    private HashAggregatePhysicalPlan BindHashAggregate(
+    private IPhysicalPlan BindHashAggregate(
         LogicalTableScan scan,
         IColumnarTableSource colTable,
         TableSchema schema,
+        ICatalog catalog,
         VectorizedScanExecutionOptions scanOptions)
     {
         if (scan.SelectList is not { Count: > 0 })
@@ -113,7 +114,98 @@ public sealed class LogicalTableScanBinder
         ValidateWhereTableQualifiers(scan.WhereConjuncts, scan.TableName);
         var filters = BuildColumnCompareFilters(scan.WhereConjuncts, schema, scan.TableName);
         var having = _havingBinder.Bind(scan.HavingConjuncts, scan.SelectList!, scan.GroupByColumns!, schema, scan.TableName, aggs.ToArray());
-        return new HashAggregatePhysicalPlan(colTable.Id, groupIndices, aggs.ToArray(), slots.ToArray(), filters, having, scanOptions);
+        var aggPlan = new HashAggregatePhysicalPlan(colTable.Id, groupIndices, aggs.ToArray(), slots.ToArray(), filters, having, scanOptions);
+        if (scan.OrderBy is not { Count: > 0 } && scan.Limit is null)
+            return MaybeWrapDistinct(scan, aggPlan, catalog);
+
+        var sortSpecs = BuildGroupedSortSpecs(scan.OrderBy ?? [], scan.SelectList!, scan.GroupByColumns!, schema, scan.TableName, slots, aggs);
+        var outSchema = InferGroupedOutputSchema(schema, scan.GroupByColumns!, slots, aggs);
+        return MaybeWrapDistinct(
+            scan,
+            new GroupedSortTopNPhysicalPlan(aggPlan, outSchema, sortSpecs, scan.Limit, scanOptions),
+            catalog);
+    }
+
+    private static TableSchema InferGroupedOutputSchema(
+        TableSchema input,
+        IReadOnlyList<LogicalColumnProjection> groupBy,
+        List<HashAggregateOutputSlot> slots,
+        List<AggregateSpec> aggs)
+    {
+        var cols = new List<ColumnDef>(slots.Count);
+        foreach (var slot in slots)
+        {
+            switch (slot.Kind)
+            {
+                case HashAggregateOutputColumnKind.GroupKey:
+                    var gi = groupBy[slot.Ordinal];
+                    var ix = -1;
+                    for (var ci = 0; ci < input.Columns.Count; ci++)
+                    {
+                        if (input.Columns[ci].Name.Equals(gi.ColumnName, StringComparison.OrdinalIgnoreCase))
+                        {
+                            ix = ci;
+                            break;
+                        }
+                    }
+
+                    cols.Add(ix >= 0 ? input.Columns[ix] : new ColumnDef(gi.ColumnName, RainDbType.Int32));
+                    break;
+                case HashAggregateOutputColumnKind.Aggregate:
+                    var spec = aggs[slot.Ordinal];
+                    var src = spec.SourceColumnIndex >= 0 ? input.Columns[spec.SourceColumnIndex].Type : RainDbType.Int64;
+                    cols.Add(new ColumnDef($"agg{slot.Ordinal}", AggregateTypeRules.ResultType(spec.Kind, src)));
+                    break;
+            }
+        }
+
+        return new TableSchema(cols);
+    }
+
+    private SortKeyPhysicalSpec[] BuildGroupedSortSpecs(
+        IReadOnlyList<LogicalSortKey> orderBy,
+        IReadOnlyList<LogicalSelectListItem> selectList,
+        IReadOnlyList<LogicalColumnProjection> groupBy,
+        TableSchema inputSchema,
+        string tableName,
+        List<HashAggregateOutputSlot> slots,
+        List<AggregateSpec> aggs)
+    {
+        var arr = new SortKeyPhysicalSpec[orderBy.Count];
+        for (var i = 0; i < orderBy.Count; i++)
+        {
+            var k = orderBy[i];
+            if (k.SortExpression is not null)
+                throw new SqlCompileException("ORDER BY expression is not supported with GROUP BY yet.");
+            if (k.Column is null)
+                throw new SqlCompileException("ORDER BY requires a column reference.");
+            var outIx = ResolveGroupedOutputColumnIndex(k.Column, selectList, groupBy, tableName, slots, aggs);
+            arr[i] = new SortKeyPhysicalSpec(outIx, k.Descending);
+        }
+
+        return arr;
+    }
+
+    private static int ResolveGroupedOutputColumnIndex(
+        LogicalColumnProjection key,
+        IReadOnlyList<LogicalSelectListItem> selectList,
+        IReadOnlyList<LogicalColumnProjection> groupBy,
+        string tableName,
+        List<HashAggregateOutputSlot> slots,
+        List<AggregateSpec> aggs)
+    {
+        for (var i = 0; i < selectList.Count; i++)
+        {
+            if (selectList[i] is LogicalColumnProjection col
+                && string.Equals(col.ColumnName, key.ColumnName, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(col.QualifierTableName ?? tableName, key.QualifierTableName ?? tableName, StringComparison.OrdinalIgnoreCase))
+                return i;
+            if (selectList[i] is LogicalAggregationCall agg
+                && key.ColumnName.Equals(agg.ArgumentColumnName ?? "*", StringComparison.OrdinalIgnoreCase))
+                return i;
+        }
+
+        throw new SqlCompileException($"ORDER BY column '{key.ColumnName}' must appear in the SELECT list.");
     }
 
     private static string NormalizeGroupKey(LogicalColumnProjection p, string scanTable) =>
@@ -128,6 +220,15 @@ public sealed class LogicalTableScanBinder
         {
             throw new SqlCompileException(
                 $"Aggregate argument references table '{aq}' but the FROM clause scans '{tableName}' only.");
+        }
+
+        if (agg.IsDistinct)
+        {
+            if (agg.Kind != AggregateKind.Count || agg.ArgumentColumnName is null)
+                throw new SqlCompileException("DISTINCT is only supported with COUNT(column).");
+            var di = ResolveColumn(schema, agg.ArgumentColumnName, tableName);
+            AggregateTypeRules.EnsureSupported(schema.Columns[di].Type, AggregateKind.CountDistinct);
+            return new AggregateSpec(di, AggregateKind.CountDistinct);
         }
 
         switch (agg.Kind)
@@ -219,17 +320,29 @@ public sealed class LogicalTableScanBinder
         var scanPlan = new VectorizedScanPhysicalPlan(tableId, outputColumns, filters, aggregate, scanOptions, inSub, existsSub);
         if (scan.Aggregate is not null)
             return scanPlan;
-        if (scan.OrderBy is not { Count: > 0 } && scan.Limit is null)
-            return scanPlan;
 
-        var sortSpecs = scan.OrderBy is { Count: > 0 } ob
-            ? BuildTableSortKeySpecs(schema, tableName, ob)
-            : Array.Empty<SortKeyPhysicalSpec>();
-        var sortOutputIndices = Array.ConvertAll(outputColumns, static c =>
-            c.Int32Expression is null && c.Float64Expression is null ? c.ColumnIndex : -1);
-        if (sortOutputIndices.Any(static i => i < 0))
-            throw new SqlCompileException("ORDER BY / LIMIT with computed SELECT expressions is not supported yet.");
-        return new SortTopNPhysicalPlan(tableId, sortOutputIndices, filters, sortSpecs, scan.Limit, scanOptions, inSub, existsSub);
+        IPhysicalPlan result = scanPlan;
+        if (scan.OrderBy is { Count: > 0 } || scan.Limit is not null)
+        {
+            var sortSpecs = scan.OrderBy is { Count: > 0 } ob
+                ? BuildTableSortKeySpecs(schema, tableName, ob)
+                : Array.Empty<SortKeyPhysicalSpec>();
+            var sortOutputIndices = Array.ConvertAll(outputColumns, static c =>
+                c.Int32Expression is null && c.Float64Expression is null ? c.ColumnIndex : -1);
+            if (sortOutputIndices.Any(static i => i < 0))
+                throw new SqlCompileException("ORDER BY / LIMIT with computed SELECT expressions is not supported yet.");
+            result = new SortTopNPhysicalPlan(tableId, sortOutputIndices, filters, sortSpecs, scan.Limit, scanOptions, inSub, existsSub);
+        }
+
+        return MaybeWrapDistinct(scan, result, catalog);
+    }
+
+    private static IPhysicalPlan MaybeWrapDistinct(LogicalTableScan scan, IPhysicalPlan plan, ICatalog catalog)
+    {
+        if (!scan.SelectDistinct)
+            return plan;
+        var schema = PhysicalPlanOutputSchema.Resolve(plan, catalog);
+        return new DistinctPhysicalPlan(plan, schema);
     }
 
     private ScanOutputColumn[] BindScanOutputColumns(

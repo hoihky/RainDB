@@ -16,24 +16,43 @@ internal static class SubqueryFilterResolver
             return ResolvedSubqueryFilters.Empty;
 
         ColumnInSetFilter[]? inResolved = null;
+        SubqueryInPhysicalSpec[]? correlatedIn = null;
         if (inFilters is { Length: > 0 })
         {
-            inResolved = new ColumnInSetFilter[inFilters.Length];
+            var resolved = new List<ColumnInSetFilter>();
+            var corrIn = new List<SubqueryInPhysicalSpec>();
             for (var i = 0; i < inFilters.Length; i++)
             {
                 var spec = inFilters[i];
+                if (spec.Correlations is { Length: > 0 })
+                {
+                    corrIn.Add(spec);
+                    continue;
+                }
+
                 var result = await executor.ExecuteAsync(spec.Subquery, context).ConfigureAwait(false);
                 if (result is not IColumnarQueryResult col)
                     throw new InvalidOperationException("IN subquery must return a columnar row set.");
                 var set = ScalarValueSet.FromSingleColumn(col, spec.SubqueryResultColumnIndex, spec.ColumnType);
-                inResolved[i] = new ColumnInSetFilter(spec.ColumnIndex, spec.Negated, set);
+                resolved.Add(new ColumnInSetFilter(spec.ColumnIndex, spec.Negated, set));
             }
+
+            inResolved = resolved.Count > 0 ? resolved.ToArray() : null;
+            correlatedIn = corrIn.Count > 0 ? corrIn.ToArray() : null;
         }
 
+        SubqueryExistsPhysicalSpec[]? correlatedExists = null;
         if (existsFilters is { Length: > 0 })
         {
+            var corr = new List<SubqueryExistsPhysicalSpec>();
             foreach (var ex in existsFilters)
             {
+                if (ex.Correlations is { Length: > 0 })
+                {
+                    corr.Add(ex);
+                    continue;
+                }
+
                 var result = await executor.ExecuteAsync(ex.Subquery, context).ConfigureAwait(false);
                 var any = result is IColumnarQueryResult c && c.RowCount > 0;
                 if (ex.Negated)
@@ -41,9 +60,11 @@ internal static class SubqueryFilterResolver
                 if (!any)
                     return ResolvedSubqueryFilters.AllDenied;
             }
+
+            correlatedExists = corr.Count > 0 ? corr.ToArray() : null;
         }
 
-        return new ResolvedSubqueryFilters(inResolved);
+        return new ResolvedSubqueryFilters(inResolved, correlatedExists, correlatedIn);
     }
 
     internal static async ValueTask<ResolvedJoinSubqueryFilters> ResolveJoinAsync(
@@ -68,6 +89,8 @@ internal static class SubqueryFilterResolver
         {
             foreach (var ex in existsFilters)
             {
+                if (ex.Correlations is { Length: > 0 })
+                    throw new NotSupportedException("Correlated EXISTS is not supported on join queries yet.");
                 var result = await executor.ExecuteAsync(ex.Subquery, context).ConfigureAwait(false);
                 var any = result is IColumnarQueryResult c && c.RowCount > 0;
                 if (ex.Negated)
@@ -124,13 +147,23 @@ internal sealed class ResolvedSubqueryFilters
     public static readonly ResolvedSubqueryFilters Empty = new(null);
     public static readonly ResolvedSubqueryFilters AllDenied = new(null, denyAll: true);
 
-    public ResolvedSubqueryFilters(ColumnInSetFilter[]? inFilters, bool denyAll = false)
+    public ResolvedSubqueryFilters(
+        ColumnInSetFilter[]? inFilters,
+        SubqueryExistsPhysicalSpec[]? correlatedExists = null,
+        SubqueryInPhysicalSpec[]? correlatedIn = null,
+        bool denyAll = false)
     {
         InFilters = inFilters;
+        CorrelatedExists = correlatedExists;
+        CorrelatedIn = correlatedIn;
         IsDenyAll = denyAll;
     }
 
     public ColumnInSetFilter[]? InFilters { get; }
+
+    public SubqueryExistsPhysicalSpec[]? CorrelatedExists { get; }
+
+    public SubqueryInPhysicalSpec[]? CorrelatedIn { get; }
 
     public bool IsDenyAll { get; }
 }

@@ -18,6 +18,7 @@ internal sealed class LogicalPlanCloner
             LogicalUnionAll u => new LogicalUnionAll
             {
                 Branches = u.Branches.Select(CloneRoot).ToArray(),
+                UnionAll = u.UnionAll,
             },
             LogicalDerivedTableScan d => new LogicalDerivedTableScan
             {
@@ -40,6 +41,7 @@ internal sealed class LogicalPlanCloner
         new()
         {
             TableName = s.TableName,
+            SelectDistinct = s.SelectDistinct,
             Projection = projectionOverride ?? CloneProjectionList(s.Projection),
             GroupByColumns = CloneProjectionList(s.GroupByColumns),
             SelectList = CloneSelectList(s.SelectList),
@@ -85,6 +87,13 @@ internal sealed class LogicalPlanCloner
             Operator = w.Operator,
             Literal = w.Literal is { } lit ? new SqlLiteral(lit.Kind, lit.Text) : null,
             ParameterName = w.ParameterName,
+            CompareColumn = w.CompareColumn is { } cc
+                ? new LogicalColumnScalarRef
+                {
+                    QualifierTableName = cc.QualifierTableName,
+                    ColumnName = cc.ColumnName,
+                }
+                : null,
         };
 
     private static IReadOnlyList<LogicalQualifiedColumn>? CloneQualifiedColumns(IReadOnlyList<LogicalQualifiedColumn> cols)
@@ -168,6 +177,7 @@ internal sealed class LogicalPlanCloner
                 LogicalAggregationCall a => new LogicalAggregationCall
                 {
                     Kind = a.Kind,
+                    IsDistinct = a.IsDistinct,
                     ArgumentColumnName = a.ArgumentColumnName,
                     ArgumentQualifierTableName = a.ArgumentQualifierTableName,
                 },

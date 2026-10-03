@@ -17,7 +17,7 @@ public static class AggregateTypeRules
     public static bool IsSupported(RainDbType columnType, AggregateKind kind) =>
         kind switch
         {
-            AggregateKind.Count => true,
+            AggregateKind.Count or AggregateKind.CountDistinct => true,
             AggregateKind.Sum => columnType is RainDbType.Int32 or RainDbType.Int64 or RainDbType.Float64,
             AggregateKind.Min or AggregateKind.Max => columnType is RainDbType.Int32 or RainDbType.Int64 or RainDbType.Float64 or RainDbType.Utf8,
             _ => false,
@@ -26,7 +26,7 @@ public static class AggregateTypeRules
     public static RainDbType ResultType(AggregateKind kind, RainDbType sourceType) =>
         kind switch
         {
-            AggregateKind.Count => RainDbType.Int64,
+            AggregateKind.Count or AggregateKind.CountDistinct => RainDbType.Int64,
             AggregateKind.Sum when sourceType == RainDbType.Float64 => RainDbType.Float64,
             AggregateKind.Sum => RainDbType.Int64,
             AggregateKind.Min or AggregateKind.Max => sourceType,

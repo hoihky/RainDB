@@ -116,7 +116,7 @@ Example scripts (run against `TestDataBuilders.RegisterAnalyticsDemoTables` or `
 | `samples/sql/12_left_join.sql` | `LEFT JOIN` null-padding |
 | `samples/sql/13_union_all.sql` | `UNION ALL` between compatible SELECTs |
 
-Only `INNER JOIN` and `LEFT JOIN` are supported for joins; `UNION` without `ALL` is rejected. `LEFT JOIN` with `GROUP BY` is not supported yet.
+`INNER JOIN`, `LEFT JOIN`, `RIGHT JOIN` (compiled as a swapped `LEFT JOIN`), and `FULL OUTER JOIN` are supported for equi-joins. `UNION` (distinct) deduplicates row signatures after `UNION ALL`. `LEFT JOIN` with `GROUP BY` is not supported yet.
 
 ### 2.2.4 Uncorrelated subqueries (Phase D4)
 
@@ -125,7 +125,17 @@ Only `INNER JOIN` and `LEFT JOIN` are supported for joins; `UNION` without `ALL`
 | `samples/sql/14_subquery_in_exists.sql` | `IN` and `EXISTS` in `WHERE` |
 | `samples/sql/15_derived_table.sql` | Derived table in `FROM` |
 
-Supported: uncorrelated `IN` / `NOT IN` / `EXISTS` / `NOT EXISTS` on single-table scans and join `WHERE` (probe/build side from qualified or unambiguous `IN` columns); `FROM (SELECT …) alias` with outer `WHERE`, `ORDER BY`, and `LIMIT`. The `IN` subquery must return exactly one column. Correlated subqueries (inner query references an outer table) are rejected.
+Supported: uncorrelated `IN` / `NOT IN` / `EXISTS` / `NOT EXISTS` on single-table scans and join `WHERE` (probe/build side from qualified or unambiguous `IN` columns); `FROM (SELECT …) alias` with outer `WHERE`, `ORDER BY`, and `LIMIT`. The `IN` subquery must return exactly one column.
+
+### 2.2.5 Correlated subqueries and DISTINCT analytics (Phase D5)
+
+| File | Topic |
+|------|--------|
+| `samples/sql/16_d5_analytics.sql` | Correlated `EXISTS` |
+| `samples/sql/17_union_distinct.sql` | `UNION` (dedup) |
+| `samples/sql/18_full_outer_join.sql` | `FULL OUTER JOIN` |
+
+Supported on **single-table** outer queries: correlated `EXISTS` / `NOT EXISTS` and `IN` / `NOT IN` when the inner `WHERE` contains one or more equalities of the form `outer.col = inner.col` (qualified table names). The engine rewrites those predicates into per-outer-row nested scans. `SELECT DISTINCT`, `COUNT(DISTINCT …)` in grouped queries, `GROUP BY … ORDER BY … LIMIT …`, and `UNION` (without `ALL`) are supported. Correlated subqueries inside join `WHERE` are still rejected at compile time.
 
 ### 2.3 Custom catalog
 

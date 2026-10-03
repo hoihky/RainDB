@@ -8,6 +8,9 @@ public sealed class LogicalTableScan : ILogicalRoot
 {
     public required string TableName { get; init; }
 
+    /// <summary><c>SELECT DISTINCT</c> — deduplicate output rows after projection.</summary>
+    public bool SelectDistinct { get; init; }
+
     /// <summary>
     /// Explicit column projection for non-aggregate queries; <see langword="null"/> means <c>SELECT *</c>.
     /// </summary>

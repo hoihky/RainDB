@@ -101,6 +101,13 @@ internal sealed class JoinBatchMaterializer
         for (var o = 0; o < n; o++)
         {
             var m = matches[o];
+            if (useProbeSide && !m.HasLeft)
+            {
+                anyNull = true;
+                SetNullBit(outNb.AsSpan(), o);
+                continue;
+            }
+
             if (!useProbeSide && !m.HasRight)
             {
                 anyNull = true;
@@ -147,14 +154,22 @@ internal sealed class JoinBatchMaterializer
         var blob = new List<byte>(Math.Max(0, n * 4));
         var anyNull = false;
         byte[]? nbBuf = null;
-        var outerBuildNulls = !useProbeSide && OuterBuildNullPresent(matches);
-        if (Utf8ColumnMayHaveNulls(batches, colIndex, matches, useProbeSide) || outerBuildNulls)
+        var outerNullPadding = useProbeSide ? OuterProbeNullPresent(matches) : OuterBuildNullPresent(matches);
+        if (Utf8ColumnMayHaveNulls(batches, colIndex, matches, useProbeSide) || outerNullPadding)
             nbBuf = new byte[ColumnTypeSizes.NullBitmapBytes(n)];
 
         for (var o = 0; o < n; o++)
         {
             offsets[o] = blob.Count;
             var m = matches[o];
+            if (useProbeSide && !m.HasLeft)
+            {
+                anyNull = true;
+                if (nbBuf != null)
+                    SetNullBit(nbBuf.AsSpan(), o);
+                continue;
+            }
+
             if (!useProbeSide && !m.HasRight)
             {
                 anyNull = true;
@@ -195,6 +210,17 @@ internal sealed class JoinBatchMaterializer
         return false;
     }
 
+    private static bool OuterProbeNullPresent(IReadOnlyList<JoinRowMatch> matches)
+    {
+        for (var i = 0; i < matches.Count; i++)
+        {
+            if (!matches[i].HasLeft)
+                return true;
+        }
+
+        return false;
+    }
+
     private static bool Utf8ColumnMayHaveNulls(
         IReadOnlyList<IColumnarBatch> batches,
         int colIndex,
@@ -204,6 +230,8 @@ internal sealed class JoinBatchMaterializer
         for (var i = 0; i < matches.Count; i++)
         {
             var m = matches[i];
+            if (useProbeSide && !m.HasLeft)
+                continue;
             if (!useProbeSide && !m.HasRight)
                 continue;
             var bi = useProbeSide ? m.LeftBatchIdx : m.RightBatchIdx;
