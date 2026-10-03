@@ -49,8 +49,10 @@ This document tracks what RainDB implements today and the original phased delive
 
 ## Phase 2b — Durable catalog snapshot (MVP implemented)
 
-10. **Directory-backed database** — `RainDbFileDatabase.Open(directory)` loads **`catalog.json`** + batch files into **`MemoryTable`** instances wired with **`IRainDbBatchPersistence`**; each **`AppendBatch`** persists **`######.batch`** (not a WAL: crash between catalog write and batch write can leave inconsistency until we add journaling).
-11. **Save / load in-memory** — `RainDbFileDatabase.ExportCatalog(catalog, dir)` writes a full snapshot from any **`IColumnarTableSource`** tables; `ImportCatalog(dir)` rebuilds **`InMemoryCatalog`** without auto-persist. **`FlushCatalog()`** rewrites **`catalog.json`** for **`MemoryTable`** entries only (other **`ITableSource`** implementations are skipped until typed export is extended).
+10. **Directory-backed database** — `RainDbFileDatabase.Open(directory)` loads committed **`catalog.json`** (ignores **`catalog.json.tmp`**) and **`######.batch`** files (skips **`*.batch.tmp`**) into **`MemoryTable`** instances wired with **`IRainDbBatchPersistence`**. Hydration prefers **`RainDbBatchMmapReader`** (fixed-width columns mapped without copying value buffers; UTF-8 columns still copy payloads). **`RainDbFileDatabaseOptions.PreferMmapBatchHydration`** toggles mmap vs decode.
+11. **Save / load in-memory** — `RainDbFileDatabase.ExportCatalog(catalog, dir)` writes a full snapshot from any **`IColumnarTableSource`** tables; `ImportCatalog(dir)` rebuilds **`InMemoryCatalog`** without auto-persist. **`RainDbAtomicFileWriter`** centralizes replace-on-write for catalog and batches. After each durable batch append, **`FlushCatalog()`** rewrites **`catalog.json`** (batch-first, then catalog; incomplete tmp files are ignored on open). Not a WAL — see Roadmap Phase F for journaling.
+12. **Mmap memory budget (Phase C2)** — **`RainDbMappedBatchMemoryManager`** tracks resident mmap bytes; **`RainDbFileDatabaseOptions.MappedBatchMemoryBudgetBytes`** with **`EvictColdBatches`** (decode evicted batch to RAM) or **`Fail`**. Scans notify LRU via **`IMappedBatchScanObserver`** on **`RainDbExecutionContext`**.
+13. **Column encodings (Phase C3, partial)** — batch kind **`KindDictInt32`**: dictionary + 1/2-byte indices for low-cardinality **`Int32`** columns on write when smaller than raw; **`DictionaryEncodedInt32ColumnChunk`** materializes on **`Values`** access. Toggle with **`EnableInt32DictionaryEncoding`**.
 
 ---
 
@@ -61,8 +63,9 @@ This document tracks what RainDB implements today and the original phased delive
 14. **Join heuristics (Phase B2)** — `HeuristicJoinAlgorithmSelector` chooses hash vs sort-merge from row-count ratio; algorithm appears in physical `EXPLAIN` (`JoinPhysicalPlan`).
 15. **Prepared SQL (Phase B3)** — `ISqlCompiler.PrepareAsync`, `@param` in WHERE, `CompiledSqlCache` keyed by SQL + `CatalogSchemaFingerprint`.
 16. **EXPLAIN (Phase B4)** — `EXPLAIN` / `EXPLAIN LOGICAL` / `EXPLAIN PHYSICAL` SQL; `ExplainBundlePhysicalPlan` → `ExplainTextQueryResult`.
+17. **Scalar expressions (Phase D1, partial)** — `LogicalScalarExpression` IR; Int32 arithmetic (`+ - * /`), `CAST(... AS INT)`, parentheses; in **`WHERE`** (compare to literal) and **`SELECT`** (computed columns). Float64 / `CASE` / join WHERE expressions not yet.
 
-> **Note:** Broader SQL (Phase D), cost model histograms, and `EXPLAIN ANALYZE` timers remain on the [Development Roadmap](Development-Roadmap.md).
+> **Note:** Remaining Phase D (HAVING, DISTINCT, outer joins, subqueries), cost model histograms, and `EXPLAIN ANALYZE` timers remain on the [Development Roadmap](Development-Roadmap.md).
 
 ---
 

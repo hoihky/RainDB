@@ -1,7 +1,9 @@
 using System.Buffers;
+using System.Buffers.Binary;
 using RainDB.Columnar;
 using RainDB.Core.Columnar;
 using RainDB.Memory;
+using RainDB.Query.Plans;
 using RainDB.Schema;
 
 namespace RainDB.Query.Vectorized;
@@ -43,6 +45,89 @@ internal sealed class ProjectGather
         }
 
         return new ColumnarBatch(selectedCount, cols);
+    }
+
+    internal ColumnarBatch Project(
+        IColumnarBatch batch,
+        ReadOnlySpan<ScanOutputColumn> outputColumns,
+        bool useRowSelection,
+        ReadOnlySpan<int> selectedRows,
+        int selectedCount,
+        IBufferPool bufferPool,
+        IAlignedBufferPool alignedBufferPool)
+    {
+        ArgumentNullException.ThrowIfNull(bufferPool);
+        ArgumentNullException.ThrowIfNull(alignedBufferPool);
+        if (useRowSelection && selectedRows.Length < selectedCount)
+            throw new ArgumentException(nameof(selectedCount));
+
+        var cols = new IColumnChunk[outputColumns.Length];
+        for (var c = 0; c < outputColumns.Length; c++)
+        {
+            var slot = outputColumns[c];
+            if (slot.Int32Expression is { } expr)
+            {
+                cols[c] = MaterializeInt32Expression(
+                    batch,
+                    expr,
+                    useRowSelection,
+                    selectedRows,
+                    selectedCount,
+                    bufferPool,
+                    alignedBufferPool);
+                continue;
+            }
+
+            var colIdx = slot.ColumnIndex;
+            if ((uint)colIdx >= (uint)batch.Columns.Count)
+                throw new ArgumentOutOfRangeException(nameof(outputColumns));
+            cols[c] = GatherColumn(
+                batch.Columns[colIdx],
+                useRowSelection,
+                selectedRows,
+                selectedCount,
+                bufferPool,
+                alignedBufferPool);
+        }
+
+        return new ColumnarBatch(selectedCount, cols);
+    }
+
+    private static IColumnChunk MaterializeInt32Expression(
+        IColumnarBatch batch,
+        BoundInt32RowExpression expr,
+        bool useRowSelection,
+        ReadOnlySpan<int> selectedRows,
+        int selectedCount,
+        IBufferPool bufferPool,
+        IAlignedBufferPool alignedBufferPool)
+    {
+        var valueBytes = checked(selectedCount * sizeof(int));
+        var valuesOwner = alignedBufferPool.RentAligned(valueBytes);
+        var outValues = valuesOwner.Memory.Span[..valueBytes];
+        var nbBytes = ColumnTypeSizes.NullBitmapBytes(selectedCount);
+        var nb = bufferPool.Rent(nbBytes);
+        nb.AsSpan(0, nbBytes).Clear();
+        var hasNulls = false;
+        for (var i = 0; i < selectedCount; i++)
+        {
+            var row = useRowSelection ? selectedRows[i] : i;
+            if (!expr.TryGetInt32(batch, row, out var v))
+            {
+                hasNulls = true;
+                nb[i >> 3] |= (byte)(1 << (i & 7));
+                continue;
+            }
+
+            BinaryPrimitives.WriteInt32LittleEndian(outValues.Slice(i * sizeof(int), sizeof(int)), v);
+        }
+
+        return new FixedWidthColumnChunk(
+            RainDbType.Int32,
+            selectedCount,
+            valuesOwner.Memory,
+            hasNulls ? nb.AsMemory(0, nbBytes) : ReadOnlyMemory<byte>.Empty,
+            hasNulls);
     }
 
     private IColumnChunk GatherColumn(

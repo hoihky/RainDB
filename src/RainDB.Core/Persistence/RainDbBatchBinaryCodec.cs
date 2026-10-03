@@ -15,8 +15,11 @@ public static class RainDbBatchBinaryCodec
     private const byte KindFixed = 1;
     private const byte KindUtf8Arrow = 2;
     private const byte KindUtf8LengthPrefixed = 3;
+    private const byte KindDictInt32 = 4;
 
-    public static void WriteBatch(Stream destination, IColumnarBatch batch)
+    private static readonly Int32DictionaryColumnEncoder DictionaryEncoder = new();
+
+    public static void WriteBatch(Stream destination, IColumnarBatch batch, RainDbBatchCodecOptions? options = null)
     {
         ArgumentNullException.ThrowIfNull(destination);
         ArgumentNullException.ThrowIfNull(batch);
@@ -25,13 +28,13 @@ public static class RainDbBatchBinaryCodec
         WriteI32(destination, batch.RowCount);
         WriteI32(destination, batch.Columns.Count);
         for (var i = 0; i < batch.Columns.Count; i++)
-            WriteColumn(destination, batch.Columns[i], batch.RowCount);
+            WriteColumn(destination, batch.Columns[i], batch.RowCount, options);
     }
 
-    public static byte[] EncodeBatch(IColumnarBatch batch)
+    public static byte[] EncodeBatch(IColumnarBatch batch, RainDbBatchCodecOptions? options = null)
     {
         using var ms = new MemoryStream();
-        WriteBatch(ms, batch);
+        WriteBatch(ms, batch, options);
         return ms.ToArray();
     }
 
@@ -57,10 +60,26 @@ public static class RainDbBatchBinaryCodec
         return new ColumnarBatch(rowCount, cols);
     }
 
-    private static void WriteColumn(Stream s, IColumnChunk chunk, int batchRowCount)
+    private static void WriteColumn(Stream s, IColumnChunk chunk, int batchRowCount, RainDbBatchCodecOptions? options)
     {
         if (chunk.RowCount != batchRowCount)
             throw new ArgumentException("Column row count does not match batch row count.", nameof(chunk));
+        if (chunk is FixedWidthColumnChunk fwTry
+            && fwTry.PhysicalType == RainDbType.Int32
+            && options?.EnableInt32DictionaryEncoding == true
+            && DictionaryEncoder.TryEncode(fwTry, out var encoded)
+            && encoded is not null)
+        {
+            WriteDictionaryInt32(s, encoded);
+            return;
+        }
+
+        if (chunk is DictionaryEncodedInt32ColumnChunk dict)
+        {
+            WriteDictionaryInt32(s, dict);
+            return;
+        }
+
         switch (chunk)
         {
             case FixedWidthColumnChunk fw:
@@ -96,6 +115,21 @@ public static class RainDbBatchBinaryCodec
         }
     }
 
+    private static void WriteDictionaryInt32(Stream s, DictionaryEncodedInt32ColumnChunk col)
+    {
+        s.WriteByte(KindDictInt32);
+        s.WriteByte((byte)(col.HasNulls ? 1 : 0));
+        WriteI32(s, col.RowCount);
+        var dict = col.Dictionary.Span;
+        WriteI32(s, dict.Length);
+        foreach (var v in dict)
+            WriteI32(s, v);
+        s.WriteByte(col.IndexWidthBytes);
+        WriteI32(s, col.Indices.Length);
+        s.Write(col.Indices.Span);
+        WriteNullBitmap(s, col);
+    }
+
     private static void WriteNullBitmap(Stream s, IColumnChunk c)
     {
         if (!c.HasNulls)
@@ -112,8 +146,42 @@ public static class RainDbBatchBinaryCodec
             KindFixed => ReadFixed(data, ref o, batchRowCount),
             KindUtf8Arrow => ReadUtf8Arrow(data, ref o, batchRowCount),
             KindUtf8LengthPrefixed => ReadUtf8Lp(data, ref o, batchRowCount),
+            KindDictInt32 => ReadDictionaryInt32(data, ref o, batchRowCount),
             _ => throw new InvalidDataException($"Unknown column kind {kind}."),
         };
+    }
+
+    private static IColumnChunk ReadDictionaryInt32(ReadOnlySpan<byte> data, ref int o, int batchRowCount)
+    {
+        var hasNulls = ReadByte(data, ref o) != 0;
+        var rowCount = ReadI32(data, ref o);
+        if (rowCount != batchRowCount)
+            throw new InvalidDataException("Column row count mismatch.");
+        var dictLen = ReadI32(data, ref o);
+        if (dictLen < 0)
+            throw new InvalidDataException("Invalid dictionary length.");
+        var dictionary = new int[dictLen];
+        for (var i = 0; i < dictLen; i++)
+            dictionary[i] = ReadI32(data, ref o);
+        var indexWidth = ReadByte(data, ref o);
+        if (indexWidth is not (1 or 2 or 4))
+            throw new InvalidDataException("Invalid dictionary index width.");
+        var indicesLen = ReadI32(data, ref o);
+        var indices = ReadBytes(data, ref o, indicesLen);
+        ReadOnlyMemory<byte> nbMem = ReadOnlyMemory<byte>.Empty;
+        if (hasNulls)
+        {
+            var nb = ColumnTypeSizes.NullBitmapBytes(rowCount);
+            nbMem = ReadBytes(data, ref o, nb);
+        }
+
+        return new DictionaryEncodedInt32ColumnChunk(
+            rowCount,
+            dictionary,
+            indices,
+            indexWidth,
+            nbMem,
+            hasNulls);
     }
 
     private static IColumnChunk ReadFixed(ReadOnlySpan<byte> data, ref int o, int batchRowCount)

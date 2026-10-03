@@ -1,6 +1,7 @@
 using System.Globalization;
 using RainDB.Execution;
 using RainDB.Logical;
+using RainDB.Schema;
 using RainDB.Sql;
 
 namespace RainDB.Sql.Parsing;
@@ -148,11 +149,8 @@ public sealed class SqlParser
                     _explainLevel);
             }
 
-            if (selectItems.TrueForAll(static x => x is LogicalColumnProjection))
+            if (selectItems.TrueForAll(static x => x is LogicalColumnProjection or LogicalScalarProjection))
             {
-                var proj = new List<LogicalColumnProjection>(selectItems.Count);
-                foreach (var x in selectItems)
-                    proj.Add((LogicalColumnProjection)x);
                 var ob2 = TryParseOrderBy();
                 var lim2 = TryParseLimit();
                 ExpectEnd();
@@ -161,7 +159,7 @@ public sealed class SqlParser
                     {
                         TableName = table,
                         WhereConjuncts = whereConjuncts,
-                        Projection = proj,
+                        SelectList = selectItems,
                         OrderBy = ob2,
                         Limit = lim2,
                     },
@@ -396,7 +394,7 @@ public sealed class SqlParser
                 if (TryParseAggregationCall(out var agg))
                     list.Add(agg);
                 else
-                    list.Add(ParseColumnProjection());
+                    list.Add(ParseSelectListItem());
 
                 if (_cur.Kind == SqlTokenKind.Comma)
                 {
@@ -568,44 +566,149 @@ public sealed class SqlParser
             return list;
         }
 
-        private SimpleWhereClause ParseWherePredicate()
+        private LogicalSelectListItem ParseSelectListItem()
         {
-            if (_cur.Kind != SqlTokenKind.Identifier)
-                throw new SqlCompileException($"Expected column reference in WHERE at position {_cur.Start}.");
-            string? qualifier = null;
-            string column;
-            var savePos = _lexer.Save();
-            var saveTok = _cur;
-            Advance();
-            if (_cur.Kind == SqlTokenKind.Dot)
+            var expr = ParseAdditiveExpression();
+            string? alias = null;
+            if (_cur.Kind == SqlTokenKind.Identifier && LexemeEqualsIgnoreCase(_cur, "AS"))
             {
-                qualifier = _lexer.Lexeme(saveTok).ToString();
                 Advance();
-                column = ExpectIdentifier("column name in WHERE");
-            }
-            else
-            {
-                _lexer.Restore(savePos);
-                _cur = saveTok;
-                column = ExpectIdentifier("column name in WHERE");
+                alias = ExpectIdentifier("SELECT alias");
             }
 
+            if (expr is LogicalColumnScalarRef col && alias is null)
+                return new LogicalColumnProjection { QualifierTableName = col.QualifierTableName, ColumnName = col.ColumnName };
+            return new LogicalScalarProjection { Expression = expr, OutputAlias = alias };
+        }
+
+        private SimpleWhereClause ParseWherePredicate()
+        {
+            var leftExpr = ParseAdditiveExpression();
             var op = ParseCompareOp();
             if (_cur.Kind == SqlTokenKind.Parameter)
             {
                 var name = ParseParameterNameFromToken();
-                return new SimpleWhereClause
+                if (leftExpr is LogicalColumnScalarRef col)
                 {
-                    QualifierTableName = qualifier,
-                    ColumnName = column,
-                    Operator = op,
-                    ParameterName = name,
-                };
+                    return new SimpleWhereClause
+                    {
+                        QualifierTableName = col.QualifierTableName,
+                        ColumnName = col.ColumnName,
+                        Operator = op,
+                        ParameterName = name,
+                    };
+                }
+
+                throw new SqlCompileException("Parameterized predicates on expressions are not supported yet.");
             }
 
             var lit = ParseLiteral();
-            return new SimpleWhereClause { QualifierTableName = qualifier, ColumnName = column, Operator = op, Literal = lit };
+            if (leftExpr is LogicalColumnScalarRef colOnly)
+            {
+                return new SimpleWhereClause
+                {
+                    QualifierTableName = colOnly.QualifierTableName,
+                    ColumnName = colOnly.ColumnName,
+                    Operator = op,
+                    Literal = lit,
+                };
+            }
+
+            return new SimpleWhereClause { LeftExpression = leftExpr, Operator = op, Literal = lit };
         }
+
+        private LogicalScalarExpression ParseAdditiveExpression()
+        {
+            var left = ParseMultiplicativeExpression();
+            while (_cur.Kind == SqlTokenKind.Plus || _cur.Kind == SqlTokenKind.Minus)
+            {
+                var op = _cur.Kind == SqlTokenKind.Plus ? BinaryScalarOp.Add : BinaryScalarOp.Sub;
+                Advance();
+                left = new LogicalBinaryScalar { Operator = op, Left = left, Right = ParseMultiplicativeExpression() };
+            }
+
+            return left;
+        }
+
+        private LogicalScalarExpression ParseMultiplicativeExpression()
+        {
+            var left = ParseUnaryScalarExpression();
+            while (_cur.Kind == SqlTokenKind.Star || _cur.Kind == SqlTokenKind.Slash)
+            {
+                var op = _cur.Kind == SqlTokenKind.Star ? BinaryScalarOp.Mul : BinaryScalarOp.Div;
+                Advance();
+                left = new LogicalBinaryScalar { Operator = op, Left = left, Right = ParseUnaryScalarExpression() };
+            }
+
+            return left;
+        }
+
+        private LogicalScalarExpression ParseUnaryScalarExpression()
+        {
+            if (_cur.Kind == SqlTokenKind.Minus)
+            {
+                Advance();
+                var lit = ParseScalarPrimary();
+                if (lit is LogicalLiteralScalar { Literal.Kind: SqlLiteralKind.Integer } iLit
+                    && int.TryParse(iLit.Literal.Text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var v))
+                {
+                    return new LogicalLiteralScalar
+                    {
+                        Literal = new SqlLiteral(SqlLiteralKind.Integer, (-v).ToString(CultureInfo.InvariantCulture)),
+                    };
+                }
+
+                throw new SqlCompileException("Unary minus is only supported on integer literals.");
+            }
+
+            return ParseScalarPrimary();
+        }
+
+        private LogicalScalarExpression ParseScalarPrimary()
+        {
+            if (_cur.Kind == SqlTokenKind.LParen)
+            {
+                Advance();
+                var inner = ParseAdditiveExpression();
+                Expect(SqlTokenKind.RParen, ")");
+                return inner;
+            }
+
+            if (_cur.Kind == SqlTokenKind.Identifier && LexemeEqualsIgnoreCase(_cur, "CAST"))
+            {
+                Advance();
+                Expect(SqlTokenKind.LParen, "(");
+                var operand = ParseAdditiveExpression();
+                ExpectKeyword("AS");
+                var typeName = ExpectIdentifier("CAST target type");
+                Expect(SqlTokenKind.RParen, ")");
+                var target = ParseRainDbTypeName(typeName);
+                return new LogicalCastScalar { Operand = operand, TargetType = target };
+            }
+
+            if (_cur.Kind == SqlTokenKind.Number)
+            {
+                var lit = ParseLiteral();
+                return new LogicalLiteralScalar { Literal = lit };
+            }
+
+            if (_cur.Kind == SqlTokenKind.Identifier)
+            {
+                var col = ParseColumnProjection();
+                return new LogicalColumnScalarRef { QualifierTableName = col.QualifierTableName, ColumnName = col.ColumnName };
+            }
+
+            throw new SqlCompileException($"Expected scalar expression at position {_cur.Start}.");
+        }
+
+        private static RainDbType ParseRainDbTypeName(string name) =>
+            name.ToUpperInvariant() switch
+            {
+                "INT" or "INT32" or "INTEGER" => RainDbType.Int32,
+                "BIGINT" or "INT64" => RainDbType.Int64,
+                "DOUBLE" or "FLOAT64" => RainDbType.Float64,
+                _ => throw new SqlCompileException($"Unsupported CAST target type '{name}'."),
+            };
 
         private string ParseParameterNameFromToken()
         {

@@ -7,6 +7,7 @@ using RainDB.Execution;
 using RainDB.Query.Execution.Operators;
 using RainDB.Query.Plans;
 using RainDB.Query.Results;
+using RainDB.Query.Runtime;
 using RainDB.Query.Vectorized;
 using RainDB.Schema;
 
@@ -48,17 +49,17 @@ public sealed class VectorizedScanOperator : Operators.IVectorizedScanOperator
             throw new ArgumentException("Physical plan table id does not match resolved table.", nameof(table));
 
         var colCount = table.Schema.Columns.Count;
-        foreach (var idx in plan.OutputColumnIndices)
+        foreach (var slot in plan.OutputColumns)
         {
-            if ((uint)idx >= (uint)colCount)
-                throw new ArgumentException($"Output column index {idx} is out of range.", nameof(plan));
+            if (slot.Int32Expression is null && (uint)slot.ColumnIndex >= (uint)colCount)
+                throw new ArgumentException($"Output column index {slot.ColumnIndex} is out of range.", nameof(plan));
         }
 
         if (plan.Filters is { } fa)
         {
             foreach (var f in fa)
             {
-                if ((uint)f.ColumnIndex >= (uint)colCount)
+                if (f.Int32Expression is null && (uint)f.ColumnIndex >= (uint)colCount)
                     throw new ArgumentException("Filter column index is out of range.", nameof(plan));
             }
         }
@@ -106,14 +107,14 @@ public sealed class VectorizedScanOperator : Operators.IVectorizedScanOperator
         if (dop <= 1 || n == 1)
         {
             for (var i = 0; i < n; i++)
-                outArr[i] = ProcessOneBatch(plan, batches[i], context);
+                outArr[i] = ProcessOneBatch(plan, batches[i], i, context);
         }
         else if (plan.Options.UseChannelScheduler)
         {
             await RunChannelMorselsAsync(
                 n,
                 dop,
-                i => outArr[i] = ProcessOneBatch(plan, batches[i], context),
+                i => outArr[i] = ProcessOneBatch(plan, batches[i], i, context),
                 ct).ConfigureAwait(false);
         }
         else
@@ -122,7 +123,7 @@ public sealed class VectorizedScanOperator : Operators.IVectorizedScanOperator
                 0,
                 n,
                 new ParallelOptions { MaxDegreeOfParallelism = dop, CancellationToken = ct },
-                i => outArr[i] = ProcessOneBatch(plan, batches[i], context));
+                i => outArr[i] = ProcessOneBatch(plan, batches[i], i, context));
         }
 
         return outArr;
@@ -163,12 +164,20 @@ public sealed class VectorizedScanOperator : Operators.IVectorizedScanOperator
         await Task.WhenAll(workers).ConfigureAwait(false);
     }
 
+    private static void NotifyMappedBatch(IExecutionContext context, TableId tableId, int batchIndex)
+    {
+        if (context is RainDbExecutionContext { MappedBatchScanObserver: { } observer })
+            observer.OnBatchScanned(tableId, batchIndex);
+    }
+
     private IColumnarBatch ProcessOneBatch(
         VectorizedScanPhysicalPlan plan,
         IColumnarBatch batch,
+        int batchIndex,
         IExecutionContext context)
     {
         context.CancellationToken.ThrowIfCancellationRequested();
+        NotifyMappedBatch(context, plan.TableId, batchIndex);
         var rent = ArrayPool<int>.Shared.Rent(batch.RowCount);
         try
         {
@@ -182,7 +191,7 @@ public sealed class VectorizedScanOperator : Operators.IVectorizedScanOperator
 
             return _deps.ProjectGather.Project(
                 batch,
-                plan.OutputColumnIndices.AsSpan(),
+                plan.OutputColumns.AsSpan(),
                 useRowSelection: hasFilters,
                 selectedRows: hasFilters ? span[..selected] : ReadOnlySpan<int>.Empty,
                 selected,
@@ -212,14 +221,21 @@ public sealed class VectorizedScanOperator : Operators.IVectorizedScanOperator
         if (dop <= 1 || n == 1)
         {
             for (var i = 0; i < n; i++)
+            {
+                NotifyMappedBatch(context, plan.TableId, i);
                 partials[i] = AccumulateAggregateBatch(plan, batches[i], spec, plan.Options);
+            }
         }
         else if (plan.Options.UseChannelScheduler)
         {
             await RunChannelMorselsAsync(
                 n,
                 dop,
-                i => partials[i] = AccumulateAggregateBatch(plan, batches[i], spec, plan.Options),
+                i =>
+                {
+                    NotifyMappedBatch(context, plan.TableId, i);
+                    partials[i] = AccumulateAggregateBatch(plan, batches[i], spec, plan.Options);
+                },
                 ct).ConfigureAwait(false);
         }
         else
@@ -228,7 +244,11 @@ public sealed class VectorizedScanOperator : Operators.IVectorizedScanOperator
                 0,
                 n,
                 new ParallelOptions { MaxDegreeOfParallelism = dop, CancellationToken = ct },
-                i => partials[i] = AccumulateAggregateBatch(plan, batches[i], spec, plan.Options));
+                i =>
+                {
+                    NotifyMappedBatch(context, plan.TableId, i);
+                    partials[i] = AccumulateAggregateBatch(plan, batches[i], spec, plan.Options);
+                });
         }
 
         var combined = partials[0];

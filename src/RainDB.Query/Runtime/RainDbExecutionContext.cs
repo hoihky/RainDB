@@ -1,6 +1,7 @@
 using RainDB.Catalog;
 using RainDB.Execution;
 using RainDB.Memory;
+using RainDB.Persistence;
 
 namespace RainDB.Query.Runtime;
 
@@ -11,13 +12,15 @@ public sealed class RainDbExecutionContext : IExecutionContext
         IBufferPool bufferPool,
         IAlignedBufferPool alignedBufferPool,
         ISpillWriter spillWriter,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        IMappedBatchScanObserver? mappedBatchScanObserver = null)
     {
         Catalog = catalog;
         BufferPool = bufferPool;
         AlignedBufferPool = alignedBufferPool;
         SpillWriter = spillWriter ?? NoOpSpillWriter.Instance;
         CancellationToken = cancellationToken;
+        MappedBatchScanObserver = mappedBatchScanObserver;
     }
 
     public ICatalog Catalog { get; }
@@ -29,4 +32,6 @@ public sealed class RainDbExecutionContext : IExecutionContext
     public ISpillWriter SpillWriter { get; }
 
     public CancellationToken CancellationToken { get; }
+
+    public IMappedBatchScanObserver? MappedBatchScanObserver { get; }
 }

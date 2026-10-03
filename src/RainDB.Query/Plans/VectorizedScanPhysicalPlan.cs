@@ -1,5 +1,6 @@
 using RainDB.Catalog;
 using RainDB.Execution;
+using RainDB.Query.Vectorized;
 
 namespace RainDB.Query.Plans;
 
@@ -10,23 +11,55 @@ public sealed class VectorizedScanPhysicalPlan : IPhysicalPlan
 {
     public VectorizedScanPhysicalPlan(
         TableId tableId,
-        int[] outputColumnIndices,
+        ScanOutputColumn[] outputColumns,
         ColumnCompareFilter[]? filters = null,
         AggregateSpec? aggregate = null,
         VectorizedScanExecutionOptions options = default)
     {
-        ArgumentNullException.ThrowIfNull(outputColumnIndices);
+        ArgumentNullException.ThrowIfNull(outputColumns);
         TableId = tableId;
-        OutputColumnIndices = (int[])outputColumnIndices.Clone();
+        OutputColumns = (ScanOutputColumn[])outputColumns.Clone();
         Filters = filters is { Length: > 0 } ? (ColumnCompareFilter[])filters.Clone() : null;
         Aggregate = aggregate;
         Options = options;
     }
 
+    public VectorizedScanPhysicalPlan(
+        TableId tableId,
+        int[] outputColumnIndices,
+        ColumnCompareFilter[]? filters = null,
+        AggregateSpec? aggregate = null,
+        VectorizedScanExecutionOptions options = default)
+        : this(
+            tableId,
+            Array.ConvertAll(outputColumnIndices, static i => new ScanOutputColumn(i)),
+            filters,
+            aggregate,
+            options)
+    {
+    }
+
     public TableId TableId { get; }
 
-    /// <summary>Indices into the table schema / batch column list (deduplicated projection).</summary>
-    public int[] OutputColumnIndices { get; }
+    /// <summary>Per-output column: table column index and/or computed Int32 expression.</summary>
+    public ScanOutputColumn[] OutputColumns { get; }
+
+    /// <summary>Legacy view when every output is a plain column reference.</summary>
+    public int[] OutputColumnIndices
+    {
+        get
+        {
+            var arr = new int[OutputColumns.Length];
+            for (var i = 0; i < OutputColumns.Length; i++)
+            {
+                if (OutputColumns[i].Int32Expression is not null)
+                    throw new InvalidOperationException("Plan includes computed expressions.");
+                arr[i] = OutputColumns[i].ColumnIndex;
+            }
+
+            return arr;
+        }
+    }
 
     /// <summary>AND conjunction of predicates (same row must satisfy all).</summary>
     public ColumnCompareFilter[]? Filters { get; }
@@ -41,18 +74,24 @@ public sealed class VectorizedScanPhysicalPlan : IPhysicalPlan
         var f = Filters is { Length: > 0 } fl
             ? $" FILTER[{string.Join(" AND ", Array.ConvertAll(fl, x => $"col{x.ColumnIndex}{x.Op}"))}]"
             : "";
-        return $"{indent}VectorizedScan(table={TableId}) PROJECT[{string.Join(",", OutputColumnIndices)}]{f}{agg}";
+        return $"{indent}VectorizedScan(table={TableId}) PROJECT[{string.Join(",", OutputColumns)}]{f}{agg}";
     }
 }
 
+public readonly record struct ScanOutputColumn(
+    int ColumnIndex = -1,
+    BoundInt32RowExpression? Int32Expression = null);
+
 /// <summary>
 /// Compares a column to an immediate: fixed-width uses <see cref="ImmediateBits"/>; UTF-8 uses <see cref="Utf8LiteralBytes"/> with only Eq/Ne.
+/// When <see cref="Int32Expression"/> is set, <see cref="ColumnIndex"/> is ignored.
 /// </summary>
 public readonly record struct ColumnCompareFilter(
     int ColumnIndex,
     ScalarCompareOp Op,
     long ImmediateBits,
-    byte[]? Utf8LiteralBytes = null);
+    byte[]? Utf8LiteralBytes = null,
+    BoundInt32RowExpression? Int32Expression = null);
 
 /// <summary>Single-column aggregate over filtered rows (P1: Float64 sum/min/max; Int32/Int64 sum uses Int64Value).</summary>
 public readonly record struct AggregateSpec(int SourceColumnIndex, AggregateKind Kind);

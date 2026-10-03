@@ -14,6 +14,8 @@ namespace RainDB.Sql.Compilation;
 /// <summary>Binds <see cref="LogicalTableScan"/> to <see cref="IPhysicalPlan"/> (vectorized scan or hash aggregate).</summary>
 public sealed class LogicalTableScanBinder
 {
+    private readonly LogicalScalarExpressionBinder _scalarBinder = new();
+
     public IPhysicalPlan BindAndLower(
         LogicalTableScan scan,
         ICatalog catalog,
@@ -129,7 +131,7 @@ public sealed class LogicalTableScanBinder
         var filters = BuildColumnCompareFilters(scan.WhereConjuncts, schema, scan.TableName);
 
         AggregateSpec? aggregate = null;
-        int[] outputIndices;
+        ScanOutputColumn[] outputColumns;
         if (scan.Aggregate is { } a)
         {
             AggregateSpec spec;
@@ -146,26 +148,32 @@ public sealed class LogicalTableScanBinder
                 ValidateAggregate(RainDbType.Int32, spec.Kind); // COUNT(*) — type ignored
 
             aggregate = spec;
-            outputIndices = spec.SourceColumnIndex >= 0 ? [spec.SourceColumnIndex] : [];
+            outputColumns = spec.SourceColumnIndex >= 0
+                ? [new ScanOutputColumn(spec.SourceColumnIndex)]
+                : [];
+        }
+        else if (scan.SelectList is { Count: > 0 } selectList)
+        {
+            outputColumns = BindScanOutputColumns(selectList, schema, scan.TableName);
         }
         else if (scan.Projection is null)
         {
-            outputIndices = new int[colCount];
+            outputColumns = new ScanOutputColumn[colCount];
             for (var i = 0; i < colCount; i++)
-                outputIndices[i] = i;
+                outputColumns[i] = new ScanOutputColumn(i);
         }
         else
         {
-            outputIndices = new int[scan.Projection.Count];
+            outputColumns = new ScanOutputColumn[scan.Projection.Count];
             for (var i = 0; i < scan.Projection.Count; i++)
             {
                 var p = scan.Projection[i];
                 ValidateProjectionTableQualifier(p, scan.TableName);
-                outputIndices[i] = ResolveColumn(schema, p.ColumnName, scan.TableName);
+                outputColumns[i] = new ScanOutputColumn(ResolveColumn(schema, p.ColumnName, scan.TableName));
             }
         }
 
-        var scanPlan = new VectorizedScanPhysicalPlan(colTable.Id, outputIndices, filters, aggregate, scanOptions);
+        var scanPlan = new VectorizedScanPhysicalPlan(colTable.Id, outputColumns, filters, aggregate, scanOptions);
         if (scan.Aggregate is not null)
             return scanPlan;
         if (scan.OrderBy is not { Count: > 0 } && scan.Limit is null)
@@ -174,7 +182,35 @@ public sealed class LogicalTableScanBinder
         var sortSpecs = scan.OrderBy is { Count: > 0 } ob
             ? BuildTableSortKeySpecs(schema, scan.TableName, ob)
             : Array.Empty<SortKeyPhysicalSpec>();
-        return new SortTopNPhysicalPlan(colTable.Id, outputIndices, filters, sortSpecs, scan.Limit, scanOptions);
+        var sortOutputIndices = Array.ConvertAll(outputColumns, static c => c.Int32Expression is null ? c.ColumnIndex : -1);
+        if (sortOutputIndices.Any(static i => i < 0))
+            throw new SqlCompileException("ORDER BY / LIMIT with computed SELECT expressions is not supported yet.");
+        return new SortTopNPhysicalPlan(colTable.Id, sortOutputIndices, filters, sortSpecs, scan.Limit, scanOptions);
+    }
+
+    private ScanOutputColumn[] BindScanOutputColumns(
+        IReadOnlyList<LogicalSelectListItem> items,
+        TableSchema schema,
+        string tableName)
+    {
+        var cols = new ScanOutputColumn[items.Count];
+        for (var i = 0; i < items.Count; i++)
+        {
+            switch (items[i])
+            {
+                case LogicalColumnProjection p:
+                    ValidateProjectionTableQualifier(p, tableName);
+                    cols[i] = new ScanOutputColumn(ResolveColumn(schema, p.ColumnName, tableName));
+                    break;
+                case LogicalScalarProjection sp:
+                    cols[i] = new ScanOutputColumn(-1, _scalarBinder.BindInt32(sp.Expression, schema, tableName));
+                    break;
+                default:
+                    throw new SqlCompileException("Unsupported SELECT list item for a non-grouped scan.");
+            }
+        }
+
+        return cols;
     }
 
     private static SortKeyPhysicalSpec[] BuildTableSortKeySpecs(
@@ -217,7 +253,15 @@ public sealed class LogicalTableScanBinder
         if (where.UsesParameter)
             throw new SqlCompileException($"Parameter '@{where.ParameterName}' must be bound before physical compilation.");
         if (where.Literal is not { } literal)
-            throw new SqlCompileException($"WHERE predicate on '{where.ColumnName}' is missing a literal value.");
+            throw new SqlCompileException($"WHERE predicate is missing a literal value.");
+        if (where.LeftExpression is { } lex)
+        {
+            LogicalScalarExpressionBinder.ValidateExpressionTableRefs(lex, tableName);
+            var bound = _scalarBinder.BindInt32(lex, schema, tableName);
+            var imm = CoerceLiteralToImmediateBits(RainDbType.Int32, literal);
+            return new ColumnCompareFilter(-1, where.Operator, imm, Int32Expression: bound);
+        }
+
         var wi = ResolveColumn(schema, where.ColumnName, tableName);
         var wt = schema.Columns[wi].Type;
         if (wt == RainDbType.Utf8)
@@ -256,6 +300,8 @@ public sealed class LogicalTableScanBinder
 
     internal static void ValidateWhereTableQualifier(SimpleWhereClause? where, string scannedTableName)
     {
+        if (where?.LeftExpression is { } lex)
+            LogicalScalarExpressionBinder.ValidateExpressionTableRefs(lex, scannedTableName);
         if (where?.QualifierTableName is { } q && !q.Equals(scannedTableName, StringComparison.OrdinalIgnoreCase))
             throw new SqlCompileException(
                 $"WHERE references table '{q}' but the FROM clause scans '{scannedTableName}' only.");
@@ -276,7 +322,7 @@ public sealed class LogicalTableScanBinder
         }
     }
 
-    private static int ResolveColumn(TableSchema schema, string name, string tableName)
+    internal static int ResolveColumn(TableSchema schema, string name, string tableName)
     {
         for (var i = 0; i < schema.Columns.Count; i++)
         {

@@ -66,6 +66,34 @@ var fileDb = engine.FileDatabase!; // keeps persistence alive
 - Loads `catalog.json` and existing `.batch` files into memory if present.
 - New tables should be created with `fileDb.CreateMemoryTable(...)` so **appends are mirrored to disk**.
 
+### 2.2.1 Mmap budget and column encoding (Phase C2/C3)
+
+Tune how much RAM mmap-backed batch segments may occupy and whether Int32 columns are dictionary-encoded on disk:
+
+```csharp
+using RainDB.Core.Persistence;
+
+var options = new RainDbFileDatabaseOptions
+{
+    PreferMmapBatchHydration = true,
+    // Evict least-recently-scanned mmap segments when over budget (default).
+    MappedBatchMemoryBudgetBytes = 64 * 1024 * 1024,
+    MappedBatchBudgetExceededBehavior = MappedBatchBudgetExceededBehavior.EvictColdBatches,
+    // Persist low-cardinality Int32 columns as dictionary + indices when smaller than raw.
+    EnableInt32DictionaryEncoding = true,
+};
+
+var engine = RainDbEngine.OpenPersistent("/path/to/dataDir", options);
+var fileDb = engine.FileDatabase!;
+
+// Observability: bytes currently charged against the mmap budget.
+Console.WriteLine($"mmap resident: {fileDb.MappedBatchMemory.ResidentBytes} / {fileDb.MappedBatchMemory.BudgetBytes}");
+```
+
+Scans on persistent tables automatically **touch** the LRU tracker via `IMappedBatchScanObserver` on the execution session (wired from `RainDbEngine.CreateSession`). Evicted batches are reloaded from their `.batch` file into in-memory columnar form so SQL results stay correct.
+
+For in-memory export/import without the mmap manager, `RainDbBatchBinaryCodec.EncodeBatch(batch, new RainDbBatchCodecOptions { EnableInt32DictionaryEncoding = true })` applies the same encoding heuristics.
+
 ### 2.3 Custom catalog
 
 ```csharp

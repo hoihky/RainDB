@@ -46,17 +46,29 @@ internal sealed class SelectionEvaluator
         if (dest.Length < n)
             throw new ArgumentException("Selection buffer too small.", nameof(dest));
 
-        var count = FillSelectedRows(batch.Columns[filters[0].ColumnIndex], filters[0], dest);
+        var count = ApplyFilter(batch, filters[0], dest);
         for (var f = 1; f < filters.Length; f++)
-        {
-            var col = batch.Columns[filters[f].ColumnIndex];
-            count = filters[f].Utf8LiteralBytes is not null || col.PhysicalType == RainDbType.Utf8
-                ? IntersectUtf8(col, filters[f], dest, count)
-                : (_kernels ?? throw new InvalidOperationException("Fixed-width selection kernels are not bound."))
-                    .IntersectSelectedIndices(col, filters[f], dest, count);
-        }
+            count = IntersectFilter(batch, filters[f], dest, count);
 
         return count;
+    }
+
+    private int ApplyFilter(IColumnarBatch batch, ColumnCompareFilter filter, Span<int> dest)
+    {
+        if (filter.Int32Expression is not null)
+            return FillInt32ExpressionSelected(batch, filter, dest);
+        return FillSelectedRows(batch.Columns[filter.ColumnIndex], filter, dest);
+    }
+
+    private int IntersectFilter(IColumnarBatch batch, ColumnCompareFilter filter, Span<int> dest, int count)
+    {
+        if (filter.Int32Expression is not null)
+            return IntersectInt32Expression(batch, filter, dest, count);
+        var col = batch.Columns[filter.ColumnIndex];
+        return filter.Utf8LiteralBytes is not null || col.PhysicalType == RainDbType.Utf8
+            ? IntersectUtf8(col, filter, dest, count)
+            : (_kernels ?? throw new InvalidOperationException("Fixed-width selection kernels are not bound."))
+                .IntersectSelectedIndices(col, filter, dest, count);
     }
 
     /// <summary>Writes 0..rowCount-1 row indices that pass <paramref name="filter"/> into <paramref name="dest"/>; returns match count.</summary>
@@ -225,4 +237,34 @@ internal sealed class SelectionEvaluator
             ScalarCompareOp.Ge => v | !imm,
             _ => false,
         };
+
+    private static int FillInt32ExpressionSelected(IColumnarBatch batch, ColumnCompareFilter filter, Span<int> dest)
+    {
+        var expr = filter.Int32Expression!;
+        var imm = (int)filter.ImmediateBits;
+        var n = batch.RowCount;
+        var count = 0;
+        for (var i = 0; i < n; i++)
+        {
+            if (expr.TryGetInt32(batch, i, out var v) && CompareInt32(v, imm, filter.Op))
+                dest[count++] = i;
+        }
+
+        return count;
+    }
+
+    private static int IntersectInt32Expression(IColumnarBatch batch, ColumnCompareFilter filter, Span<int> dest, int count)
+    {
+        var expr = filter.Int32Expression!;
+        var imm = (int)filter.ImmediateBits;
+        var write = 0;
+        for (var r = 0; r < count; r++)
+        {
+            var row = dest[r];
+            if (expr.TryGetInt32(batch, row, out var v) && CompareInt32(v, imm, filter.Op))
+                dest[write++] = row;
+        }
+
+        return write;
+    }
 }

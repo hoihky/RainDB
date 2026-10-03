@@ -1,6 +1,7 @@
 using RainDB.Catalog;
 using RainDB.Columnar;
 using RainDB.Core.Columnar;
+using RainDB.Core.Persistence;
 using RainDB.Persistence;
 using RainDB.Schema;
 
@@ -10,6 +11,7 @@ namespace RainDB.Core.Tables;
 public sealed class MemoryTable : ITableSource, IColumnarTableSource
 {
     private readonly List<IColumnarBatch> _batches = new();
+    private readonly Dictionary<int, MappedColumnarBatch> _mmapByBatchIndex = new();
     private int _schemaVersion = 1;
 
     public MemoryTable(string name, TableSchema schema, TableId? id = null, MemoryTableOptions options = default)
@@ -54,6 +56,24 @@ public sealed class MemoryTable : ITableSource, IColumnarTableSource
 
     /// <summary>Loads a batch from durable storage without invoking <see cref="IRainDbBatchPersistence"/> (hydration only).</summary>
     internal void AppendHydratedBatch(IColumnarBatch batch) => AppendCore(batch, notifyPersistence: false);
+
+    internal void AttachMappedBatch(int batchIndex, MappedColumnarBatch mapped)
+    {
+        ArgumentNullException.ThrowIfNull(mapped);
+        _mmapByBatchIndex[batchIndex] = mapped;
+    }
+
+    internal void DetachMappedBatch(int batchIndex) => _mmapByBatchIndex.Remove(batchIndex);
+
+    internal void ReplaceHydratedBatchAt(int batchIndex, IColumnarBatch batch)
+    {
+        ArgumentNullException.ThrowIfNull(batch);
+        if ((uint)batchIndex >= (uint)_batches.Count)
+            throw new ArgumentOutOfRangeException(nameof(batchIndex));
+        if (!Schema.MatchesBatch(batch))
+            throw new ArgumentException("Batch does not match this table's schema.", nameof(batch));
+        _batches[batchIndex] = batch;
+    }
 
     private void AppendCore(IColumnarBatch batch, bool notifyPersistence)
     {

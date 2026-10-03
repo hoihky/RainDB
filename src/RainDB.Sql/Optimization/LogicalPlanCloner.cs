@@ -62,6 +62,7 @@ internal sealed class LogicalPlanCloner
         {
             QualifierTableName = w.QualifierTableName,
             ColumnName = w.ColumnName,
+            LeftExpression = CloneScalarExpression(w.LeftExpression),
             Operator = w.Operator,
             Literal = w.Literal is { } lit ? new SqlLiteral(lit.Kind, lit.Text) : null,
             ParameterName = w.ParameterName,
@@ -126,11 +127,46 @@ internal sealed class LogicalPlanCloner
                     ArgumentColumnName = a.ArgumentColumnName,
                     ArgumentQualifierTableName = a.ArgumentQualifierTableName,
                 },
+                LogicalScalarProjection s => new LogicalScalarProjection
+                {
+                    Expression = CloneScalarExpression(s.Expression)!,
+                    OutputAlias = s.OutputAlias,
+                },
                 _ => item,
             });
         }
 
         return list;
+    }
+
+    private static LogicalScalarExpression? CloneScalarExpression(LogicalScalarExpression? expr)
+    {
+        if (expr is null)
+            return null;
+        return expr switch
+        {
+            LogicalColumnScalarRef c => new LogicalColumnScalarRef
+            {
+                QualifierTableName = c.QualifierTableName,
+                ColumnName = c.ColumnName,
+            },
+            LogicalLiteralScalar l => new LogicalLiteralScalar
+            {
+                Literal = new SqlLiteral(l.Literal.Kind, l.Literal.Text),
+            },
+            LogicalBinaryScalar b => new LogicalBinaryScalar
+            {
+                Operator = b.Operator,
+                Left = CloneScalarExpression(b.Left)!,
+                Right = CloneScalarExpression(b.Right)!,
+            },
+            LogicalCastScalar cast => new LogicalCastScalar
+            {
+                Operand = CloneScalarExpression(cast.Operand)!,
+                TargetType = cast.TargetType,
+            },
+            _ => expr,
+        };
     }
 
     private static IReadOnlyList<LogicalSortKey>? CloneOrderBy(IReadOnlyList<LogicalSortKey>? keys)

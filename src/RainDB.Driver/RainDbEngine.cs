@@ -71,10 +71,10 @@ public sealed class RainDbEngine
     /// <summary>
     /// Opens a directory-backed database: loads <see cref="RainDbFileDatabase.CatalogFileName"/> if present, wires new appends on tables created via <see cref="RainDbFileDatabase.CreateMemoryTable"/> to batch files under the directory.
     /// </summary>
-    public static RainDbEngine OpenPersistent(string directoryPath)
+    public static RainDbEngine OpenPersistent(string directoryPath, RainDbFileDatabaseOptions? options = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(directoryPath);
-        var fileDb = RainDbFileDatabase.Open(directoryPath);
+        var fileDb = RainDbFileDatabase.Open(directoryPath, options);
         return CreateDefault(fileDb.Catalog, fileDb);
     }
 
@@ -90,7 +90,13 @@ public sealed class RainDbEngine
     }
 
     public IExecutionContext CreateSession(CancellationToken cancellationToken = default) =>
-        new RainDbExecutionContext(Catalog, BufferPool, AlignedBufferPool, SpillWriter, cancellationToken);
+        new RainDbExecutionContext(
+            Catalog,
+            BufferPool,
+            AlignedBufferPool,
+            SpillWriter,
+            cancellationToken,
+            FileDatabase?.MappedBatchScanObserver);
 
     public async ValueTask<IQueryResult> ExecuteSqlAsync(string sql, CancellationToken cancellationToken = default)
     {

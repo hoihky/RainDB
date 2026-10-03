@@ -7,6 +7,9 @@ internal enum SqlTokenKind
     EndOfFile,
     Identifier,
     Star,
+    Plus,
+    Minus,
+    Slash,
     Comma,
     LParen,
     RParen,
@@ -66,6 +69,24 @@ internal sealed class SqlLexer
         {
             _pos++;
             return new SqlToken(SqlTokenKind.Star, start, 1);
+        }
+
+        if (c == '+')
+        {
+            _pos++;
+            return new SqlToken(SqlTokenKind.Plus, start, 1);
+        }
+
+        if (c == '/')
+        {
+            _pos++;
+            return new SqlToken(SqlTokenKind.Slash, start, 1);
+        }
+
+        if (c == '-' && !(_pos + 1 < _src.Length && char.IsAsciiDigit(_src[_pos + 1])))
+        {
+            _pos++;
+            return new SqlToken(SqlTokenKind.Minus, start, 1);
         }
 
         if (c == ',')

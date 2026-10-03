@@ -8,7 +8,11 @@ public sealed class SimpleWhereClause
     /// <summary>When set, <see cref="ColumnName"/> is on this table (<c>table.column</c> form).</summary>
     public string? QualifierTableName { get; init; }
 
-    public required string ColumnName { get; init; }
+    /// <summary>Single-column compare when <see cref="LeftExpression"/> is null.</summary>
+    public string ColumnName { get; init; } = "";
+
+    /// <summary>Int32 arithmetic/compare expression on the left-hand side of the predicate.</summary>
+    public LogicalScalarExpression? LeftExpression { get; init; }
 
     public required ScalarCompareOp Operator { get; init; }
 

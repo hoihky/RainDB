@@ -17,6 +17,15 @@ public sealed class LogicalColumnProjection : LogicalSelectListItem
 }
 
 /// <summary>Aggregate function call (including <c>COUNT(*)</c>).</summary>
+/// <summary>Scalar expression in the SELECT list (non-grouped queries).</summary>
+public sealed class LogicalScalarProjection : LogicalSelectListItem
+{
+    public required LogicalScalarExpression Expression { get; init; }
+
+    /// <summary>Optional <c>AS</c> alias for the result column.</summary>
+    public string? OutputAlias { get; init; }
+}
+
 public sealed class LogicalAggregationCall : LogicalSelectListItem
 {
     public required AggregateKind Kind { get; init; }

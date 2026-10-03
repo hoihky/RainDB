@@ -27,12 +27,25 @@ public sealed class RainDbFileDatabase : IRainDbBatchPersistence
     };
 
     private readonly object _ioLock = new();
+    private readonly RainDbAtomicFileWriter _atomicWriter = new();
+    private readonly RainDbBatchMmapReader _mmapReader = new();
+    private readonly RainDbFileDatabaseOptions _options;
+    private readonly RainDbMappedBatchMemoryManager _mappedBatchMemory;
 
-    private RainDbFileDatabase(string rootDirectory, InMemoryCatalog catalog)
+    private RainDbFileDatabase(string rootDirectory, InMemoryCatalog catalog, RainDbFileDatabaseOptions options)
     {
         RootDirectory = rootDirectory;
         Catalog = catalog;
+        _options = options;
+        _mappedBatchMemory = new RainDbMappedBatchMemoryManager(
+            options.MappedBatchMemoryBudgetBytes,
+            options.MappedBatchBudgetExceededBehavior);
     }
+
+    /// <summary>LRU mmap budget tracker for hydrated batches.</summary>
+    public RainDbMappedBatchMemoryManager MappedBatchMemory => _mappedBatchMemory;
+
+    public IMappedBatchScanObserver MappedBatchScanObserver => _mappedBatchMemory;
 
     /// <summary>Absolute root directory for this database.</summary>
     public string RootDirectory { get; }
@@ -40,13 +53,13 @@ public sealed class RainDbFileDatabase : IRainDbBatchPersistence
     public InMemoryCatalog Catalog { get; }
 
     /// <summary>Creates or opens a directory-backed database. Existing <see cref="CatalogFileName"/> tables are loaded into memory.</summary>
-    public static RainDbFileDatabase Open(string rootDirectory)
+    public static RainDbFileDatabase Open(string rootDirectory, RainDbFileDatabaseOptions? options = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(rootDirectory);
         var root = Path.GetFullPath(rootDirectory);
         Directory.CreateDirectory(root);
         var catalog = new InMemoryCatalog();
-        var db = new RainDbFileDatabase(root, catalog);
+        var db = new RainDbFileDatabase(root, catalog, options ?? new RainDbFileDatabaseOptions());
         db.HydrateFromDiskIfPresent();
         return db;
     }
@@ -84,6 +97,7 @@ public sealed class RainDbFileDatabase : IRainDbBatchPersistence
             Directory.Delete(tablesRoot, recursive: true);
         Directory.CreateDirectory(tablesRoot);
 
+        var writer = new RainDbAtomicFileWriter();
         var doc = new RainDbCatalogDocument { FormatVersion = 1 };
         foreach (var name in catalog.TableNames.OrderBy(n => n, StringComparer.OrdinalIgnoreCase))
         {
@@ -101,11 +115,12 @@ public sealed class RainDbFileDatabase : IRainDbBatchPersistence
             for (var i = 0; i < col.Batches.Count; i++)
             {
                 var batchPath = Path.Combine(tableDir, $"{i:D6}.batch");
-                WriteBatchFile(batchPath, col.Batches[i]);
+                writer.WriteStream(batchPath, fs => RainDbBatchBinaryCodec.WriteBatch(fs, col.Batches[i]));
             }
         }
 
-        WriteCatalogAtomicToRoot(root, doc);
+        var catalogPath = Path.Combine(root, CatalogFileName);
+        writer.WriteAllText(catalogPath, JsonSerializer.Serialize(doc, JsonOptions));
     }
 
     /// <summary>Loads tables from disk into a new in-memory catalog (no automatic persistence hook).</summary>
@@ -113,10 +128,8 @@ public sealed class RainDbFileDatabase : IRainDbBatchPersistence
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(rootDirectory);
         var root = Path.GetFullPath(rootDirectory);
-        var catalogPath = Path.Combine(root, CatalogFileName);
-        if (!File.Exists(catalogPath))
-            throw new FileNotFoundException("catalog.json not found.", catalogPath);
-        var json = File.ReadAllText(catalogPath);
+        if (!RainDbAtomicFileWriter.TryReadCommittedCatalogJson(root, out var json))
+            throw new FileNotFoundException("catalog.json not found.", Path.Combine(root, CatalogFileName));
         var doc = JsonSerializer.Deserialize<RainDbCatalogDocument>(json, JsonOptions)
             ?? throw new InvalidDataException("catalog.json could not be deserialized.");
         if (doc.FormatVersion != 1)
@@ -127,7 +140,7 @@ public sealed class RainDbFileDatabase : IRainDbBatchPersistence
             var schema = ToTableSchema(t);
             var id = TableId.From(Guid.ParseExact(t.Id, "N"));
             var table = new MemoryTable(t.Name, schema, id);
-            LoadBatchesIntoTable(root, table);
+            LoadBatchesIntoTableStatic(root, table, preferMmap: true);
             catalog.Register(table);
         }
 
@@ -142,17 +155,16 @@ public sealed class RainDbFileDatabase : IRainDbBatchPersistence
         {
             Directory.CreateDirectory(Path.GetDirectoryName(path)!);
             WriteBatchFile(path, batch);
+            FlushCatalog();
         }
     }
 
     private void HydrateFromDiskIfPresent()
     {
-        var catalogPath = Path.Combine(RootDirectory, CatalogFileName);
-        if (!File.Exists(catalogPath))
+        if (!RainDbAtomicFileWriter.TryReadCommittedCatalogJson(RootDirectory, out var json))
             return;
         lock (_ioLock)
         {
-            var json = File.ReadAllText(catalogPath);
             var doc = JsonSerializer.Deserialize<RainDbCatalogDocument>(json, JsonOptions)
                 ?? throw new InvalidDataException("catalog.json could not be deserialized.");
             if (doc.FormatVersion != 1)
@@ -163,22 +175,71 @@ public sealed class RainDbFileDatabase : IRainDbBatchPersistence
                 var id = TableId.From(Guid.ParseExact(t.Id, "N"));
                 var opts = new MemoryTableOptions(BatchPersistence: this);
                 var table = new MemoryTable(t.Name, schema, id, opts);
-                LoadBatchesIntoTable(RootDirectory, table);
+                LoadBatchesIntoTable(table, _options.PreferMmapBatchHydration);
                 Catalog.Register(table);
             }
         }
     }
 
-    private static void LoadBatchesIntoTable(string root, MemoryTable table)
+    private void LoadBatchesIntoTable(MemoryTable table, bool preferMmap)
     {
-        var dir = Path.Combine(root, TablesDirectoryName, table.Id.ToString());
+        var dir = Path.Combine(RootDirectory, TablesDirectoryName, table.Id.ToString());
         if (!Directory.Exists(dir))
             return;
         foreach (var file in Directory.GetFiles(dir, "*.batch").OrderBy(f => f, StringComparer.Ordinal))
         {
+            if (!RainDbAtomicFileWriter.IsCommittedBatchFileName(Path.GetFileName(file)))
+                continue;
+            if (preferMmap)
+            {
+                try
+                {
+                    var mapped = _mmapReader.Open(file);
+                    table.AppendHydratedBatch(mapped.Batch);
+                    _mappedBatchMemory.RegisterMappedBatch(table, table.Batches.Count - 1, mapped, file);
+                    continue;
+                }
+                catch (IOException)
+                {
+                }
+                catch (UnauthorizedAccessException)
+                {
+                }
+            }
+
             var bytes = File.ReadAllBytes(file);
             var batch = RainDbBatchBinaryCodec.DecodeBatch(bytes);
             table.AppendHydratedBatch(batch);
+        }
+    }
+
+    private static void LoadBatchesIntoTableStatic(string root, MemoryTable table, bool preferMmap)
+    {
+        var dir = Path.Combine(root, TablesDirectoryName, table.Id.ToString());
+        if (!Directory.Exists(dir))
+            return;
+        var reader = new RainDbBatchMmapReader();
+        foreach (var file in Directory.GetFiles(dir, "*.batch").OrderBy(f => f, StringComparer.Ordinal))
+        {
+            if (!RainDbAtomicFileWriter.IsCommittedBatchFileName(Path.GetFileName(file)))
+                continue;
+            if (preferMmap)
+            {
+                try
+                {
+                    table.AppendHydratedBatch(reader.Open(file).Batch);
+                    continue;
+                }
+                catch (IOException)
+                {
+                }
+                catch (UnauthorizedAccessException)
+                {
+                }
+            }
+
+            var bytes = File.ReadAllBytes(file);
+            table.AppendHydratedBatch(RainDbBatchBinaryCodec.DecodeBatch(bytes));
         }
     }
 
@@ -202,21 +263,20 @@ public sealed class RainDbFileDatabase : IRainDbBatchPersistence
 
     private void WriteCatalogAtomic(RainDbCatalogDocument doc) => WriteCatalogAtomicToRoot(RootDirectory, doc);
 
-    private static void WriteCatalogAtomicToRoot(string root, RainDbCatalogDocument doc)
+    private void WriteCatalogAtomicToRoot(string root, RainDbCatalogDocument doc)
     {
         var catalogPath = Path.Combine(root, CatalogFileName);
-        var tmp = catalogPath + ".tmp";
         var json = JsonSerializer.Serialize(doc, JsonOptions);
-        File.WriteAllText(tmp, json);
-        File.Move(tmp, catalogPath, overwrite: true);
+        _atomicWriter.WriteAllText(catalogPath, json);
     }
 
-    private static void WriteBatchFile(string path, IColumnarBatch batch)
+    private void WriteBatchFile(string path, IColumnarBatch batch)
     {
-        var tmp = path + ".tmp";
-        using (var fs = File.Create(tmp))
-            RainDbBatchBinaryCodec.WriteBatch(fs, batch);
-        File.Move(tmp, path, overwrite: true);
+        var codecOptions = new RainDbBatchCodecOptions
+        {
+            EnableInt32DictionaryEncoding = _options.EnableInt32DictionaryEncoding,
+        };
+        _atomicWriter.WriteStream(path, fs => RainDbBatchBinaryCodec.WriteBatch(fs, batch, codecOptions));
     }
 
     private string GetBatchPath(TableId tableId, int zeroBasedBatchIndex) =>
