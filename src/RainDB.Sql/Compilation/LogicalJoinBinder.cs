@@ -155,7 +155,8 @@ public sealed class LogicalJoinBinder
             aggs.ToArray(),
             slots.ToArray(),
             filters: null,
-            scanOptions);
+            havingFilters: null,
+            options: scanOptions);
         return new GroupedJoinPhysicalPlan(joinPlan, aggPlan);
     }
 
@@ -175,6 +176,10 @@ public sealed class LogicalJoinBinder
         var arr = new SortKeyPhysicalSpec[keys.Count];
         for (var i = 0; i < keys.Count; i++)
         {
+            if (keys[i].SortExpression is not null)
+                throw new SqlCompileException("ORDER BY expression is not supported on joins yet.");
+            if (keys[i].Column is null)
+                throw new SqlCompileException("ORDER BY requires a column reference on joins.");
             var ix = ResolveJoinOrderKeyColumnIndex(keys[i].Column, selectProjection, leftTs, rightTs);
             var t = joinOutputSchema.Columns[ix].Type;
             if (t != RainDbType.Utf8 && !ColumnTypeSizes.IsFixedWidth(t))

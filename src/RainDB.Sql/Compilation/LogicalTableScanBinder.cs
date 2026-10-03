@@ -14,7 +14,8 @@ namespace RainDB.Sql.Compilation;
 /// <summary>Binds <see cref="LogicalTableScan"/> to <see cref="IPhysicalPlan"/> (vectorized scan or hash aggregate).</summary>
 public sealed class LogicalTableScanBinder
 {
-    private readonly LogicalScalarExpressionBinder _scalarBinder = new();
+    private readonly ScalarExpressionBindingPipeline _expressions = new();
+    private readonly GroupedHavingBinder _havingBinder = new();
 
     public IPhysicalPlan BindAndLower(
         LogicalTableScan scan,
@@ -78,9 +79,13 @@ public sealed class LogicalTableScanBinder
             }
         }
 
+        if (scan.HavingConjuncts is { Count: > 0 } && aggs.Count == 0)
+            throw new SqlCompileException("HAVING requires at least one aggregate in the SELECT list.");
+
         ValidateWhereTableQualifiers(scan.WhereConjuncts, scan.TableName);
         var filters = BuildColumnCompareFilters(scan.WhereConjuncts, schema, scan.TableName);
-        return new HashAggregatePhysicalPlan(colTable.Id, groupIndices, aggs.ToArray(), slots.ToArray(), filters, scanOptions);
+        var having = _havingBinder.Bind(scan.HavingConjuncts, scan.SelectList!, scan.GroupByColumns!, schema, scan.TableName, aggs.ToArray());
+        return new HashAggregatePhysicalPlan(colTable.Id, groupIndices, aggs.ToArray(), slots.ToArray(), filters, having, scanOptions);
     }
 
     private static string NormalizeGroupKey(LogicalColumnProjection p, string scanTable) =>
@@ -104,7 +109,7 @@ public sealed class LogicalTableScanBinder
             case AggregateKind.Count:
             {
                 var ci = ResolveColumn(schema, agg.ArgumentColumnName!, tableName);
-                ValidateAggregate(schema.Columns[ci].Type, AggregateKind.Count);
+                AggregateTypeRules.EnsureSupported(schema.Columns[ci].Type, AggregateKind.Count);
                 return new AggregateSpec(ci, AggregateKind.Count);
             }
             case AggregateKind.Sum:
@@ -112,7 +117,7 @@ public sealed class LogicalTableScanBinder
             case AggregateKind.Max:
             {
                 var si = ResolveColumn(schema, agg.ArgumentColumnName!, tableName);
-                ValidateAggregate(schema.Columns[si].Type, agg.Kind);
+                AggregateTypeRules.EnsureSupported(schema.Columns[si].Type, agg.Kind);
                 return new AggregateSpec(si, agg.Kind);
             }
             default:
@@ -143,9 +148,9 @@ public sealed class LogicalTableScanBinder
                 spec = new AggregateSpec(ResolveColumn(schema, a.ColumnName!, scan.TableName), a.Kind);
 
             if (spec.SourceColumnIndex >= 0)
-                ValidateAggregate(schema.Columns[spec.SourceColumnIndex].Type, spec.Kind);
+                AggregateTypeRules.EnsureSupported(schema.Columns[spec.SourceColumnIndex].Type, spec.Kind);
             else
-                ValidateAggregate(RainDbType.Int32, spec.Kind); // COUNT(*) — type ignored
+                AggregateTypeRules.EnsureSupported(RainDbType.Int32, spec.Kind); // COUNT(*) — type ignored
 
             aggregate = spec;
             outputColumns = spec.SourceColumnIndex >= 0
@@ -182,7 +187,8 @@ public sealed class LogicalTableScanBinder
         var sortSpecs = scan.OrderBy is { Count: > 0 } ob
             ? BuildTableSortKeySpecs(schema, scan.TableName, ob)
             : Array.Empty<SortKeyPhysicalSpec>();
-        var sortOutputIndices = Array.ConvertAll(outputColumns, static c => c.Int32Expression is null ? c.ColumnIndex : -1);
+        var sortOutputIndices = Array.ConvertAll(outputColumns, static c =>
+            c.Int32Expression is null && c.Float64Expression is null ? c.ColumnIndex : -1);
         if (sortOutputIndices.Any(static i => i < 0))
             throw new SqlCompileException("ORDER BY / LIMIT with computed SELECT expressions is not supported yet.");
         return new SortTopNPhysicalPlan(colTable.Id, sortOutputIndices, filters, sortSpecs, scan.Limit, scanOptions);
@@ -203,7 +209,7 @@ public sealed class LogicalTableScanBinder
                     cols[i] = new ScanOutputColumn(ResolveColumn(schema, p.ColumnName, tableName));
                     break;
                 case LogicalScalarProjection sp:
-                    cols[i] = new ScanOutputColumn(-1, _scalarBinder.BindInt32(sp.Expression, schema, tableName));
+                    cols[i] = BindScalarProjection(sp.Expression, schema, tableName);
                     break;
                 default:
                     throw new SqlCompileException("Unsupported SELECT list item for a non-grouped scan.");
@@ -213,7 +219,18 @@ public sealed class LogicalTableScanBinder
         return cols;
     }
 
-    private static SortKeyPhysicalSpec[] BuildTableSortKeySpecs(
+    private ScanOutputColumn BindScalarProjection(LogicalScalarExpression expr, TableSchema schema, string tableName)
+    {
+        var t = _expressions.InferType(expr, schema, tableName);
+        return t switch
+        {
+            RainDbType.Int32 => new ScanOutputColumn(-1, _expressions.BindInt32(expr, schema, tableName)),
+            RainDbType.Float64 => new ScanOutputColumn(-1, Float64Expression: _expressions.BindFloat64(expr, schema, tableName)),
+            _ => throw new SqlCompileException($"SELECT expression result type {t} is not supported."),
+        };
+    }
+
+    private SortKeyPhysicalSpec[] BuildTableSortKeySpecs(
         TableSchema schema,
         string tableName,
         IReadOnlyList<LogicalSortKey> keys)
@@ -222,13 +239,27 @@ public sealed class LogicalTableScanBinder
         for (var i = 0; i < keys.Count; i++)
         {
             var k = keys[i];
+            if (k.SortExpression is { } sortExpr)
+            {
+                var t = _expressions.InferType(sortExpr, schema, tableName);
+                arr[i] = t switch
+                {
+                    RainDbType.Int32 => new SortKeyPhysicalSpec(Descending: k.Descending, Int32SortExpression: _expressions.BindInt32(sortExpr, schema, tableName)),
+                    RainDbType.Float64 => new SortKeyPhysicalSpec(Descending: k.Descending, Float64SortExpression: _expressions.BindFloat64(sortExpr, schema, tableName)),
+                    _ => throw new SqlCompileException($"ORDER BY expression type {t} is not supported."),
+                };
+                continue;
+            }
+
+            if (k.Column is null)
+                throw new SqlCompileException("ORDER BY requires a column or expression.");
             ValidateProjectionTableQualifier(k.Column, tableName);
             var ix = ResolveColumn(schema, k.Column.ColumnName, tableName);
-            var t = schema.Columns[ix].Type;
-            if (t != RainDbType.Utf8 && !ColumnTypeSizes.IsFixedWidth(t))
+            var colType = schema.Columns[ix].Type;
+            if (colType != RainDbType.Utf8 && !ColumnTypeSizes.IsFixedWidth(colType))
             {
                 throw new SqlCompileException(
-                    $"ORDER BY does not support type {t} for column '{schema.Columns[ix].Name}'.");
+                    $"ORDER BY does not support type {colType} for column '{schema.Columns[ix].Name}'.");
             }
 
             arr[i] = new SortKeyPhysicalSpec(ix, k.Descending);
@@ -256,10 +287,23 @@ public sealed class LogicalTableScanBinder
             throw new SqlCompileException($"WHERE predicate is missing a literal value.");
         if (where.LeftExpression is { } lex)
         {
-            LogicalScalarExpressionBinder.ValidateExpressionTableRefs(lex, tableName);
-            var bound = _scalarBinder.BindInt32(lex, schema, tableName);
-            var imm = CoerceLiteralToImmediateBits(RainDbType.Int32, literal);
-            return new ColumnCompareFilter(-1, where.Operator, imm, Int32Expression: bound);
+            ScalarExpressionBindingPipeline.ValidateTableRefs(lex, tableName);
+            var exprType = _expressions.InferType(lex, schema, tableName);
+            if (exprType == RainDbType.Int32)
+            {
+                var bound = _expressions.BindInt32(lex, schema, tableName);
+                var imm = CoerceLiteralToImmediateBits(RainDbType.Int32, literal);
+                return new ColumnCompareFilter(-1, where.Operator, imm, Int32Expression: bound);
+            }
+
+            if (exprType == RainDbType.Float64)
+            {
+                var bound = _expressions.BindFloat64(lex, schema, tableName);
+                var imm = CoerceLiteralToImmediateBits(RainDbType.Float64, literal);
+                return new ColumnCompareFilter(-1, where.Operator, imm, Float64Expression: bound);
+            }
+
+            throw new SqlCompileException($"WHERE expression type {exprType} is not supported.");
         }
 
         var wi = ResolveColumn(schema, where.ColumnName, tableName);
@@ -301,25 +345,10 @@ public sealed class LogicalTableScanBinder
     internal static void ValidateWhereTableQualifier(SimpleWhereClause? where, string scannedTableName)
     {
         if (where?.LeftExpression is { } lex)
-            LogicalScalarExpressionBinder.ValidateExpressionTableRefs(lex, scannedTableName);
+            ScalarExpressionBindingPipeline.ValidateTableRefs(lex, scannedTableName);
         if (where?.QualifierTableName is { } q && !q.Equals(scannedTableName, StringComparison.OrdinalIgnoreCase))
             throw new SqlCompileException(
                 $"WHERE references table '{q}' but the FROM clause scans '{scannedTableName}' only.");
-    }
-
-    private static void ValidateAggregate(RainDbType columnType, AggregateKind kind)
-    {
-        switch (kind)
-        {
-            case AggregateKind.Count:
-                return;
-            case AggregateKind.Sum when columnType is RainDbType.Int32 or RainDbType.Int64 or RainDbType.Float64:
-                return;
-            case AggregateKind.Min or AggregateKind.Max when columnType == RainDbType.Float64:
-                return;
-            default:
-                throw new SqlCompileException($"Aggregate {kind} is not supported for type {columnType}.");
-        }
     }
 
     internal static int ResolveColumn(TableSchema schema, string name, string tableName)

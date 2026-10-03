@@ -91,7 +91,15 @@ public sealed class HashAggregateOperator : Operators.IHashAggregateOperator, Op
         var global = MergePartials(partials, plan.Aggregates);
         var sortedKeys = SortKeys(global.Keys, schema, plan.GroupKeyColumnIndices);
         var outBatch = MaterializeOutput(sortedKeys, global, plan, schema);
+        outBatch = ApplyHavingIfNeeded(outBatch, plan, context);
         return new ColumnarMaterializedQueryResult([outBatch]);
+    }
+
+    private static ColumnarBatch ApplyHavingIfNeeded(ColumnarBatch batch, HashAggregatePhysicalPlan plan, IExecutionContext context)
+    {
+        if (plan.HavingFilters is not { Length: > 0 } hf)
+            return batch;
+        return GroupHavingEvaluator.Apply(batch, hf, context.BufferPool, context.AlignedBufferPool);
     }
 
     void Operators.IHashAggregateGroupingSupport.ValidatePlanForInputSchema(HashAggregatePhysicalPlan plan, TableSchema schema)
@@ -252,7 +260,7 @@ public sealed class HashAggregateOperator : Operators.IHashAggregateOperator, Op
                 return;
             case AggregateKind.Sum when columnType is RainDbType.Int32 or RainDbType.Int64 or RainDbType.Float64:
                 return;
-            case AggregateKind.Min or AggregateKind.Max when columnType == RainDbType.Float64:
+            case AggregateKind.Min or AggregateKind.Max when columnType is RainDbType.Float64 or RainDbType.Int32 or RainDbType.Int64 or RainDbType.Utf8:
                 return;
             default:
                 throw new NotSupportedException($"Aggregate {kind} on {columnType} is not supported for hash aggregation.");
@@ -435,6 +443,9 @@ public sealed class HashAggregateOperator : Operators.IHashAggregateOperator, Op
         int rowCount)
     {
         var resultType = AggregateResultType(spec, schema);
+        if (resultType == RainDbType.Utf8)
+            return MaterializeUtf8AggregateColumn(sortedKeys, global, aggIndex, spec, rowCount);
+
         var w = ColumnTypeSizes.FixedWidthBytes(resultType);
         var values = new byte[rowCount * w];
         var nbBytes = ColumnTypeSizes.NullBitmapBytes(rowCount);
@@ -458,6 +469,37 @@ public sealed class HashAggregateOperator : Operators.IHashAggregateOperator, Op
         if (spec.Kind == AggregateKind.Count)
             hasNulls = false;
         return new FixedWidthColumnChunk(resultType, rowCount, values, nb, hasNulls);
+    }
+
+    private static IColumnChunk MaterializeUtf8AggregateColumn(
+        GroupKey[] sortedKeys,
+        Dictionary<GroupKey, AggregateAccumulator[]> global,
+        int aggIndex,
+        AggregateSpec spec,
+        int rowCount)
+    {
+        var offsets = new int[rowCount + 1];
+        var blob = new List<byte>();
+        var nbBytes = ColumnTypeSizes.NullBitmapBytes(rowCount);
+        var nb = nbBytes > 0 ? new byte[nbBytes] : Array.Empty<byte>();
+        var anyNull = false;
+        for (var r = 0; r < rowCount; r++)
+        {
+            offsets[r] = blob.Count;
+            var acc = global[sortedKeys[r]][aggIndex];
+            if (ShouldEmitAggregateNull(spec, acc))
+            {
+                anyNull = true;
+                SetNull(nb, r);
+                continue;
+            }
+
+            var bytes = spec.Kind == AggregateKind.Min ? acc.Utf8MinBytes! : acc.Utf8MaxBytes!;
+            blob.AddRange(bytes);
+        }
+
+        offsets[rowCount] = blob.Count;
+        return new Utf8ColumnChunk(rowCount, offsets, blob.ToArray(), nb, anyNull);
     }
 
     private static bool ShouldEmitAggregateNull(AggregateSpec spec, AggregateAccumulator acc)
@@ -486,6 +528,18 @@ public sealed class HashAggregateOperator : Operators.IHashAggregateOperator, Op
             case AggregateKind.Sum:
                 BinaryPrimitives.WriteInt64LittleEndian(dest, acc.IntSum);
                 break;
+            case AggregateKind.Min when srcType == RainDbType.Int32:
+                BinaryPrimitives.WriteInt32LittleEndian(dest, acc.Int32Min);
+                break;
+            case AggregateKind.Max when srcType == RainDbType.Int32:
+                BinaryPrimitives.WriteInt32LittleEndian(dest, acc.Int32Max);
+                break;
+            case AggregateKind.Min when srcType == RainDbType.Int64:
+                BinaryPrimitives.WriteInt64LittleEndian(dest, acc.Int64Min);
+                break;
+            case AggregateKind.Max when srcType == RainDbType.Int64:
+                BinaryPrimitives.WriteInt64LittleEndian(dest, acc.Int64Max);
+                break;
             case AggregateKind.Min:
                 BinaryPrimitives.WriteInt64LittleEndian(dest, BitConverter.DoubleToInt64Bits(acc.FloatMin));
                 break;
@@ -503,6 +557,7 @@ public sealed class HashAggregateOperator : Operators.IHashAggregateOperator, Op
             AggregateKind.Count => RainDbType.Int64,
             AggregateKind.Sum when spec.SourceColumnIndex >= 0 && schema.Columns[spec.SourceColumnIndex].Type == RainDbType.Float64 => RainDbType.Float64,
             AggregateKind.Sum => RainDbType.Int64,
+            AggregateKind.Min or AggregateKind.Max when spec.SourceColumnIndex >= 0 => schema.Columns[spec.SourceColumnIndex].Type,
             AggregateKind.Min or AggregateKind.Max => RainDbType.Float64,
             _ => throw new ArgumentOutOfRangeException(nameof(spec.Kind), spec.Kind, null),
         };
@@ -869,6 +924,13 @@ internal struct AggregateAccumulator
     public double FloatMin;
     public double FloatMax;
     public long IntSum;
+    public int Int32Min;
+    public int Int32Max;
+    public long Int64Min;
+    public long Int64Max;
+    public byte[]? Utf8MinBytes;
+    public byte[]? Utf8MaxBytes;
+    public RainDbType ExtremumPhysicalType;
     public bool HasMin;
     public bool HasMax;
 }
@@ -928,6 +990,7 @@ internal static class AggregateRowOps
                 if (!acc.HasMin)
                 {
                     acc.FloatMin = v;
+                    acc.ExtremumPhysicalType = RainDbType.Float64;
                     acc.HasMin = true;
                 }
                 else if (v < acc.FloatMin)
@@ -943,11 +1006,96 @@ internal static class AggregateRowOps
                 if (!acc.HasMax)
                 {
                     acc.FloatMax = v;
+                    acc.ExtremumPhysicalType = RainDbType.Float64;
                     acc.HasMax = true;
                 }
                 else if (v > acc.FloatMax)
                     acc.FloatMax = v;
 
+                acc.ContributingRows++;
+                break;
+            }
+            case AggregateKind.Min when col.PhysicalType == RainDbType.Int32:
+            {
+                var v = BinaryPrimitives.ReadInt32LittleEndian(values.Slice(row * sizeof(int), sizeof(int)));
+                if (!acc.HasMin)
+                {
+                    acc.Int32Min = v;
+                    acc.ExtremumPhysicalType = RainDbType.Int32;
+                    acc.HasMin = true;
+                }
+                else if (v < acc.Int32Min)
+                    acc.Int32Min = v;
+                acc.ContributingRows++;
+                break;
+            }
+            case AggregateKind.Max when col.PhysicalType == RainDbType.Int32:
+            {
+                var v = BinaryPrimitives.ReadInt32LittleEndian(values.Slice(row * sizeof(int), sizeof(int)));
+                if (!acc.HasMax)
+                {
+                    acc.Int32Max = v;
+                    acc.ExtremumPhysicalType = RainDbType.Int32;
+                    acc.HasMax = true;
+                }
+                else if (v > acc.Int32Max)
+                    acc.Int32Max = v;
+                acc.ContributingRows++;
+                break;
+            }
+            case AggregateKind.Min when col.PhysicalType == RainDbType.Int64:
+            {
+                var v = BinaryPrimitives.ReadInt64LittleEndian(values.Slice(row * sizeof(long), sizeof(long)));
+                if (!acc.HasMin)
+                {
+                    acc.Int64Min = v;
+                    acc.ExtremumPhysicalType = RainDbType.Int64;
+                    acc.HasMin = true;
+                }
+                else if (v < acc.Int64Min)
+                    acc.Int64Min = v;
+                acc.ContributingRows++;
+                break;
+            }
+            case AggregateKind.Max when col.PhysicalType == RainDbType.Int64:
+            {
+                var v = BinaryPrimitives.ReadInt64LittleEndian(values.Slice(row * sizeof(long), sizeof(long)));
+                if (!acc.HasMax)
+                {
+                    acc.Int64Max = v;
+                    acc.ExtremumPhysicalType = RainDbType.Int64;
+                    acc.HasMax = true;
+                }
+                else if (v > acc.Int64Max)
+                    acc.Int64Max = v;
+                acc.ContributingRows++;
+                break;
+            }
+            case AggregateKind.Min when col.PhysicalType == RainDbType.Utf8:
+            {
+                var payload = Utf8Payload(col, row);
+                if (!acc.HasMin)
+                {
+                    acc.Utf8MinBytes = payload.ToArray();
+                    acc.ExtremumPhysicalType = RainDbType.Utf8;
+                    acc.HasMin = true;
+                }
+                else if (Utf8Compare(payload, acc.Utf8MinBytes!) < 0)
+                    acc.Utf8MinBytes = payload.ToArray();
+                acc.ContributingRows++;
+                break;
+            }
+            case AggregateKind.Max when col.PhysicalType == RainDbType.Utf8:
+            {
+                var payload = Utf8Payload(col, row);
+                if (!acc.HasMax)
+                {
+                    acc.Utf8MaxBytes = payload.ToArray();
+                    acc.ExtremumPhysicalType = RainDbType.Utf8;
+                    acc.HasMax = true;
+                }
+                else if (Utf8Compare(payload, acc.Utf8MaxBytes!) > 0)
+                    acc.Utf8MaxBytes = payload.ToArray();
                 acc.ContributingRows++;
                 break;
             }
@@ -990,12 +1138,7 @@ internal static class AggregateRowOps
                 return y;
             }
 
-            return new AggregateAccumulator
-            {
-                ContributingRows = rows,
-                FloatMin = Math.Min(a.FloatMin, b.FloatMin),
-                HasMin = true,
-            };
+            return CombineTypedMinMax(a, b, rows, isMin: true);
         }
 
         if (!a.HasMax)
@@ -1012,11 +1155,76 @@ internal static class AggregateRowOps
             return y;
         }
 
-        return new AggregateAccumulator
+        return CombineTypedMinMax(a, b, rows, isMin: false);
+    }
+
+    private static AggregateAccumulator CombineTypedMinMax(AggregateAccumulator a, AggregateAccumulator b, long rows, bool isMin)
+    {
+        var t = a.ExtremumPhysicalType != default ? a.ExtremumPhysicalType : b.ExtremumPhysicalType;
+        return t switch
         {
-            ContributingRows = rows,
-            FloatMax = Math.Max(a.FloatMax, b.FloatMax),
-            HasMax = true,
+            RainDbType.Utf8 => new AggregateAccumulator
+            {
+                ContributingRows = rows,
+                ExtremumPhysicalType = RainDbType.Utf8,
+                Utf8MinBytes = isMin
+                    ? (Utf8Compare(a.Utf8MinBytes, b.Utf8MinBytes) <= 0 ? a.Utf8MinBytes : b.Utf8MinBytes)
+                    : null,
+                Utf8MaxBytes = isMin
+                    ? null
+                    : (Utf8Compare(a.Utf8MaxBytes, b.Utf8MaxBytes) >= 0 ? a.Utf8MaxBytes : b.Utf8MaxBytes),
+                HasMin = isMin,
+                HasMax = !isMin,
+            },
+            RainDbType.Int32 => new AggregateAccumulator
+            {
+                ContributingRows = rows,
+                ExtremumPhysicalType = RainDbType.Int32,
+                Int32Min = isMin ? Math.Min(a.Int32Min, b.Int32Min) : 0,
+                Int32Max = isMin ? 0 : Math.Max(a.Int32Max, b.Int32Max),
+                HasMin = isMin,
+                HasMax = !isMin,
+            },
+            RainDbType.Int64 => new AggregateAccumulator
+            {
+                ContributingRows = rows,
+                ExtremumPhysicalType = RainDbType.Int64,
+                Int64Min = isMin ? Math.Min(a.Int64Min, b.Int64Min) : 0,
+                Int64Max = isMin ? 0 : Math.Max(a.Int64Max, b.Int64Max),
+                HasMin = isMin,
+                HasMax = !isMin,
+            },
+            _ => new AggregateAccumulator
+            {
+                ContributingRows = rows,
+                ExtremumPhysicalType = RainDbType.Float64,
+                FloatMin = isMin ? Math.Min(a.FloatMin, b.FloatMin) : 0,
+                FloatMax = isMin ? 0 : Math.Max(a.FloatMax, b.FloatMax),
+                HasMin = isMin,
+                HasMax = !isMin,
+            },
         };
+    }
+
+    private static ReadOnlySpan<byte> Utf8Payload(IColumnChunk col, int row) =>
+        col switch
+        {
+            Utf8ColumnChunk u => u.Values.Span[u.Offsets.Span[row]..u.Offsets.Span[row + 1]],
+            Utf8LengthPrefixedColumnChunk lp => lp.GetPayloadSpan(row),
+            _ => throw new InvalidOperationException(),
+        };
+
+    private static int Utf8Compare(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b) =>
+        a.SequenceCompareTo(b);
+
+    private static int Utf8Compare(byte[]? a, byte[]? b)
+    {
+        if (a is null && b is null)
+            return 0;
+        if (a is null)
+            return -1;
+        if (b is null)
+            return 1;
+        return a.AsSpan().SequenceCompareTo(b);
     }
 }

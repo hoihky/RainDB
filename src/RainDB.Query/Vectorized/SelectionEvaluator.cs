@@ -57,6 +57,8 @@ internal sealed class SelectionEvaluator
     {
         if (filter.Int32Expression is not null)
             return FillInt32ExpressionSelected(batch, filter, dest);
+        if (filter.Float64Expression is not null)
+            return FillFloat64ExpressionSelected(batch, filter, dest);
         return FillSelectedRows(batch.Columns[filter.ColumnIndex], filter, dest);
     }
 
@@ -64,6 +66,8 @@ internal sealed class SelectionEvaluator
     {
         if (filter.Int32Expression is not null)
             return IntersectInt32Expression(batch, filter, dest, count);
+        if (filter.Float64Expression is not null)
+            return IntersectFloat64Expression(batch, filter, dest, count);
         var col = batch.Columns[filter.ColumnIndex];
         return filter.Utf8LiteralBytes is not null || col.PhysicalType == RainDbType.Utf8
             ? IntersectUtf8(col, filter, dest, count)
@@ -253,6 +257,21 @@ internal sealed class SelectionEvaluator
         return count;
     }
 
+    private static int FillFloat64ExpressionSelected(IColumnarBatch batch, ColumnCompareFilter filter, Span<int> dest)
+    {
+        var expr = filter.Float64Expression!;
+        var imm = BitConverter.Int64BitsToDouble(filter.ImmediateBits);
+        var n = batch.RowCount;
+        var count = 0;
+        for (var i = 0; i < n; i++)
+        {
+            if (expr.TryGetFloat64(batch, i, out var v) && CompareDouble(v, imm, filter.Op))
+                dest[count++] = i;
+        }
+
+        return count;
+    }
+
     private static int IntersectInt32Expression(IColumnarBatch batch, ColumnCompareFilter filter, Span<int> dest, int count)
     {
         var expr = filter.Int32Expression!;
@@ -262,6 +281,21 @@ internal sealed class SelectionEvaluator
         {
             var row = dest[r];
             if (expr.TryGetInt32(batch, row, out var v) && CompareInt32(v, imm, filter.Op))
+                dest[write++] = row;
+        }
+
+        return write;
+    }
+
+    private static int IntersectFloat64Expression(IColumnarBatch batch, ColumnCompareFilter filter, Span<int> dest, int count)
+    {
+        var expr = filter.Float64Expression!;
+        var imm = BitConverter.Int64BitsToDouble(filter.ImmediateBits);
+        var write = 0;
+        for (var r = 0; r < count; r++)
+        {
+            var row = dest[r];
+            if (expr.TryGetFloat64(batch, row, out var v) && CompareDouble(v, imm, filter.Op))
                 dest[write++] = row;
         }
 

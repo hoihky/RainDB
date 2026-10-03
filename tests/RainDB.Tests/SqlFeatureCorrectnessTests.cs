@@ -184,12 +184,13 @@ public class SqlFeatureCorrectnessTests
     }
 
     [Fact]
-    public void Compile_rejects_having_clause()
+    public void Compile_rejects_having_without_aggregate()
     {
         var cat = new InMemoryCatalog();
         cat.Register(new MemoryTable("t", new TableSchema([new ColumnDef("x", RainDbType.Int32)])));
-        Assert.Throws<SqlCompileException>(() =>
+        var ex = Assert.Throws<SqlCompileException>(() =>
             StrictSqlSubset.CompilePhysicalPlan("SELECT x FROM t GROUP BY x HAVING x > 0", cat));
+        Assert.Contains("aggregate", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]

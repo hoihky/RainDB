@@ -26,6 +26,7 @@ public sealed class HashAggregatePhysicalPlan : IPhysicalPlan
         AggregateSpec[] aggregates,
         HashAggregateOutputSlot[]? outputColumns = null,
         ColumnCompareFilter[]? filters = null,
+        GroupOutputCompareFilter[]? havingFilters = null,
         VectorizedScanExecutionOptions options = default,
         int spillPartialEntryThreshold = 0)
     {
@@ -44,6 +45,7 @@ public sealed class HashAggregatePhysicalPlan : IPhysicalPlan
             : CreateDefaultOutputLayout(groupKeyColumnIndices.Length, aggregates.Length);
         ValidateOutputLayout(GroupKeyColumnIndices.Length, Aggregates.Length, OutputColumns);
         Filters = filters is { Length: > 0 } ? (ColumnCompareFilter[])filters.Clone() : null;
+        HavingFilters = havingFilters is { Length: > 0 } ? (GroupOutputCompareFilter[])havingFilters.Clone() : null;
         Options = options;
         SpillPartialEntryThreshold = spillPartialEntryThreshold;
     }
@@ -58,6 +60,9 @@ public sealed class HashAggregatePhysicalPlan : IPhysicalPlan
 
     /// <summary>AND conjunction of predicates on input rows.</summary>
     public ColumnCompareFilter[]? Filters { get; }
+
+    /// <summary>AND conjunction on grouped output rows (<c>HAVING</c>).</summary>
+    public GroupOutputCompareFilter[]? HavingFilters { get; }
 
     public VectorizedScanExecutionOptions Options { get; }
 

@@ -63,9 +63,10 @@ This document tracks what RainDB implements today and the original phased delive
 14. **Join heuristics (Phase B2)** — `HeuristicJoinAlgorithmSelector` chooses hash vs sort-merge from row-count ratio; algorithm appears in physical `EXPLAIN` (`JoinPhysicalPlan`).
 15. **Prepared SQL (Phase B3)** — `ISqlCompiler.PrepareAsync`, `@param` in WHERE, `CompiledSqlCache` keyed by SQL + `CatalogSchemaFingerprint`.
 16. **EXPLAIN (Phase B4)** — `EXPLAIN` / `EXPLAIN LOGICAL` / `EXPLAIN PHYSICAL` SQL; `ExplainBundlePhysicalPlan` → `ExplainTextQueryResult`.
-17. **Scalar expressions (Phase D1, partial)** — `LogicalScalarExpression` IR; Int32 arithmetic (`+ - * /`), `CAST(... AS INT)`, parentheses; in **`WHERE`** (compare to literal) and **`SELECT`** (computed columns). Float64 / `CASE` / join WHERE expressions not yet.
+17. **Scalar expressions (Phase D1)** — `ScalarExpressionBindingPipeline` binds Int32/Float64 arithmetic, `CAST`, `CASE`, and comparisons; used in **`WHERE`**, **`SELECT`**, and **`ORDER BY`** (expression keys). Samples: `samples/sql/08_*.sql`, `09_*.sql`.
+18. **HAVING + MIN/MAX (Phase D2)** — post-aggregate filters via `GroupedHavingBinder` / `GroupHavingEvaluator`; `MIN`/`MAX` on Int32, Int64, Float64, and Utf8 in hash aggregation. Samples: `samples/sql/10_*.sql`, `11_*.sql`. Automated coverage: `PhaseD1D2Tests.cs`.
 
-> **Note:** Remaining Phase D (HAVING, DISTINCT, outer joins, subqueries), cost model histograms, and `EXPLAIN ANALYZE` timers remain on the [Development Roadmap](Development-Roadmap.md).
+> **Note:** Remaining Phase D (DISTINCT, outer joins, subqueries), cost model histograms, and `EXPLAIN ANALYZE` timers remain on the [Development Roadmap](Development-Roadmap.md).
 
 ---
 

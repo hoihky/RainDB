@@ -27,10 +27,13 @@ public class SqlParserValidationTests
     }
 
     [Fact]
-    public void Having_is_rejected()
+    public void Having_parses_into_grouped_scan()
     {
-        Assert.Throws<SqlCompileException>(() =>
-            StrictSqlSubset.ParseLogicalPlan("SELECT x FROM t GROUP BY x HAVING x > 1"));
+        var plan = StrictSqlSubset.ParseLogicalPlan(
+            "SELECT x, SUM(v) FROM t GROUP BY x HAVING SUM(v) > 1");
+        var scan = Assert.IsType<RainDB.Logical.LogicalTableScan>(plan.Root);
+        Assert.NotNull(scan.HavingConjuncts);
+        Assert.Single(scan.HavingConjuncts);
     }
 
     [Fact]

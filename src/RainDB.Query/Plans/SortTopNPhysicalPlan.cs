@@ -1,10 +1,15 @@
 using RainDB.Catalog;
 using RainDB.Execution;
+using RainDB.Query.Vectorized;
 
 namespace RainDB.Query.Plans;
 
 /// <summary>Sort key: index into the row's column list (table schema for scans; join output schema for join+sort).</summary>
-public readonly record struct SortKeyPhysicalSpec(int ColumnIndex, bool Descending);
+public readonly record struct SortKeyPhysicalSpec(
+    int ColumnIndex = -1,
+    bool Descending = false,
+    BoundInt32RowExpression? Int32SortExpression = null,
+    BoundFloat64RowExpression? Float64SortExpression = null);
 
 /// <summary>
 /// Single-table scan output: optional row filter, projection, then global sort (optional keys) and <see cref="Limit"/> rows.

@@ -175,7 +175,17 @@ internal sealed class LogicalPlanCloner
             return null;
         var list = new List<LogicalSortKey>(keys.Count);
         foreach (var k in keys)
-            list.Add(new LogicalSortKey { Column = new LogicalColumnProjection { QualifierTableName = k.Column.QualifierTableName, ColumnName = k.Column.ColumnName }, Descending = k.Descending });
+        {
+            LogicalColumnProjection? col = null;
+            if (k.Column is { } c)
+                col = new LogicalColumnProjection { QualifierTableName = c.QualifierTableName, ColumnName = c.ColumnName };
+            list.Add(new LogicalSortKey
+            {
+                Column = col,
+                SortExpression = k.SortExpression is null ? null : CloneScalarExpression(k.SortExpression),
+                Descending = k.Descending,
+            });
+        }
         return list;
     }
 }

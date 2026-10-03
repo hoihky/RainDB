@@ -106,6 +106,7 @@ public sealed class SqlParser
                 if (selectItems.Count == 0)
                     throw new SqlCompileException("GROUP BY requires an explicit SELECT list.");
                 ValidateGroupedSelect(selectItems, groupByColsSingle, table);
+                var havingConjuncts = TryParseHavingClause();
                 RejectOrderByLimitAfterGrouped();
                 return new LogicalPlan(
                     new LogicalTableScan
@@ -114,6 +115,7 @@ public sealed class SqlParser
                         WhereConjuncts = whereConjuncts,
                         GroupByColumns = groupByColsSingle,
                         SelectList = selectItems,
+                        HavingConjuncts = havingConjuncts,
                     },
                     _explainLevel);
             }
@@ -510,9 +512,52 @@ public sealed class SqlParser
             return keys;
         }
 
+        private List<LogicalHavingConjunct>? TryParseHavingClause()
+        {
+            if (_cur.Kind != SqlTokenKind.Identifier || !LexemeEqualsIgnoreCase(_cur, "HAVING"))
+                return null;
+            Advance();
+            var list = new List<LogicalHavingConjunct> { ParseHavingPredicate() };
+            while (_cur.Kind == SqlTokenKind.KwAnd)
+            {
+                Advance();
+                list.Add(ParseHavingPredicate());
+            }
+
+            return list;
+        }
+
+        private LogicalHavingConjunct ParseHavingPredicate()
+        {
+            if (TryParseAggregationCall(out var agg))
+            {
+                var op = ParseCompareOp();
+                var lit = ParseLiteral();
+                return new LogicalHavingConjunct { Aggregate = agg, Operator = op, Literal = lit };
+            }
+
+            var col = ParseColumnProjection();
+            var op2 = ParseCompareOp();
+            var lit2 = ParseLiteral();
+            return new LogicalHavingConjunct { GroupKeyColumn = col, Operator = op2, Literal = lit2 };
+        }
+
         private LogicalSortKey ParseSortKey()
         {
-            var col = ParseColumnProjection();
+            var expr = ParseAdditiveExpression();
+            LogicalColumnProjection? col = null;
+            LogicalScalarExpression? sortExpr = null;
+            if (expr is LogicalColumnScalarRef crefOnly)
+            {
+                col = new LogicalColumnProjection
+                {
+                    QualifierTableName = crefOnly.QualifierTableName,
+                    ColumnName = crefOnly.ColumnName,
+                };
+            }
+            else
+                sortExpr = expr;
+
             var desc = false;
             if (_cur.Kind == SqlTokenKind.Identifier)
             {
@@ -525,7 +570,7 @@ public sealed class SqlParser
                 }
             }
 
-            return new LogicalSortKey { Column = col, Descending = desc };
+            return new LogicalSortKey { Column = col, SortExpression = sortExpr, Descending = desc };
         }
 
         private int? TryParseLimit()
@@ -674,6 +719,25 @@ public sealed class SqlParser
                 return inner;
             }
 
+            if (_cur.Kind == SqlTokenKind.Identifier && LexemeEqualsIgnoreCase(_cur, "CASE"))
+            {
+                Advance();
+                var whens = new List<LogicalCaseWhenClause>();
+                while (_cur.Kind == SqlTokenKind.Identifier && LexemeEqualsIgnoreCase(_cur, "WHEN"))
+                {
+                    Advance();
+                    var cond = ParseCompareScalar();
+                    ExpectKeyword("THEN");
+                    var result = ParseAdditiveExpression();
+                    whens.Add(new LogicalCaseWhenClause { Condition = cond, Result = result });
+                }
+
+                ExpectKeyword("ELSE");
+                var elseExpr = ParseAdditiveExpression();
+                ExpectKeyword("END");
+                return new LogicalCaseScalar { WhenClauses = whens, Else = elseExpr };
+            }
+
             if (_cur.Kind == SqlTokenKind.Identifier && LexemeEqualsIgnoreCase(_cur, "CAST"))
             {
                 Advance();
@@ -701,12 +765,30 @@ public sealed class SqlParser
             throw new SqlCompileException($"Expected scalar expression at position {_cur.Start}.");
         }
 
+        private LogicalCompareScalar ParseCompareScalar()
+        {
+            var left = ParseAdditiveExpression();
+            var op = ParseCompareOp();
+            if (_cur.Kind is SqlTokenKind.Number or SqlTokenKind.Identifier or SqlTokenKind.LParen)
+            {
+                return new LogicalCompareScalar
+                {
+                    Left = left,
+                    Operator = op,
+                    RightExpression = ParseAdditiveExpression(),
+                };
+            }
+
+            var lit = ParseLiteral();
+            return new LogicalCompareScalar { Left = left, Operator = op, RightLiteral = lit };
+        }
+
         private static RainDbType ParseRainDbTypeName(string name) =>
             name.ToUpperInvariant() switch
             {
                 "INT" or "INT32" or "INTEGER" => RainDbType.Int32,
                 "BIGINT" or "INT64" => RainDbType.Int64,
-                "DOUBLE" or "FLOAT64" => RainDbType.Float64,
+                "DOUBLE" or "FLOAT64" or "FLOAT" => RainDbType.Float64,
                 _ => throw new SqlCompileException($"Unsupported CAST target type '{name}'."),
             };
 

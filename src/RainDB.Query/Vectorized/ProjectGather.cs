@@ -65,11 +65,24 @@ internal sealed class ProjectGather
         for (var c = 0; c < outputColumns.Length; c++)
         {
             var slot = outputColumns[c];
-            if (slot.Int32Expression is { } expr)
+            if (slot.Int32Expression is { } i32Expr)
             {
                 cols[c] = MaterializeInt32Expression(
                     batch,
-                    expr,
+                    i32Expr,
+                    useRowSelection,
+                    selectedRows,
+                    selectedCount,
+                    bufferPool,
+                    alignedBufferPool);
+                continue;
+            }
+
+            if (slot.Float64Expression is { } f64Expr)
+            {
+                cols[c] = MaterializeFloat64Expression(
+                    batch,
+                    f64Expr,
                     useRowSelection,
                     selectedRows,
                     selectedCount,
@@ -124,6 +137,45 @@ internal sealed class ProjectGather
 
         return new FixedWidthColumnChunk(
             RainDbType.Int32,
+            selectedCount,
+            valuesOwner.Memory,
+            hasNulls ? nb.AsMemory(0, nbBytes) : ReadOnlyMemory<byte>.Empty,
+            hasNulls);
+    }
+
+    private static IColumnChunk MaterializeFloat64Expression(
+        IColumnarBatch batch,
+        BoundFloat64RowExpression expr,
+        bool useRowSelection,
+        ReadOnlySpan<int> selectedRows,
+        int selectedCount,
+        IBufferPool bufferPool,
+        IAlignedBufferPool alignedBufferPool)
+    {
+        var valueBytes = checked(selectedCount * sizeof(double));
+        var valuesOwner = alignedBufferPool.RentAligned(valueBytes);
+        var outValues = valuesOwner.Memory.Span[..valueBytes];
+        var nbBytes = ColumnTypeSizes.NullBitmapBytes(selectedCount);
+        var nb = bufferPool.Rent(nbBytes);
+        nb.AsSpan(0, nbBytes).Clear();
+        var hasNulls = false;
+        for (var i = 0; i < selectedCount; i++)
+        {
+            var row = useRowSelection ? selectedRows[i] : i;
+            if (!expr.TryGetFloat64(batch, row, out var v))
+            {
+                hasNulls = true;
+                nb[i >> 3] |= (byte)(1 << (i & 7));
+                continue;
+            }
+
+            BinaryPrimitives.WriteInt64LittleEndian(
+                outValues.Slice(i * sizeof(double), sizeof(double)),
+                BitConverter.DoubleToInt64Bits(v));
+        }
+
+        return new FixedWidthColumnChunk(
+            RainDbType.Float64,
             selectedCount,
             valuesOwner.Memory,
             hasNulls ? nb.AsMemory(0, nbBytes) : ReadOnlyMemory<byte>.Empty,

@@ -108,6 +108,8 @@ public sealed class SortTopNOperator : Operators.ISortTopNOperator
     {
         foreach (var k in keys)
         {
+            if (k.Int32SortExpression is not null || k.Float64SortExpression is not null)
+                continue;
             if ((uint)k.ColumnIndex >= (uint)schema.Columns.Count)
                 throw new ArgumentException($"Sort key column index {k.ColumnIndex} is out of range.", nameof(keys));
             var t = schema.Columns[k.ColumnIndex].Type;

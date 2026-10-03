@@ -91,3 +91,29 @@ public sealed class BoundInt32BinaryExpression : BoundInt32RowExpression
         }
     }
 }
+
+public sealed class BoundInt32CaseExpression : BoundInt32RowExpression
+{
+    private readonly (BoundScalarCompare Condition, BoundInt32RowExpression Result)[] _whenClauses;
+    private readonly BoundInt32RowExpression _else;
+
+    public BoundInt32CaseExpression(
+        IReadOnlyList<(BoundScalarCompare Condition, BoundInt32RowExpression Result)> whenClauses,
+        BoundInt32RowExpression elseBranch)
+    {
+        _whenClauses = whenClauses.ToArray();
+        _else = elseBranch;
+    }
+
+    public override bool TryGetInt32(IColumnarBatch batch, int row, out int value)
+    {
+        foreach (var (cond, result) in _whenClauses)
+        {
+            if (!cond.RowMatches(batch, row))
+                continue;
+            return result.TryGetInt32(batch, row, out value);
+        }
+
+        return _else.TryGetInt32(batch, row, out value);
+    }
+}

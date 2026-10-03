@@ -94,6 +94,21 @@ Scans on persistent tables automatically **touch** the LRU tracker via `IMappedB
 
 For in-memory export/import without the mmap manager, `RainDbBatchBinaryCodec.EncodeBatch(batch, new RainDbBatchCodecOptions { EnableInt32DictionaryEncoding = true })` applies the same encoding heuristics.
 
+### 2.2.2 SQL expressions, HAVING, and MIN/MAX (Phase D1/D2)
+
+The strict SQL subset supports scalar expressions in `WHERE`, `SELECT`, and `ORDER BY` (Int32 and Float64 arithmetic, `CAST`, `CASE`), plus `HAVING` on grouped queries and `MIN`/`MAX` over Int32, Int64, Float64, and Utf8.
+
+Example scripts (run against `TestDataBuilders.RegisterAnalyticsDemoTables` or `RainDB.AnalyticsDemo`):
+
+| File | Topic |
+|------|--------|
+| `samples/sql/08_select_expressions.sql` | `SELECT` / `WHERE` with `+` |
+| `samples/sql/09_case_expression.sql` | `CASE WHEN … THEN … ELSE …` |
+| `samples/sql/10_having_aggregate_filter.sql` | `HAVING` on `SUM` |
+| `samples/sql/11_min_max_by_type.sql` | `MIN` / `MAX` per group |
+
+`HAVING` must reference columns or aggregates that appear in the `SELECT` list. `ORDER BY` with only computed `SELECT` columns is not supported yet (use a base table column in `ORDER BY`).
+
 ### 2.3 Custom catalog
 
 ```csharp

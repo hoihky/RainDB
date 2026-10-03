@@ -31,12 +31,46 @@ internal sealed class SchemaRowLocationComparer : IComparer<RowLocation>
     {
         foreach (var spec in _keys)
         {
-            var c = CompareAtColumn(spec.ColumnIndex, x, y);
+            var c = spec.Int32SortExpression is { } i32
+                ? CompareInt32Expression(i32, x, y)
+                : spec.Float64SortExpression is { } f64
+                    ? CompareFloat64Expression(f64, x, y)
+                    : CompareAtColumn(spec.ColumnIndex, x, y);
             if (c != 0)
                 return spec.Descending ? -c : c;
         }
 
         return 0;
+    }
+
+    private int CompareInt32Expression(BoundInt32RowExpression expr, RowLocation a, RowLocation b)
+    {
+        var batchA = _batches[a.BatchIndex];
+        var batchB = _batches[b.BatchIndex];
+        var hasA = expr.TryGetInt32(batchA, a.RowIndex, out var va);
+        var hasB = expr.TryGetInt32(batchB, b.RowIndex, out var vb);
+        if (!hasA && !hasB)
+            return 0;
+        if (!hasA)
+            return -1;
+        if (!hasB)
+            return 1;
+        return va.CompareTo(vb);
+    }
+
+    private int CompareFloat64Expression(BoundFloat64RowExpression expr, RowLocation a, RowLocation b)
+    {
+        var batchA = _batches[a.BatchIndex];
+        var batchB = _batches[b.BatchIndex];
+        var hasA = expr.TryGetFloat64(batchA, a.RowIndex, out var va);
+        var hasB = expr.TryGetFloat64(batchB, b.RowIndex, out var vb);
+        if (!hasA && !hasB)
+            return 0;
+        if (!hasA)
+            return -1;
+        if (!hasB)
+            return 1;
+        return va.CompareTo(vb);
     }
 
     private int CompareAtColumn(int colIx, RowLocation a, RowLocation b)

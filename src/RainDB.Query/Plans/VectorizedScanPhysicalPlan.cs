@@ -80,7 +80,8 @@ public sealed class VectorizedScanPhysicalPlan : IPhysicalPlan
 
 public readonly record struct ScanOutputColumn(
     int ColumnIndex = -1,
-    BoundInt32RowExpression? Int32Expression = null);
+    BoundInt32RowExpression? Int32Expression = null,
+    BoundFloat64RowExpression? Float64Expression = null);
 
 /// <summary>
 /// Compares a column to an immediate: fixed-width uses <see cref="ImmediateBits"/>; UTF-8 uses <see cref="Utf8LiteralBytes"/> with only Eq/Ne.
@@ -91,7 +92,8 @@ public readonly record struct ColumnCompareFilter(
     ScalarCompareOp Op,
     long ImmediateBits,
     byte[]? Utf8LiteralBytes = null,
-    BoundInt32RowExpression? Int32Expression = null);
+    BoundInt32RowExpression? Int32Expression = null,
+    BoundFloat64RowExpression? Float64Expression = null);
 
 /// <summary>Single-column aggregate over filtered rows (P1: Float64 sum/min/max; Int32/Int64 sum uses Int64Value).</summary>
 public readonly record struct AggregateSpec(int SourceColumnIndex, AggregateKind Kind);
