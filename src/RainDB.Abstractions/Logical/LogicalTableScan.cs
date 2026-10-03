@@ -93,7 +93,11 @@ public sealed class LogicalTableScan : ILogicalRoot
                 var w = wc[i];
                 if (w.QualifierTableName is { } qt)
                     sb.Append(qt).Append('.');
-                sb.Append(w.ColumnName).Append(' ').Append(w.Operator).Append(' ').Append(w.Literal.Text);
+                sb.Append(w.ColumnName).Append(' ').Append(w.Operator).Append(' ');
+                if (w.UsesParameter)
+                    sb.Append('@').Append(w.ParameterName);
+                else
+                    sb.Append(w.Literal?.Text ?? "?");
             }
         }
 

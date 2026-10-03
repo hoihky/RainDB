@@ -54,15 +54,15 @@ This document tracks what RainDB implements today and the original phased delive
 
 ---
 
-## Phase 3 — Planning & SQL (not started)
+## Phase 3 — Planning & SQL (partial)
 
-12. **Logical plan IR** — relational algebra nodes (scan, filter, project, join, agg, sort).
-13. **Rule-based optimizer** — predicate pushdown, projection pruning, join reordering heuristics.
-14. **Cost model v0** — row counts + distinct counts from statistics; **histograms** optional.
-15. **SQL parser** — start with **subset** (SELECT, FROM, WHERE, GROUP BY, ORDER BY, JOIN); ANTLR or hand-written recursive descent; errors with source locations.
-16. **`ISqlCompiler`** — parse → logical → physical; single pipeline shared with LINQ.
+12. **Logical plan IR** — scan/join roots with WHERE, GROUP BY, ORDER BY, LIMIT (strict subset).
+13. **Rule-based optimizer (Phase B1)** — `LogicalRewritePipeline` + instance rewrite rules: join predicate partition, table/join projection pruning, limit validation. Applied in `SqlCompilationService` before physical bind.
+14. **Join heuristics (Phase B2)** — `HeuristicJoinAlgorithmSelector` chooses hash vs sort-merge from row-count ratio; algorithm appears in physical `EXPLAIN` (`JoinPhysicalPlan`).
+15. **Prepared SQL (Phase B3)** — `ISqlCompiler.PrepareAsync`, `@param` in WHERE, `CompiledSqlCache` keyed by SQL + `CatalogSchemaFingerprint`.
+16. **EXPLAIN (Phase B4)** — `EXPLAIN` / `EXPLAIN LOGICAL` / `EXPLAIN PHYSICAL` SQL; `ExplainBundlePhysicalPlan` → `ExplainTextQueryResult`.
 
-> **Note:** Much of Phase 3 is partially delivered (logical IR, strict SQL subset, `ISqlCompiler`). Remaining work is optimizer, broader SQL, and compile-once semantics — see [Development Roadmap](Development-Roadmap.md) Phases B and D.
+> **Note:** Broader SQL (Phase D), cost model histograms, and `EXPLAIN ANALYZE` timers remain on the [Development Roadmap](Development-Roadmap.md).
 
 ---
 

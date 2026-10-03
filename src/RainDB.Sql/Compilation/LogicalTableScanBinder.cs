@@ -214,6 +214,10 @@ public sealed class LogicalTableScanBinder
     /// <summary>Binds one conjunct to a column filter (shared with join lowering).</summary>
     internal ColumnCompareFilter BuildColumnCompareFilter(SimpleWhereClause where, TableSchema schema, string tableName)
     {
+        if (where.UsesParameter)
+            throw new SqlCompileException($"Parameter '@{where.ParameterName}' must be bound before physical compilation.");
+        if (where.Literal is not { } literal)
+            throw new SqlCompileException($"WHERE predicate on '{where.ColumnName}' is missing a literal value.");
         var wi = ResolveColumn(schema, where.ColumnName, tableName);
         var wt = schema.Columns[wi].Type;
         if (wt == RainDbType.Utf8)
@@ -221,17 +225,17 @@ public sealed class LogicalTableScanBinder
             if (where.Operator is not (ScalarCompareOp.Eq or ScalarCompareOp.Ne))
                 throw new SqlCompileException(
                     $"WHERE on UTF-8 column '{where.ColumnName}' (table '{tableName}') supports only '=' and '!=' or '<>' with a string literal.");
-            if (where.Literal.Kind != SqlLiteralKind.String)
+            if (literal.Kind != SqlLiteralKind.String)
                 throw new SqlCompileException(
                     $"UTF-8 column '{where.ColumnName}' (table '{tableName}') requires a single-quoted string literal.");
-            var bytes = Encoding.UTF8.GetBytes(where.Literal.Text);
+            var bytes = Encoding.UTF8.GetBytes(literal.Text);
             return new ColumnCompareFilter(wi, where.Operator, 0, bytes);
         }
 
         if (!ColumnTypeSizes.IsFixedWidth(wt))
             throw new SqlCompileException(
                 $"WHERE comparisons on type {wt} (column '{where.ColumnName}', table '{tableName}') are not supported.");
-        var bits = CoerceLiteralToImmediateBits(wt, where.Literal);
+        var bits = CoerceLiteralToImmediateBits(wt, literal);
         return new ColumnCompareFilter(wi, where.Operator, bits);
     }
 

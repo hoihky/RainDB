@@ -65,6 +65,9 @@ public sealed class DefaultQueryExecutor : IQueryExecutor
         if (plan is ExplainOnlyPhysicalPlan explain)
             throw new NotSupportedException($"Physical plan '{explain.Label}' cannot be executed. Use EXPLAIN-style APIs or implement the operator.");
 
+        if (plan is ExplainBundlePhysicalPlan bundle)
+            return new ExplainTextQueryResult(bundle.Explain());
+
         throw new NotSupportedException($"Unsupported physical plan type: {plan.GetType().Name}.");
     }
 

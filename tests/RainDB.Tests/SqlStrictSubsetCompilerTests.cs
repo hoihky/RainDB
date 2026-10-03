@@ -68,8 +68,8 @@ public class SqlStrictSubsetCompilerTests
         var plan = StrictSqlSubset.ParseLogicalPlan("SELECT * FROM t WHERE name = 'hello''world'");
         var scan = Assert.IsType<LogicalTableScan>(plan.Root);
         Assert.Single(scan.WhereConjuncts!);
-        Assert.Equal(SqlLiteralKind.String, scan.WhereConjuncts![0].Literal.Kind);
-        Assert.Equal("hello'world", scan.WhereConjuncts[0].Literal.Text);
+        Assert.Equal(SqlLiteralKind.String, scan.WhereConjuncts![0].Literal!.Value.Kind);
+        Assert.Equal("hello'world", scan.WhereConjuncts[0].Literal!.Value.Text);
     }
 
     [Fact]

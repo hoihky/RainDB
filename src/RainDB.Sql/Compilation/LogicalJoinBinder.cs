@@ -66,7 +66,7 @@ public sealed class LogicalJoinBinder
         if (join.GroupByColumns is { Count: > 0 })
             return BindGroupedJoin(join, leftCol, rightCol, leftTs, rightTs, probeIx, buildIx, algorithm, scanOptions);
 
-        var (probeFilters, buildFilters) = ResolveJoinWhere(join.WhereConjuncts, leftTs, rightTs);
+        var (probeFilters, buildFilters) = ResolveJoinWhere(join, leftTs, rightTs);
         var (outputOrder, outputSchema) = BindJoinOutputs(join.SelectProjection, leftTs, rightTs);
 
         var joinPlan = new JoinPhysicalPlan(
@@ -106,7 +106,7 @@ public sealed class LogicalJoinBinder
         if (join.OrderBy is { Count: > 0 } || join.Limit is not null)
             throw new SqlCompileException("ORDER BY and LIMIT are not supported with GROUP BY on a join.");
 
-        var (probeFilters, buildFilters) = ResolveJoinWhere(join.WhereConjuncts, leftTs, rightTs);
+        var (probeFilters, buildFilters) = ResolveJoinWhere(join, leftTs, rightTs);
         var (_, outputSchema) = BindJoinOutputs(null, leftTs, rightTs);
         var joinPlan = new JoinPhysicalPlan(
             algorithm,
@@ -383,6 +383,49 @@ public sealed class LogicalJoinBinder
     }
 
     private (ColumnCompareFilter[]? probe, ColumnCompareFilter[]? build) ResolveJoinWhere(
+        LogicalInnerJoin join,
+        ITableSource left,
+        ITableSource right)
+    {
+        if (join.ProbeSideWhereConjuncts is { Count: > 0 } || join.BuildSideWhereConjuncts is { Count: > 0 })
+        {
+            var probeFromPartition = BuildFilterArray(join.ProbeSideWhereConjuncts, left, right, leftSide: true);
+            var buildFromPartition = BuildFilterArray(join.BuildSideWhereConjuncts, left, right, leftSide: false);
+            var (probeResidual, buildResidual) = ResolveJoinWhereConjuncts(join.WhereConjuncts, left, right);
+            return (MergeFilters(probeFromPartition, probeResidual), MergeFilters(buildFromPartition, buildResidual));
+        }
+
+        return ResolveJoinWhereConjuncts(join.WhereConjuncts, left, right);
+    }
+
+    private static ColumnCompareFilter[]? MergeFilters(ColumnCompareFilter[]? a, ColumnCompareFilter[]? b)
+    {
+        if (a is null)
+            return b;
+        if (b is null)
+            return a;
+        var merged = new ColumnCompareFilter[a.Length + b.Length];
+        a.CopyTo(merged, 0);
+        b.CopyTo(merged, a.Length);
+        return merged;
+    }
+
+    private ColumnCompareFilter[]? BuildFilterArray(
+        IReadOnlyList<SimpleWhereClause>? conjuncts,
+        ITableSource left,
+        ITableSource right,
+        bool leftSide)
+    {
+        if (conjuncts is null or { Count: 0 })
+            return null;
+        var list = new List<ColumnCompareFilter>(conjuncts.Count);
+        var table = leftSide ? left : right;
+        foreach (var w in conjuncts)
+            list.Add(_scanBinder.BuildColumnCompareFilter(w, table.Schema, table.Name));
+        return list.ToArray();
+    }
+
+    private (ColumnCompareFilter[]? probe, ColumnCompareFilter[]? build) ResolveJoinWhereConjuncts(
         IReadOnlyList<SimpleWhereClause>? conjuncts,
         ITableSource left,
         ITableSource right)

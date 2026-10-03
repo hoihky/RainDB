@@ -22,6 +22,12 @@ public sealed class LogicalInnerJoin : ILogicalRoot
     /// <summary>AND conjunction of predicates (fixed-width or UTF-8 with string literals).</summary>
     public IReadOnlyList<SimpleWhereClause>? WhereConjuncts { get; init; }
 
+    /// <summary>Probe-side predicates after optimizer partition (optional; supersedes mixed <see cref="WhereConjuncts"/> for the left table).</summary>
+    public IReadOnlyList<SimpleWhereClause>? ProbeSideWhereConjuncts { get; init; }
+
+    /// <summary>Build-side predicates after optimizer partition (optional).</summary>
+    public IReadOnlyList<SimpleWhereClause>? BuildSideWhereConjuncts { get; init; }
+
     /// <summary>
     /// When set with <see cref="SelectList"/>, runs grouped aggregation over the join result (<c>SELECT … GROUP BY</c>).
     /// <see cref="SelectProjection"/> must be <see langword="null"/> for this shape.
@@ -106,7 +112,11 @@ public sealed class LogicalInnerJoin : ILogicalRoot
                 var w = wc[i];
                 if (w.QualifierTableName is { } qt)
                     sb.Append(qt).Append('.');
-                sb.Append(w.ColumnName).Append(' ').Append(w.Operator).Append(' ').Append(w.Literal.Text);
+                sb.Append(w.ColumnName).Append(' ').Append(w.Operator).Append(' ');
+                if (w.UsesParameter)
+                    sb.Append('@').Append(w.ParameterName);
+                else
+                    sb.Append(w.Literal?.Text ?? "?");
             }
         }
 

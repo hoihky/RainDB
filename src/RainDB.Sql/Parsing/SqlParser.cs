@@ -21,6 +21,7 @@ public sealed class SqlParser
         private readonly SqlLexer _lexer;
         private readonly string _src;
         private SqlToken _cur;
+        private SqlExplainLevel? _explainLevel;
 
         public SelectParser(SqlLexer lexer, string src)
         {
@@ -32,6 +33,7 @@ public sealed class SqlParser
         public LogicalPlan Parse()
         {
             _cur = _lexer.NextToken();
+            _explainLevel = TryParseExplainPrefix();
             Expect(SqlTokenKind.KwSelect, "SELECT");
             var selectItems = ParseSelectItems(out var starOnly);
             Expect(SqlTokenKind.KwFrom, "FROM");
@@ -60,7 +62,8 @@ public sealed class SqlParser
                             SelectProjection = null,
                             GroupByColumns = groupByCols,
                             SelectList = selectItems,
-                        });
+                        },
+                        _explainLevel);
                 }
 
                 List<LogicalColumnProjection>? joinProj = null;
@@ -87,7 +90,8 @@ public sealed class SqlParser
                         SelectProjection = joinProj,
                         OrderBy = joinOrderBy,
                         Limit = joinLimit,
-                    });
+                    },
+                    _explainLevel);
             }
 
             var table = ((SingleTableFrom)from).TableName;
@@ -109,7 +113,8 @@ public sealed class SqlParser
                         WhereConjuncts = whereConjuncts,
                         GroupByColumns = groupByColsSingle,
                         SelectList = selectItems,
-                    });
+                    },
+                    _explainLevel);
             }
 
             if (starOnly)
@@ -125,7 +130,8 @@ public sealed class SqlParser
                         Projection = null,
                         OrderBy = ob,
                         Limit = lim,
-                    });
+                    },
+                    _explainLevel);
             }
 
             if (selectItems.Count == 1 && selectItems[0] is LogicalAggregationCall lone)
@@ -138,7 +144,8 @@ public sealed class SqlParser
                         TableName = table,
                         WhereConjuncts = whereConjuncts,
                         Aggregate = new LogicalAggregate { Kind = lone.Kind, ColumnName = lone.ArgumentColumnName },
-                    });
+                    },
+                    _explainLevel);
             }
 
             if (selectItems.TrueForAll(static x => x is LogicalColumnProjection))
@@ -157,10 +164,31 @@ public sealed class SqlParser
                         Projection = proj,
                         OrderBy = ob2,
                         Limit = lim2,
-                    });
+                    },
+                    _explainLevel);
             }
 
             throw new SqlCompileException("Mixing aggregate functions with bare columns requires GROUP BY.");
+        }
+
+        private SqlExplainLevel? TryParseExplainPrefix()
+        {
+            if (_cur.Kind != SqlTokenKind.KwExplain)
+                return null;
+            Advance();
+            if (_cur.Kind == SqlTokenKind.KwLogical)
+            {
+                Advance();
+                return SqlExplainLevel.Logical;
+            }
+
+            if (_cur.Kind == SqlTokenKind.KwPhysical)
+            {
+                Advance();
+                return SqlExplainLevel.Physical;
+            }
+
+            return SqlExplainLevel.All;
         }
 
         private abstract class FromClause;
@@ -563,8 +591,32 @@ public sealed class SqlParser
             }
 
             var op = ParseCompareOp();
+            if (_cur.Kind == SqlTokenKind.Parameter)
+            {
+                var name = ParseParameterNameFromToken();
+                return new SimpleWhereClause
+                {
+                    QualifierTableName = qualifier,
+                    ColumnName = column,
+                    Operator = op,
+                    ParameterName = name,
+                };
+            }
+
             var lit = ParseLiteral();
             return new SimpleWhereClause { QualifierTableName = qualifier, ColumnName = column, Operator = op, Literal = lit };
+        }
+
+        private string ParseParameterNameFromToken()
+        {
+            if (_cur.Kind != SqlTokenKind.Parameter)
+                throw new SqlCompileException($"Expected parameter at position {_cur.Start}.");
+            var lex = _lexer.Lexeme(_cur);
+            if (lex.Length < 2 || lex[0] != '@')
+                throw new SqlCompileException("Internal error: malformed parameter token.");
+            var name = lex.Slice(1).ToString();
+            Advance();
+            return name;
         }
 
         private LogicalColumnProjection ParseColumnProjection()

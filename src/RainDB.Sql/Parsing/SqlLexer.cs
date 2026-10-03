@@ -27,6 +27,10 @@ internal enum SqlTokenKind
     KwJoin,
     KwOn,
     KwAnd,
+    KwExplain,
+    KwLogical,
+    KwPhysical,
+    Parameter,
 }
 
 internal readonly record struct SqlToken(SqlTokenKind Kind, int Start, int Length);
@@ -141,6 +145,9 @@ internal sealed class SqlLexer
 
         if (char.IsAsciiDigit(c) || (c is '+' or '-' && _pos + 1 < _src.Length && char.IsAsciiDigit(_src[_pos + 1])))
             return LexNumber(start);
+
+        if (c == '@')
+            return LexParameter(start);
 
         if (IsIdentStart(c))
             return LexIdentifierOrKeyword(start);
@@ -258,6 +265,25 @@ internal sealed class SqlLexer
             return SqlTokenKind.KwOn;
         if (w.SequenceEqual("AND"))
             return SqlTokenKind.KwAnd;
+        if (w.SequenceEqual("EXPLAIN"))
+            return SqlTokenKind.KwExplain;
+        if (w.SequenceEqual("LOGICAL"))
+            return SqlTokenKind.KwLogical;
+        if (w.SequenceEqual("PHYSICAL"))
+            return SqlTokenKind.KwPhysical;
         return SqlTokenKind.Identifier;
+    }
+
+    private SqlToken LexParameter(int start)
+    {
+        _pos++; // @
+        if (_pos >= _src.Length || !IsIdentStart(_src[_pos]))
+            throw new SqlCompileException($"Expected parameter name after '@' at position {start}.");
+        var i = _pos + 1;
+        while (i < _src.Length && IsIdentCont(_src[i]))
+            i++;
+        var len = i - start;
+        _pos = i;
+        return new SqlToken(SqlTokenKind.Parameter, start, len);
     }
 }

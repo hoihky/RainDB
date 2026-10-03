@@ -12,5 +12,11 @@ public sealed class SimpleWhereClause
 
     public required ScalarCompareOp Operator { get; init; }
 
-    public required SqlLiteral Literal { get; init; }
+    /// <summary>Literal compare value when the predicate is not parameterized.</summary>
+    public SqlLiteral? Literal { get; init; }
+
+    /// <summary>Parameter name (without <c>@</c>) when the predicate uses <c>@name</c> instead of a literal.</summary>
+    public string? ParameterName { get; init; }
+
+    public bool UsesParameter => !string.IsNullOrEmpty(ParameterName);
 }

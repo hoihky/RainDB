@@ -20,8 +20,13 @@ public sealed class StrictSqlSubset
     public IPhysicalPlan CompilePhysical(
         string sql,
         ICatalog catalog,
-        VectorizedScanExecutionOptions scanOptions = default) =>
-        _compiler.CompilePhysical(Parse(sql).Root, catalog, scanOptions);
+        VectorizedScanExecutionOptions scanOptions = default)
+    {
+        var service = new SqlCompilationService(
+            physicalCompiler: _compiler,
+            scanOptions: scanOptions);
+        return service.CompilePhysical(Parse(sql), catalog);
+    }
 
     /// <summary>Parse SQL into a <see cref="LogicalPlan"/> (table scan or inner join root).</summary>
     public static LogicalPlan ParseLogicalPlan(string sql) => Shared.Parse(sql);
