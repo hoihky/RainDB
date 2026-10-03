@@ -19,6 +19,7 @@ internal sealed class JoinMatchChunkEmitter
     private readonly JoinBatchMaterializer _materializer;
     private readonly int _chunkRowCount;
     private readonly List<JoinRowMatch> _pending;
+    private readonly Func<JoinRowMatch, bool>? _shouldEmit;
 
     public JoinMatchChunkEmitter(
         JoinPhysicalPlan plan,
@@ -28,7 +29,8 @@ internal sealed class JoinMatchChunkEmitter
         TableSchema buildSchema,
         Action<ColumnarBatch> emitBatch,
         JoinBatchMaterializer materializer,
-        int chunkRowCount = DefaultChunkRowCount)
+        int chunkRowCount = DefaultChunkRowCount,
+        Func<JoinRowMatch, bool>? shouldEmit = null)
     {
         ArgumentNullException.ThrowIfNull(plan);
         ArgumentNullException.ThrowIfNull(probeBatches);
@@ -49,10 +51,13 @@ internal sealed class JoinMatchChunkEmitter
         _emitBatch = emitBatch;
         _chunkRowCount = chunkRowCount;
         _pending = new List<JoinRowMatch>(Math.Min(chunkRowCount, 256));
+        _shouldEmit = shouldEmit;
     }
 
     public void Add(in JoinRowMatch match)
     {
+        if (_shouldEmit is not null && !_shouldEmit(match))
+            return;
         _pending.Add(match);
         if (_pending.Count >= _chunkRowCount)
             Flush();

@@ -39,9 +39,9 @@ public sealed class LogicalJoinBinder
         {
             var lk = join.LeftKeyColumns[i];
             var rk = join.RightKeyColumns[i];
-            if (!TableEq(lk.TableName, join.LeftTableName))
+            if (!TableQualifier.Matches(lk.TableName, join.LeftTableName, join.LeftTableAlias))
                 throw new SqlCompileException($"JOIN key must reference table '{join.LeftTableName}' on the left side.");
-            if (!TableEq(rk.TableName, join.RightTableName))
+            if (!TableQualifier.Matches(rk.TableName, join.RightTableName, join.RightTableAlias))
                 throw new SqlCompileException($"JOIN key must reference table '{join.RightTableName}' on the right side.");
 
             probeIx[i] = ResolveColumn(leftTs.Schema, lk.ColumnName, leftTs.Name);
@@ -72,7 +72,7 @@ public sealed class LogicalJoinBinder
 
         var (probeFilters, buildFilters) = ResolveJoinWhere(join, leftTs, rightTs);
         var joinSubqueries = BindJoinSubqueries(join, catalog, leftTs, rightTs, scanOptions, algorithm);
-        var (outputOrder, outputSchema) = BindJoinOutputs(join.SelectProjection, leftTs, rightTs);
+        var (outputOrder, outputSchema) = BindJoinOutputs(join.SelectProjection, leftTs, rightTs, join.LeftTableAlias, join.RightTableAlias);
 
         var joinPlan = new JoinPhysicalPlan(
             algorithm,
@@ -97,7 +97,7 @@ public sealed class LogicalJoinBinder
         return new JoinSortTopNPhysicalPlan(joinPlan, sortSpecs, join.Limit, scanOptions);
     }
 
-    private GroupedJoinPhysicalPlan BindGroupedJoin(
+    private IPhysicalPlan BindGroupedJoin(
         LogicalInnerJoin join,
         ICatalog catalog,
         IColumnarTableSource leftCol,
@@ -134,7 +134,8 @@ public sealed class LogicalJoinBinder
         var leftWidth = leftTs.Schema.Columns.Count;
         var groupIndices = new int[join.GroupByColumns!.Count];
         for (var i = 0; i < join.GroupByColumns.Count; i++)
-            groupIndices[i] = ResolveJoinStarOutputColumnIndex(join.GroupByColumns[i], leftTs, rightTs, leftWidth);
+            groupIndices[i] = ResolveJoinStarOutputColumnIndex(
+                join.GroupByColumns[i], leftTs, rightTs, leftWidth, join.LeftTableAlias, join.RightTableAlias);
 
         var keyOrdinal = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         for (var i = 0; i < join.GroupByColumns.Count; i++)
@@ -152,7 +153,7 @@ public sealed class LogicalJoinBinder
                     slots.Add(new HashAggregateOutputSlot(HashAggregateOutputColumnKind.GroupKey, ko));
                     break;
                 case LogicalAggregationCall agg:
-                    aggs.Add(ToAggregateSpecJoin(outputSchema, agg, leftTs, rightTs, leftWidth));
+                    aggs.Add(ToAggregateSpecJoin(outputSchema, agg, leftTs, rightTs, leftWidth, join.LeftTableAlias, join.RightTableAlias));
                     slots.Add(new HashAggregateOutputSlot(HashAggregateOutputColumnKind.Aggregate, aggs.Count - 1));
                     break;
                 default:
@@ -169,7 +170,122 @@ public sealed class LogicalJoinBinder
             filters: null,
             havingFilters: null,
             options: scanOptions);
-        return new GroupedJoinPhysicalPlan(joinPlan, aggPlan);
+        var grouped = new GroupedJoinPhysicalPlan(joinPlan, aggPlan);
+        if (join.OrderBy is not { Count: > 0 } && join.Limit is null)
+            return grouped;
+
+        var outSchema = InferJoinGroupedOutputSchema(outputSchema, join.GroupByColumns!, groupIndices, slots, aggs);
+        var sortSpecs = BuildJoinGroupedSortSpecs(
+            join.OrderBy ?? [],
+            join.SelectList!,
+            join.GroupByColumns!,
+            leftTs,
+            rightTs,
+            join.LeftTableAlias,
+            join.RightTableAlias,
+            slots,
+            aggs);
+        return new GroupedJoinSortTopNPhysicalPlan(grouped, outSchema, sortSpecs, join.Limit, scanOptions);
+    }
+
+    private static TableSchema InferJoinGroupedOutputSchema(
+        TableSchema joinOutput,
+        IReadOnlyList<LogicalColumnProjection> groupBy,
+        int[] groupIndices,
+        List<HashAggregateOutputSlot> slots,
+        List<AggregateSpec> aggs)
+    {
+        var cols = new List<ColumnDef>(slots.Count);
+        foreach (var slot in slots)
+        {
+            switch (slot.Kind)
+            {
+                case HashAggregateOutputColumnKind.GroupKey:
+                    cols.Add(joinOutput.Columns[groupIndices[slot.Ordinal]]);
+                    break;
+                case HashAggregateOutputColumnKind.Aggregate:
+                {
+                    var spec = aggs[slot.Ordinal];
+                    var t = spec.Kind switch
+                    {
+                        AggregateKind.Count or AggregateKind.CountDistinct => RainDbType.Int64,
+                        AggregateKind.Sum when spec.SourceColumnIndex >= 0
+                            && joinOutput.Columns[spec.SourceColumnIndex].Type == RainDbType.Float64 => RainDbType.Float64,
+                        AggregateKind.Sum => RainDbType.Int64,
+                        AggregateKind.Min or AggregateKind.Max when spec.SourceColumnIndex >= 0 =>
+                            joinOutput.Columns[spec.SourceColumnIndex].Type,
+                        _ => RainDbType.Int64,
+                    };
+                    cols.Add(new ColumnDef($"agg{slot.Ordinal}", t));
+                    break;
+                }
+                default:
+                    throw new InvalidOperationException($"Unknown output slot {slot.Kind}.");
+            }
+        }
+
+        return new TableSchema(cols);
+    }
+
+    private static SortKeyPhysicalSpec[] BuildJoinGroupedSortSpecs(
+        IReadOnlyList<LogicalSortKey> orderBy,
+        IReadOnlyList<LogicalSelectListItem> selectList,
+        IReadOnlyList<LogicalColumnProjection> groupBy,
+        ITableSource leftTs,
+        ITableSource rightTs,
+        string? leftAlias,
+        string? rightAlias,
+        List<HashAggregateOutputSlot> slots,
+        List<AggregateSpec> aggs)
+    {
+        var arr = new SortKeyPhysicalSpec[orderBy.Count];
+        for (var i = 0; i < orderBy.Count; i++)
+        {
+            var k = orderBy[i];
+            if (k.SortExpression is not null)
+                throw new SqlCompileException("ORDER BY expression is not supported with GROUP BY on joins yet.");
+            if (k.Column is null)
+                throw new SqlCompileException("ORDER BY requires a column reference.");
+            var outIx = ResolveJoinGroupedOutputColumnIndex(k.Column, selectList, leftTs, rightTs, leftAlias, rightAlias);
+            arr[i] = new SortKeyPhysicalSpec(outIx, k.Descending);
+        }
+
+        return arr;
+    }
+
+    private static int ResolveJoinGroupedOutputColumnIndex(
+        LogicalColumnProjection key,
+        IReadOnlyList<LogicalSelectListItem> selectList,
+        ITableSource leftTs,
+        ITableSource rightTs,
+        string? leftAlias,
+        string? rightAlias)
+    {
+        for (var i = 0; i < selectList.Count; i++)
+        {
+            if (selectList[i] is LogicalColumnProjection col && SameJoinQualifiedColumn(col, key, leftTs, rightTs, leftAlias, rightAlias))
+                return i;
+        }
+
+        throw new SqlCompileException($"ORDER BY column '{ExplainCol(key)}' must appear in the SELECT list.");
+    }
+
+    private static bool SameJoinQualifiedColumn(
+        LogicalColumnProjection a,
+        LogicalColumnProjection b,
+        ITableSource leftTs,
+        ITableSource rightTs,
+        string? leftAlias,
+        string? rightAlias)
+    {
+        if (!string.Equals(a.ColumnName, b.ColumnName, StringComparison.OrdinalIgnoreCase))
+            return false;
+        if (a.QualifierTableName is not { } aq || b.QualifierTableName is not { } bq)
+            return false;
+        if (aq.Equals(bq, StringComparison.OrdinalIgnoreCase))
+            return true;
+        return TableQualifier.Matches(aq, leftTs.Name, leftAlias) && TableQualifier.Matches(bq, leftTs.Name, leftAlias)
+            || TableQualifier.Matches(aq, rightTs.Name, rightAlias) && TableQualifier.Matches(bq, rightTs.Name, rightAlias);
     }
 
     private static string JoinGroupKey(LogicalColumnProjection p) =>
@@ -239,15 +355,17 @@ public sealed class LogicalJoinBinder
         LogicalColumnProjection p,
         ITableSource leftTs,
         ITableSource rightTs,
-        int leftColCount)
+        int leftColCount,
+        string? leftAlias = null,
+        string? rightAlias = null)
     {
         if (p.QualifierTableName is not { } qt)
             throw new SqlCompileException("JOIN GROUP BY requires qualified table.column.");
 
-        if (TableEq(qt, leftTs.Name))
+        if (TableQualifier.Matches(qt, leftTs.Name, leftAlias))
             return ResolveColumn(leftTs.Schema, p.ColumnName, leftTs.Name);
 
-        if (TableEq(qt, rightTs.Name))
+        if (TableQualifier.Matches(qt, rightTs.Name, rightAlias))
             return leftColCount + ResolveColumn(rightTs.Schema, p.ColumnName, rightTs.Name);
 
         throw new SqlCompileException($"GROUP BY references unknown table '{qt}'.");
@@ -257,14 +375,16 @@ public sealed class LogicalJoinBinder
         LogicalAggregationCall agg,
         ITableSource leftTs,
         ITableSource rightTs,
-        int leftColCount)
+        int leftColCount,
+        string? leftAlias = null,
+        string? rightAlias = null)
     {
         var name = agg.ArgumentColumnName!;
         if (agg.ArgumentQualifierTableName is { } qt)
         {
-            if (TableEq(qt, leftTs.Name))
+            if (TableQualifier.Matches(qt, leftTs.Name, leftAlias))
                 return ResolveColumn(leftTs.Schema, name, leftTs.Name);
-            if (TableEq(qt, rightTs.Name))
+            if (TableQualifier.Matches(qt, rightTs.Name, rightAlias))
                 return leftColCount + ResolveColumn(rightTs.Schema, name, rightTs.Name);
             throw new SqlCompileException($"Unknown table '{qt}' in aggregate argument.");
         }
@@ -289,15 +409,26 @@ public sealed class LogicalJoinBinder
         LogicalAggregationCall agg,
         ITableSource leftTs,
         ITableSource rightTs,
-        int leftColCount)
+        int leftColCount,
+        string? leftAlias = null,
+        string? rightAlias = null)
     {
+        if (agg.IsDistinct)
+        {
+            if (agg.Kind != AggregateKind.Count || agg.ArgumentColumnName is null)
+                throw new SqlCompileException("DISTINCT is only supported with COUNT(column).");
+            var di = ResolveJoinAggregateColumnIndex(agg, leftTs, rightTs, leftColCount, leftAlias, rightAlias);
+            AggregateTypeRules.EnsureSupported(joinSchema.Columns[di].Type, AggregateKind.CountDistinct);
+            return new AggregateSpec(di, AggregateKind.CountDistinct);
+        }
+
         switch (agg.Kind)
         {
             case AggregateKind.Count when agg.ArgumentColumnName is null:
                 return new AggregateSpec(-1, AggregateKind.Count);
             case AggregateKind.Count:
             {
-                var ci = ResolveJoinAggregateColumnIndex(agg, leftTs, rightTs, leftColCount);
+                var ci = ResolveJoinAggregateColumnIndex(agg, leftTs, rightTs, leftColCount, leftAlias, rightAlias);
                 ValidateJoinAggregate(joinSchema.Columns[ci].Type, AggregateKind.Count);
                 return new AggregateSpec(ci, AggregateKind.Count);
             }
@@ -305,7 +436,7 @@ public sealed class LogicalJoinBinder
             case AggregateKind.Min:
             case AggregateKind.Max:
             {
-                var si = ResolveJoinAggregateColumnIndex(agg, leftTs, rightTs, leftColCount);
+                var si = ResolveJoinAggregateColumnIndex(agg, leftTs, rightTs, leftColCount, leftAlias, rightAlias);
                 ValidateJoinAggregate(joinSchema.Columns[si].Type, agg.Kind);
                 return new AggregateSpec(si, agg.Kind);
             }
@@ -316,6 +447,12 @@ public sealed class LogicalJoinBinder
 
     private static void ValidateJoinAggregate(RainDbType columnType, AggregateKind kind)
     {
+        if (kind == AggregateKind.CountDistinct)
+        {
+            AggregateTypeRules.EnsureSupported(columnType, AggregateKind.CountDistinct);
+            return;
+        }
+
         switch (kind)
         {
             case AggregateKind.Count:
@@ -332,7 +469,9 @@ public sealed class LogicalJoinBinder
     private static (JoinOutputColumnRef[]? order, TableSchema schema) BindJoinOutputs(
         IReadOnlyList<LogicalColumnProjection>? selectProjection,
         ITableSource left,
-        ITableSource right)
+        ITableSource right,
+        string? leftAlias = null,
+        string? rightAlias = null)
     {
         if (selectProjection is null or { Count: 0 })
         {
@@ -350,7 +489,7 @@ public sealed class LogicalJoinBinder
         {
             if (p.QualifierTableName is { } qt)
             {
-                if (TableEq(qt, left.Name))
+                if (TableQualifier.Matches(qt, left.Name, leftAlias))
                 {
                     var ix = ResolveColumn(left.Schema, p.ColumnName, left.Name);
                     refs.Add(new JoinOutputColumnRef(IsProbe: true, ix));
@@ -358,7 +497,7 @@ public sealed class LogicalJoinBinder
                     continue;
                 }
 
-                if (TableEq(qt, right.Name))
+                if (TableQualifier.Matches(qt, right.Name, rightAlias))
                 {
                     var ix = ResolveColumn(right.Schema, p.ColumnName, right.Name);
                     refs.Add(new JoinOutputColumnRef(IsProbe: false, ix));
@@ -408,7 +547,9 @@ public sealed class LogicalJoinBinder
         {
             Semantics = LogicalJoinSemantics.LeftOuter,
             LeftTableName = join.RightTableName,
+            LeftTableAlias = join.RightTableAlias,
             RightTableName = join.LeftTableName,
+            RightTableAlias = join.LeftTableAlias,
             LeftKeyColumns = join.RightKeyColumns,
             RightKeyColumns = join.LeftKeyColumns,
             SelectProjection = join.SelectProjection,
@@ -436,7 +577,9 @@ public sealed class LogicalJoinBinder
             left,
             right,
             scanOptions,
-            algorithm) ?? new JoinSubqueryPhysicalSpecs();
+            algorithm,
+            join.LeftTableAlias,
+            join.RightTableAlias) ?? new JoinSubqueryPhysicalSpecs();
 
     private (ColumnCompareFilter[]? probe, ColumnCompareFilter[]? build) ResolveJoinWhere(
         LogicalInnerJoin join,
@@ -447,11 +590,12 @@ public sealed class LogicalJoinBinder
         {
             var probeFromPartition = BuildFilterArray(join.ProbeSideWhereConjuncts, left, right, leftSide: true);
             var buildFromPartition = BuildFilterArray(join.BuildSideWhereConjuncts, left, right, leftSide: false);
-            var (probeResidual, buildResidual) = ResolveJoinWhereConjuncts(join.WhereConjuncts, left, right);
+            var (probeResidual, buildResidual) = ResolveJoinWhereConjuncts(
+                join.WhereConjuncts, left, right, join.LeftTableAlias, join.RightTableAlias);
             return (MergeFilters(probeFromPartition, probeResidual), MergeFilters(buildFromPartition, buildResidual));
         }
 
-        return ResolveJoinWhereConjuncts(join.WhereConjuncts, left, right);
+        return ResolveJoinWhereConjuncts(join.WhereConjuncts, left, right, join.LeftTableAlias, join.RightTableAlias);
     }
 
     private static ColumnCompareFilter[]? MergeFilters(ColumnCompareFilter[]? a, ColumnCompareFilter[]? b)
@@ -484,7 +628,9 @@ public sealed class LogicalJoinBinder
     private (ColumnCompareFilter[]? probe, ColumnCompareFilter[]? build) ResolveJoinWhereConjuncts(
         IReadOnlyList<SimpleWhereClause>? conjuncts,
         ITableSource left,
-        ITableSource right)
+        ITableSource right,
+        string? leftAlias = null,
+        string? rightAlias = null)
     {
         if (conjuncts is null or { Count: 0 })
             return (null, null);
@@ -495,9 +641,9 @@ public sealed class LogicalJoinBinder
         {
             if (w.QualifierTableName is { } qt)
             {
-                if (TableEq(qt, left.Name))
+                if (TableQualifier.Matches(qt, left.Name, leftAlias))
                     probeList.Add(_scanBinder.BuildColumnCompareFilter(w, left.Schema, left.Name));
-                else if (TableEq(qt, right.Name))
+                else if (TableQualifier.Matches(qt, right.Name, rightAlias))
                     buildList.Add(_scanBinder.BuildColumnCompareFilter(w, right.Schema, right.Name));
                 else
                     throw new SqlCompileException(

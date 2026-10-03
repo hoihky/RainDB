@@ -28,7 +28,9 @@ public sealed class HashAggregatePhysicalPlan : IPhysicalPlan
         ColumnCompareFilter[]? filters = null,
         GroupOutputCompareFilter[]? havingFilters = null,
         VectorizedScanExecutionOptions options = default,
-        int spillPartialEntryThreshold = 0)
+        int spillPartialEntryThreshold = 0,
+        SubqueryInPhysicalSpec[]? inSubqueries = null,
+        SubqueryExistsPhysicalSpec[]? existsSubqueries = null)
     {
         ArgumentNullException.ThrowIfNull(groupKeyColumnIndices);
         ArgumentNullException.ThrowIfNull(aggregates);
@@ -48,6 +50,8 @@ public sealed class HashAggregatePhysicalPlan : IPhysicalPlan
         HavingFilters = havingFilters is { Length: > 0 } ? (GroupOutputCompareFilter[])havingFilters.Clone() : null;
         Options = options;
         SpillPartialEntryThreshold = spillPartialEntryThreshold;
+        InSubqueries = inSubqueries is { Length: > 0 } ? (SubqueryInPhysicalSpec[])inSubqueries.Clone() : null;
+        ExistsSubqueries = existsSubqueries is { Length: > 0 } ? (SubqueryExistsPhysicalSpec[])existsSubqueries.Clone() : null;
     }
 
     public TableId TableId { get; }
@@ -71,6 +75,10 @@ public sealed class HashAggregatePhysicalPlan : IPhysicalPlan
     /// groups invoke <see cref="ISpillWriter.SpillChunkAsync"/> with a UTF-8 metrics payload (operator still completes in-memory).
     /// </summary>
     public int SpillPartialEntryThreshold { get; }
+
+    public SubqueryInPhysicalSpec[]? InSubqueries { get; }
+
+    public SubqueryExistsPhysicalSpec[]? ExistsSubqueries { get; }
 
     public string Explain(string indent = "")
     {

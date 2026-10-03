@@ -134,6 +134,10 @@ Supported: uncorrelated `IN` / `NOT IN` / `EXISTS` / `NOT EXISTS` on single-tabl
 | `samples/sql/16_d5_analytics.sql` | Correlated `EXISTS` |
 | `samples/sql/17_union_distinct.sql` | `UNION` (dedup) |
 | `samples/sql/18_full_outer_join.sql` | `FULL OUTER JOIN` |
+| `samples/sql/19_select_distinct_region.sql` | `SELECT DISTINCT` on demo |
+| `samples/sql/20_count_distinct_group.sql` | `COUNT(DISTINCT)` + `GROUP BY` |
+| `samples/sql/21_correlated_not_exists.sql` | Correlated `NOT EXISTS` |
+| `samples/sql/22_group_by_where_in.sql` | `GROUP BY` with `WHERE IN` subquery |
 
 Supported on **single-table** outer queries: correlated `EXISTS` / `NOT EXISTS` and `IN` / `NOT IN` when the inner `WHERE` contains one or more equalities of the form `outer.col = inner.col` (qualified table names). The engine rewrites those predicates into per-outer-row nested scans. `SELECT DISTINCT`, `COUNT(DISTINCT …)` in grouped queries, `GROUP BY … ORDER BY … LIMIT …`, and `UNION` (without `ALL`) are supported. Correlated subqueries inside join `WHERE` are still rejected at compile time.
 

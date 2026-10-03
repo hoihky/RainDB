@@ -303,14 +303,15 @@ public class PhaseD4Tests
     }
 
     [Fact]
-    public void Join_correlated_subquery_in_where_is_rejected()
+    public async Task Join_correlated_subquery_in_where_filters_matches()
     {
         var engine = RainDbEngine.CreateDefault();
-        RegisterJoinLR(engine, [1], [1], [9L]);
-        Assert.Throws<SqlCompileException>(() =>
-            StrictSqlSubset.CompilePhysicalPlan(
-                "SELECT L.id FROM L INNER JOIN R ON L.id = R.id WHERE L.id IN (SELECT id FROM L WHERE R.id > 0)",
-                engine.Catalog));
+        RegisterJoinLR(engine, [1, 2], [1, 2], [9L, 8L]);
+        engine.Catalog.Register(LookupTable([1]));
+
+        await using var r = await engine.ExecuteSqlAsync(
+            "SELECT L.id FROM L INNER JOIN R ON L.id = R.id WHERE L.id IN (SELECT id FROM lookup WHERE lookup.id = R.id) ORDER BY L.id");
+        Assert.Equal([1], ReadInt32Column(r, 0));
     }
 
     [Fact]

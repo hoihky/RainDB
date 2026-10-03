@@ -46,17 +46,28 @@ public sealed class SqlParser
                 return first;
 
             var branches = new List<ILogicalRoot> { first };
-            var unionAll = true;
+            var distinctBetween = new List<bool>();
             while (_cur.Kind == SqlTokenKind.Identifier && LexemeEqualsIgnoreCase(_cur, "UNION"))
             {
                 Advance();
-                unionAll = _cur.Kind == SqlTokenKind.Identifier && LexemeEqualsIgnoreCase(_cur, "ALL");
-                if (unionAll)
+                var thisAll = _cur.Kind == SqlTokenKind.Identifier && LexemeEqualsIgnoreCase(_cur, "ALL");
+                distinctBetween.Add(!thisAll);
+                if (thisAll)
                     Advance();
                 branches.Add(ParseOneSelectRoot());
             }
 
-            return new LogicalUnionAll { Branches = branches, UnionAll = unionAll };
+            if (distinctBetween.Count == 0)
+                return new LogicalUnionAll { Branches = branches, UnionAll = true };
+
+            var allDistinct = distinctBetween.TrueForAll(static d => d);
+            var allAll = distinctBetween.TrueForAll(static d => !d);
+            return new LogicalUnionAll
+            {
+                Branches = branches,
+                DistinctBetweenBranches = distinctBetween,
+                UnionAll = allAll && !allDistinct ? true : !allAll && allDistinct ? false : true,
+            };
         }
 
         private ILogicalRoot ParseOneSelectRoot()
@@ -91,7 +102,9 @@ public sealed class SqlParser
                     {
                         Semantics = jf.Semantics,
                         LeftTableName = jf.Left,
+                        LeftTableAlias = jf.LeftAlias,
                         RightTableName = jf.Right,
+                        RightTableAlias = jf.RightAlias,
                         LeftKeyColumns = jf.LeftKeys,
                         RightKeyColumns = jf.RightKeys,
                         WhereConjuncts = joinWhereConjuncts,
@@ -120,7 +133,9 @@ public sealed class SqlParser
                 {
                     Semantics = jf.Semantics,
                     LeftTableName = jf.Left,
+                    LeftTableAlias = jf.LeftAlias,
                     RightTableName = jf.Right,
+                    RightTableAlias = jf.RightAlias,
                     LeftKeyColumns = jf.LeftKeys,
                     RightKeyColumns = jf.RightKeys,
                     WhereConjuncts = joinWhereConjuncts,
@@ -175,7 +190,9 @@ public sealed class SqlParser
                 throw new SqlCompileException("Derived table queries support column projections only (no aggregates).");
             }
 
-            var table = ((SingleTableFrom)from).TableName;
+            var singleFrom = (SingleTableFrom)from;
+            var table = singleFrom.TableName;
+            var tableAlias = singleFrom.Alias;
             var (whereConjuncts, subqueryPreds) = TryParseWhereExtended();
             var groupByColsSingle = TryParseGroupByColumns();
 
@@ -193,6 +210,7 @@ public sealed class SqlParser
                 return new LogicalTableScan
                 {
                     TableName = table,
+                    TableAlias = tableAlias,
                     SelectDistinct = distinct,
                     WhereConjuncts = whereConjuncts,
                     SubqueryPredicates = subqueryPreds,
@@ -211,6 +229,7 @@ public sealed class SqlParser
                 return new LogicalTableScan
                 {
                     TableName = table,
+                    TableAlias = tableAlias,
                     SelectDistinct = distinct,
                     WhereConjuncts = whereConjuncts,
                     SubqueryPredicates = subqueryPreds,
@@ -227,6 +246,7 @@ public sealed class SqlParser
                 return new LogicalTableScan
                 {
                     TableName = table,
+                    TableAlias = tableAlias,
                     SelectDistinct = distinct,
                     WhereConjuncts = whereConjuncts,
                     SubqueryPredicates = subqueryPreds,
@@ -241,6 +261,7 @@ public sealed class SqlParser
                 return new LogicalTableScan
                 {
                     TableName = table,
+                    TableAlias = tableAlias,
                     SelectDistinct = distinct,
                     WhereConjuncts = whereConjuncts,
                     SubqueryPredicates = subqueryPreds,
@@ -275,14 +296,18 @@ public sealed class SqlParser
 
         private abstract class FromClause;
 
-        private sealed class SingleTableFrom(string tableName) : FromClause
+        private sealed class SingleTableFrom(string tableName, string? alias) : FromClause
         {
             public string TableName { get; } = tableName;
+
+            public string? Alias { get; } = alias;
         }
 
         private sealed class JoinFrom(
             string left,
+            string? leftAlias,
             string right,
+            string? rightAlias,
             List<LogicalQualifiedColumn> leftKeys,
             List<LogicalQualifiedColumn> rightKeys,
             LogicalJoinSemantics semantics)
@@ -290,7 +315,11 @@ public sealed class SqlParser
         {
             public string Left { get; } = left;
 
+            public string? LeftAlias { get; } = leftAlias;
+
             public string Right { get; } = right;
+
+            public string? RightAlias { get; } = rightAlias;
 
             public List<LogicalQualifiedColumn> LeftKeys { get; } = leftKeys;
 
@@ -317,16 +346,72 @@ public sealed class SqlParser
                 return new SubqueryFrom(root, alias);
             }
 
-            var left = ExpectIdentifier("table name");
+            var (left, leftAlias) = ParseTableReference();
             if (!TryParseJoinIntro(out var semantics))
-                return new SingleTableFrom(left);
+                return new SingleTableFrom(left, leftAlias);
 
-            var right = ExpectIdentifier("table name");
+            var (right, rightAlias) = ParseTableReference();
             Expect(SqlTokenKind.KwOn, "ON");
             var leftKeys = new List<LogicalQualifiedColumn>();
             var rightKeys = new List<LogicalQualifiedColumn>();
-            ParseJoinEquiConditions(left, right, leftKeys, rightKeys);
-            return new JoinFrom(left, right, leftKeys, rightKeys, semantics);
+            ParseJoinEquiConditions(left, leftAlias, right, rightAlias, leftKeys, rightKeys);
+            return new JoinFrom(left, leftAlias, right, rightAlias, leftKeys, rightKeys, semantics);
+        }
+
+        private (string TableName, string? Alias) ParseTableReference()
+        {
+            var name = ExpectIdentifier("table name");
+            if (_cur.Kind != SqlTokenKind.Identifier || IsReservedSqlKeyword(_cur))
+                return (name, null);
+            if (LexemeEqualsIgnoreCase(_cur, "WHERE")
+                || LexemeEqualsIgnoreCase(_cur, "GROUP")
+                || LexemeEqualsIgnoreCase(_cur, "ORDER")
+                || LexemeEqualsIgnoreCase(_cur, "LIMIT")
+                || LexemeEqualsIgnoreCase(_cur, "HAVING")
+                || LexemeEqualsIgnoreCase(_cur, "UNION")
+                || LexemeEqualsIgnoreCase(_cur, "INNER")
+                || LexemeEqualsIgnoreCase(_cur, "LEFT")
+                || LexemeEqualsIgnoreCase(_cur, "RIGHT")
+                || LexemeEqualsIgnoreCase(_cur, "FULL")
+                || LexemeEqualsIgnoreCase(_cur, "JOIN")
+                || LexemeEqualsIgnoreCase(_cur, "ON")
+                || LexemeEqualsIgnoreCase(_cur, "AND"))
+                return (name, null);
+            if (_cur.Kind == SqlTokenKind.Identifier && LexemeEqualsIgnoreCase(_cur, "AS"))
+            {
+                Advance();
+                return (name, ExpectIdentifier("table alias"));
+            }
+
+            var alias = ExpectIdentifier("table alias");
+            return (name, alias);
+        }
+
+        private bool IsReservedSqlKeyword(SqlToken token)
+        {
+            if (token.Kind == SqlTokenKind.KwSelect || token.Kind == SqlTokenKind.KwFrom || token.Kind == SqlTokenKind.KwWhere
+                || token.Kind == SqlTokenKind.KwExplain || token.Kind == SqlTokenKind.KwJoin || token.Kind == SqlTokenKind.KwOn
+                || token.Kind == SqlTokenKind.KwInner)
+                return true;
+            if (token.Kind != SqlTokenKind.Identifier)
+                return false;
+            return LexemeEqualsIgnoreCase(token, "GROUP")
+                || LexemeEqualsIgnoreCase(token, "BY")
+                || LexemeEqualsIgnoreCase(token, "ORDER")
+                || LexemeEqualsIgnoreCase(token, "LIMIT")
+                || LexemeEqualsIgnoreCase(token, "HAVING")
+                || LexemeEqualsIgnoreCase(token, "UNION")
+                || LexemeEqualsIgnoreCase(token, "DISTINCT")
+                || LexemeEqualsIgnoreCase(token, "WHERE")
+                || LexemeEqualsIgnoreCase(token, "LEFT")
+                || LexemeEqualsIgnoreCase(token, "RIGHT")
+                || LexemeEqualsIgnoreCase(token, "FULL")
+                || LexemeEqualsIgnoreCase(token, "OUTER")
+                || LexemeEqualsIgnoreCase(token, "INNER")
+                || LexemeEqualsIgnoreCase(token, "JOIN")
+                || LexemeEqualsIgnoreCase(token, "ON")
+                || LexemeEqualsIgnoreCase(token, "AND")
+                || LexemeEqualsIgnoreCase(token, "AS");
         }
 
         private bool TryParseJoinIntro(out LogicalJoinSemantics semantics)
@@ -380,7 +465,9 @@ public sealed class SqlParser
 
         private void ParseJoinEquiConditions(
             string leftTable,
+            string? leftAlias,
             string rightTable,
+            string? rightAlias,
             List<LogicalQualifiedColumn> leftKeys,
             List<LogicalQualifiedColumn> rightKeys)
         {
@@ -389,7 +476,7 @@ public sealed class SqlParser
                 var a = ExpectQualifiedColumn("JOIN");
                 Expect(SqlTokenKind.Eq, "=");
                 var b = ExpectQualifiedColumn("JOIN");
-                MapJoinPair(leftTable, rightTable, a, b, leftKeys, rightKeys);
+                MapJoinPair(leftTable, leftAlias, rightTable, rightAlias, a, b, leftKeys, rightKeys);
                 if (_cur.Kind == SqlTokenKind.KwAnd)
                 {
                     Advance();
@@ -402,20 +489,22 @@ public sealed class SqlParser
 
         private static void MapJoinPair(
             string leftTable,
+            string? leftAlias,
             string rightTable,
+            string? rightAlias,
             LogicalQualifiedColumn x,
             LogicalQualifiedColumn y,
             List<LogicalQualifiedColumn> leftKeys,
             List<LogicalQualifiedColumn> rightKeys)
         {
-            if (TableEq(x.TableName, leftTable) && TableEq(y.TableName, rightTable))
+            if (RefEq(x.TableName, leftTable, leftAlias) && RefEq(y.TableName, rightTable, rightAlias))
             {
                 leftKeys.Add(x);
                 rightKeys.Add(y);
                 return;
             }
 
-            if (TableEq(x.TableName, rightTable) && TableEq(y.TableName, leftTable))
+            if (RefEq(x.TableName, rightTable, rightAlias) && RefEq(y.TableName, leftTable, leftAlias))
             {
                 leftKeys.Add(y);
                 rightKeys.Add(x);
@@ -428,6 +517,9 @@ public sealed class SqlParser
         }
 
         private static bool TableEq(string a, string b) => a.Equals(b, StringComparison.OrdinalIgnoreCase);
+
+        private static bool RefEq(string qualifier, string table, string? alias) =>
+            Compilation.TableQualifier.Matches(qualifier, table, alias);
 
         private LogicalQualifiedColumn ExpectQualifiedColumn(string context)
         {

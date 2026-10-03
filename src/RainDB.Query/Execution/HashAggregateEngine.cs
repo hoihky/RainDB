@@ -7,6 +7,7 @@ using RainDB.Execution;
 using RainDB.Query.Execution.Operators;
 using RainDB.Query.Plans;
 using RainDB.Query.Results;
+using RainDB.Query.Runtime;
 using RainDB.Query.Vectorized;
 using RainDB.Schema;
 
@@ -36,8 +37,15 @@ public sealed class HashAggregateOperator : Operators.IHashAggregateOperator, Op
 
         ValidatePlan(plan, table);
 
+        var subFilters = await ResolveSubqueryFiltersAsync(plan, context).ConfigureAwait(false);
+        if (subFilters.IsDenyAll)
+        {
+            var emptyCols = MaterializeEmptyOutput(plan, table.Schema);
+            return new ColumnarMaterializedQueryResult([new ColumnarBatch(0, emptyCols)]);
+        }
+
         if (AnyUtf8GroupKey(plan, table.Schema))
-            return await ExecuteWithCompositeKeysAsync(plan, table, context).ConfigureAwait(false);
+            return await ExecuteWithCompositeKeysAsync(plan, table, context, subFilters).ConfigureAwait(false);
 
         var batches = table.Batches;
         var n = batches.Count;
@@ -55,14 +63,14 @@ public sealed class HashAggregateOperator : Operators.IHashAggregateOperator, Op
         if (dop <= 1 || n == 1)
         {
             for (var i = 0; i < n; i++)
-                partials[i] = AccumulateBatch(batches[i], plan, ct);
+                partials[i] = AccumulateBatch(batches[i], plan, subFilters.InFilters, ct);
         }
         else if (plan.Options.UseChannelScheduler)
         {
             await RunChannelMorselsAsync(
                     n,
                     dop,
-                    i => partials[i] = AccumulateBatch(batches[i], plan, ct),
+                    i => partials[i] = AccumulateBatch(batches[i], plan, subFilters.InFilters, ct),
                     ct)
                 .ConfigureAwait(false);
         }
@@ -72,7 +80,7 @@ public sealed class HashAggregateOperator : Operators.IHashAggregateOperator, Op
                 0,
                 n,
                 new ParallelOptions { MaxDegreeOfParallelism = dop, CancellationToken = ct },
-                i => partials[i] = AccumulateBatch(batches[i], plan, ct));
+                i => partials[i] = AccumulateBatch(batches[i], plan, subFilters.InFilters, ct));
         }
 
         if (context.SpillWriter.IsEnabled && plan.SpillPartialEntryThreshold > 0)
@@ -153,14 +161,14 @@ public sealed class HashAggregateOperator : Operators.IHashAggregateOperator, Op
         IColumnarBatch batch,
         HashAggregatePhysicalPlan plan,
         CancellationToken cancellationToken) =>
-        AccumulateBatch(batch, plan, cancellationToken);
+        AccumulateBatch(batch, plan, null, cancellationToken);
 
     Dictionary<CompositeJoinKey, AggregateAccumulator[]> Operators.IHashAggregateGroupingSupport.AccumulateBatchCompositeForGrouped(
         IColumnarBatch batch,
         HashAggregatePhysicalPlan plan,
         TableSchema schema,
         CancellationToken cancellationToken) =>
-        AccumulateBatchComposite(batch, plan, schema, cancellationToken);
+        AccumulateBatchComposite(batch, plan, schema, null, cancellationToken);
 
     void Operators.IHashAggregateGroupingSupport.MergePartialIntoGlobal(
         Dictionary<GroupKey, AggregateAccumulator[]> global,
@@ -270,6 +278,7 @@ public sealed class HashAggregateOperator : Operators.IHashAggregateOperator, Op
     private Dictionary<GroupKey, AggregateAccumulator[]> AccumulateBatch(
         IColumnarBatch batch,
         HashAggregatePhysicalPlan plan,
+        ColumnInSetFilter[]? inFilters,
         CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -281,9 +290,11 @@ public sealed class HashAggregateOperator : Operators.IHashAggregateOperator, Op
         {
             ReadOnlySpan<int> sel;
             int k;
-            if (plan.Filters is { Length: > 0 } filters)
+            var compare = plan.Filters is { Length: > 0 } filters ? filters.AsSpan() : ReadOnlySpan<ColumnCompareFilter>.Empty;
+            var inSpan = inFilters is { Length: > 0 } inf ? inf.AsSpan() : ReadOnlySpan<ColumnInSetFilter>.Empty;
+            if (compare.Length > 0 || inSpan.Length > 0)
             {
-                k = _deps.Selection.FillSelectedRowsConjunctive(batch, filters, rent.AsSpan(0, batch.RowCount));
+                k = _deps.Selection.FillSelectedRowsConjunctive(batch, compare, inSpan, rent.AsSpan(0, batch.RowCount));
                 sel = rent.AsSpan(0, k);
             }
             else
@@ -313,7 +324,7 @@ public sealed class HashAggregateOperator : Operators.IHashAggregateOperator, Op
                         if (spec.Kind == AggregateKind.Count && spec.SourceColumnIndex < 0)
                             AggregateRowOps.AddCountStar(ref slot);
                         else if (spec.Kind == AggregateKind.CountDistinct)
-                            AggregateRowOps.AddCountDistinctInt32(ref slot, _deps.Selection, batch.Columns[spec.SourceColumnIndex], row);
+                            AggregateRowOps.AddCountDistinct(ref slot, _deps.Selection, batch.Columns[spec.SourceColumnIndex], row);
                         else if (spec.Kind == AggregateKind.Count)
                             AggregateRowOps.AddCountColumn(ref slot, _deps.Selection, batch.Columns[spec.SourceColumnIndex], row);
                         else
@@ -522,8 +533,10 @@ public sealed class HashAggregateOperator : Operators.IHashAggregateOperator, Op
         switch (spec.Kind)
         {
             case AggregateKind.Count:
+                BinaryPrimitives.WriteInt64LittleEndian(dest, acc.Count);
+                break;
             case AggregateKind.CountDistinct:
-                BinaryPrimitives.WriteInt64LittleEndian(dest, acc.DistinctInt32?.Count ?? acc.Count);
+                BinaryPrimitives.WriteInt64LittleEndian(dest, AggregateRowOps.DistinctCount(acc));
                 break;
             case AggregateKind.Sum when srcType == RainDbType.Float64:
                 BinaryPrimitives.WriteInt64LittleEndian(dest, BitConverter.DoubleToInt64Bits(acc.FloatSum));
@@ -613,10 +626,26 @@ public sealed class HashAggregateOperator : Operators.IHashAggregateOperator, Op
         return false;
     }
 
+    private static async ValueTask<ResolvedSubqueryFilters> ResolveSubqueryFiltersAsync(
+        HashAggregatePhysicalPlan plan,
+        IExecutionContext context)
+    {
+        if (plan.InSubqueries is null && plan.ExistsSubqueries is null)
+            return ResolvedSubqueryFilters.Empty;
+        if (context is not RainDbExecutionContext { NestedExecutor: { } executor })
+            throw new InvalidOperationException("Subquery predicates require NestedExecutor on the execution context.");
+        return await SubqueryFilterResolver.ResolveAsync(
+            plan.InSubqueries,
+            plan.ExistsSubqueries,
+            executor,
+            context).ConfigureAwait(false);
+    }
+
     private async ValueTask<IQueryResult> ExecuteWithCompositeKeysAsync(
         HashAggregatePhysicalPlan plan,
         IColumnarTableSource table,
-        IExecutionContext context)
+        IExecutionContext context,
+        ResolvedSubqueryFilters subFilters)
     {
         var batches = table.Batches;
         var n = batches.Count;
@@ -634,14 +663,14 @@ public sealed class HashAggregateOperator : Operators.IHashAggregateOperator, Op
         if (dop <= 1 || n == 1)
         {
             for (var i = 0; i < n; i++)
-                partials[i] = AccumulateBatchComposite(batches[i], plan, schema, ct);
+                partials[i] = AccumulateBatchComposite(batches[i], plan, schema, subFilters.InFilters, ct);
         }
         else if (plan.Options.UseChannelScheduler)
         {
             await RunChannelMorselsAsync(
                     n,
                     dop,
-                    i => partials[i] = AccumulateBatchComposite(batches[i], plan, schema, ct),
+                    i => partials[i] = AccumulateBatchComposite(batches[i], plan, schema, subFilters.InFilters, ct),
                     ct)
                 .ConfigureAwait(false);
         }
@@ -651,7 +680,7 @@ public sealed class HashAggregateOperator : Operators.IHashAggregateOperator, Op
                 0,
                 n,
                 new ParallelOptions { MaxDegreeOfParallelism = dop, CancellationToken = ct },
-                i => partials[i] = AccumulateBatchComposite(batches[i], plan, schema, ct));
+                i => partials[i] = AccumulateBatchComposite(batches[i], plan, schema, subFilters.InFilters, ct));
         }
 
         if (context.SpillWriter.IsEnabled && plan.SpillPartialEntryThreshold > 0)
@@ -670,6 +699,7 @@ public sealed class HashAggregateOperator : Operators.IHashAggregateOperator, Op
         var global = MergePartialsComposite(partials, plan.Aggregates);
         var sortedKeys = SortCompositeKeys(global.Keys, schema, plan.GroupKeyColumnIndices);
         var outBatch = MaterializeOutputComposite(sortedKeys, global, plan, schema);
+        outBatch = ApplyHavingIfNeeded(outBatch, plan, context);
         return new ColumnarMaterializedQueryResult([outBatch]);
     }
 
@@ -677,6 +707,7 @@ public sealed class HashAggregateOperator : Operators.IHashAggregateOperator, Op
         IColumnarBatch batch,
         HashAggregatePhysicalPlan plan,
         TableSchema schema,
+        ColumnInSetFilter[]? inFilters,
         CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -688,9 +719,11 @@ public sealed class HashAggregateOperator : Operators.IHashAggregateOperator, Op
         {
             ReadOnlySpan<int> sel;
             int k;
-            if (plan.Filters is { Length: > 0 } filters)
+            var compare = plan.Filters is { Length: > 0 } filters ? filters.AsSpan() : ReadOnlySpan<ColumnCompareFilter>.Empty;
+            var inSpan = inFilters is { Length: > 0 } inf ? inf.AsSpan() : ReadOnlySpan<ColumnInSetFilter>.Empty;
+            if (compare.Length > 0 || inSpan.Length > 0)
             {
-                k = _deps.Selection.FillSelectedRowsConjunctive(batch, filters, rent.AsSpan(0, batch.RowCount));
+                k = _deps.Selection.FillSelectedRowsConjunctive(batch, compare, inSpan, rent.AsSpan(0, batch.RowCount));
                 sel = rent.AsSpan(0, k);
             }
             else
@@ -716,6 +749,8 @@ public sealed class HashAggregateOperator : Operators.IHashAggregateOperator, Op
                     var spec = specs[a];
                     if (spec.Kind == AggregateKind.Count && spec.SourceColumnIndex < 0)
                         AggregateRowOps.AddCountStar(ref slot);
+                    else if (spec.Kind == AggregateKind.CountDistinct)
+                        AggregateRowOps.AddCountDistinct(ref slot, _deps.Selection, batch.Columns[spec.SourceColumnIndex], row);
                     else if (spec.Kind == AggregateKind.Count)
                         AggregateRowOps.AddCountColumn(ref slot, _deps.Selection, batch.Columns[spec.SourceColumnIndex], row);
                     else
@@ -925,6 +960,8 @@ internal struct AggregateAccumulator
     public long Count;
 
     public HashSet<int>? DistinctInt32;
+    public HashSet<long>? DistinctInt64;
+    public HashSet<byte[]>? DistinctUtf8;
     public double FloatSum;
     public double FloatMin;
     public double FloatMax;
@@ -944,20 +981,56 @@ internal static class AggregateRowOps
 {
     public static void AddCountStar(ref AggregateAccumulator acc) => acc.Count++;
 
-    public static void AddCountDistinctInt32(
+    public static long DistinctCount(AggregateAccumulator acc) =>
+        acc.DistinctInt32?.Count ?? acc.DistinctInt64?.Count ?? acc.DistinctUtf8?.Count ?? 0;
+
+    public static void AddCountDistinct(
         ref AggregateAccumulator acc,
         SelectionEvaluator selection,
         IColumnChunk col,
         int row)
     {
-        if (col.PhysicalType != RainDbType.Int32)
-            throw new NotSupportedException("COUNT(DISTINCT) supports Int32 columns in this release.");
         var nb = col.HasNulls ? col.NullBitmap.Span : ReadOnlySpan<byte>.Empty;
         if (selection.IsNull(nb, row, col.HasNulls))
             return;
-        acc.DistinctInt32 ??= new HashSet<int>();
-        var v = BinaryPrimitives.ReadInt32LittleEndian(col.Values.Span.Slice(row * sizeof(int), sizeof(int)));
-        acc.DistinctInt32.Add(v);
+
+        var values = col.Values.Span;
+        switch (col.PhysicalType)
+        {
+            case RainDbType.Int32:
+                acc.DistinctInt32 ??= new HashSet<int>();
+                acc.DistinctInt32.Add(BinaryPrimitives.ReadInt32LittleEndian(values.Slice(row * sizeof(int), sizeof(int))));
+                break;
+            case RainDbType.Int64:
+                acc.DistinctInt64 ??= new HashSet<long>();
+                acc.DistinctInt64.Add(BinaryPrimitives.ReadInt64LittleEndian(values.Slice(row * sizeof(long), sizeof(long))));
+                break;
+            case RainDbType.Float64:
+                acc.DistinctInt64 ??= new HashSet<long>();
+                acc.DistinctInt64.Add(BinaryPrimitives.ReadInt64LittleEndian(values.Slice(row * sizeof(double), sizeof(double))));
+                break;
+            case RainDbType.Utf8:
+                acc.DistinctUtf8 ??= new HashSet<byte[]>(ByteArrayComparer.Instance);
+                acc.DistinctUtf8.Add(Utf8Payload(col, row).ToArray());
+                break;
+            default:
+                throw new NotSupportedException($"COUNT(DISTINCT) is not supported for type {col.PhysicalType}.");
+        }
+    }
+
+    private sealed class ByteArrayComparer : IEqualityComparer<byte[]>
+    {
+        public static readonly ByteArrayComparer Instance = new();
+
+        public bool Equals(byte[]? x, byte[]? y) =>
+            x is not null && y is not null && x.AsSpan().SequenceEqual(y);
+
+        public int GetHashCode(byte[] obj)
+        {
+            var hc = new HashCode();
+            hc.AddBytes(obj);
+            return hc.ToHashCode();
+        }
     }
 
     public static void AddCountColumn(
@@ -1127,11 +1200,34 @@ internal static class AggregateRowOps
 
     private static AggregateAccumulator CombineDistinct(AggregateAccumulator a, AggregateAccumulator b)
     {
-        if (a.DistinctInt32 is null)
-            return b;
-        if (b.DistinctInt32 is null)
+        if (a.DistinctInt32 is not null || b.DistinctInt32 is not null)
+        {
+            a.DistinctInt32 ??= new HashSet<int>();
+            if (b.DistinctInt32 is not null)
+                a.DistinctInt32.UnionWith(b.DistinctInt32);
             return a;
-        a.DistinctInt32.UnionWith(b.DistinctInt32);
+        }
+
+        if (a.DistinctInt64 is not null || b.DistinctInt64 is not null)
+        {
+            a.DistinctInt64 ??= new HashSet<long>();
+            if (b.DistinctInt64 is not null)
+                a.DistinctInt64.UnionWith(b.DistinctInt64);
+            return a;
+        }
+
+        if (a.DistinctUtf8 is not null || b.DistinctUtf8 is not null)
+        {
+            a.DistinctUtf8 ??= new HashSet<byte[]>(ByteArrayComparer.Instance);
+            if (b.DistinctUtf8 is not null)
+            {
+                foreach (var u in b.DistinctUtf8)
+                    a.DistinctUtf8.Add(u);
+            }
+
+            return a;
+        }
+
         return a;
     }
 

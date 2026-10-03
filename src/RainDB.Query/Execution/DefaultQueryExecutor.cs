@@ -6,6 +6,7 @@ using RainDB.Query.Runtime;
 using RainDB.Query.Execution.Operators;
 using RainDB.Query.Plans;
 using RainDB.Query.Results;
+using RainDB.Schema;
 
 namespace RainDB.Query.Execution;
 
@@ -57,6 +58,9 @@ public sealed class DefaultQueryExecutor : IQueryExecutor
             var buildCols = RequireColumnarTable(context, jst.Join.BuildTableId);
             return await _operators.SortTopN.ExecuteJoinAsync(jst, probeCols, buildCols, context).ConfigureAwait(false);
         }
+
+        if (plan is GroupedJoinSortTopNPhysicalPlan groupedJoinSort)
+            return await ExecuteGroupedJoinSortTopNAsync(groupedJoinSort, context).ConfigureAwait(false);
 
         if (plan is GroupedJoinPhysicalPlan grouped)
         {
@@ -126,18 +130,41 @@ public sealed class DefaultQueryExecutor : IQueryExecutor
         return await ExecuteAsync(plan.OuterPlan, scoped).ConfigureAwait(false);
     }
 
+    private async ValueTask<IQueryResult> ExecuteGroupedJoinSortTopNAsync(
+        GroupedJoinSortTopNPhysicalPlan plan,
+        IExecutionContext context)
+    {
+        var probeCols = RequireColumnarTable(context, plan.GroupedJoin.Join.ProbeTableId);
+        var buildCols = RequireColumnarTable(context, plan.GroupedJoin.Join.BuildTableId);
+        var aggRes = await _operators.GroupedJoin.ExecuteAsync(plan.GroupedJoin, probeCols, buildCols, context).ConfigureAwait(false);
+        return await SortGroupedOutputAsync(aggRes, plan.OutputSchema, plan.SortKeys, plan.Limit, plan.Options, context)
+            .ConfigureAwait(false);
+    }
+
     private async ValueTask<IQueryResult> ExecuteGroupedSortTopNAsync(
         GroupedSortTopNPhysicalPlan plan,
         IExecutionContext context)
     {
         var aggRes = await ExecuteAsync(plan.Aggregate, context).ConfigureAwait(false);
+        return await SortGroupedOutputAsync(aggRes, plan.OutputSchema, plan.SortKeys, plan.Limit, plan.Options, context)
+            .ConfigureAwait(false);
+    }
+
+    private async ValueTask<IQueryResult> SortGroupedOutputAsync(
+        IQueryResult aggRes,
+        TableSchema outputSchema,
+        SortKeyPhysicalSpec[] sortKeys,
+        int? limit,
+        VectorizedScanExecutionOptions options,
+        IExecutionContext context)
+    {
         if (aggRes is not IColumnarQueryResult col)
             throw new InvalidOperationException("Grouped sort input must be columnar.");
         var batchList = new List<IColumnarBatch>();
         foreach (var b in col.Batches)
             batchList.Add(b);
         var ephemeralId = new TableId(Guid.NewGuid());
-        var ephemeral = new EphemeralColumnarTableSource(ephemeralId, "grouped", plan.OutputSchema, batchList);
+        var ephemeral = new EphemeralColumnarTableSource(ephemeralId, "grouped", outputSchema, batchList);
         if (context is not RainDbExecutionContext rc)
             throw new InvalidOperationException("Grouped sort requires RainDbExecutionContext.");
         var overlay = new OverlayCatalog(context.Catalog, [ephemeral]);
@@ -145,10 +172,10 @@ public sealed class DefaultQueryExecutor : IQueryExecutor
         {
             NestedExecutor = rc.NestedExecutor ?? this,
         };
-        var outIx = new int[plan.OutputSchema.Columns.Count];
+        var outIx = new int[outputSchema.Columns.Count];
         for (var i = 0; i < outIx.Length; i++)
             outIx[i] = i;
-        var sortPlan = new SortTopNPhysicalPlan(ephemeralId, outIx, null, plan.SortKeys, plan.Limit, plan.Options);
+        var sortPlan = new SortTopNPhysicalPlan(ephemeralId, outIx, null, sortKeys, limit, options);
         return await _operators.SortTopN.ExecuteTableAsync(sortPlan, ephemeral, scoped).ConfigureAwait(false);
     }
 

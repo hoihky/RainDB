@@ -4,6 +4,7 @@ using RainDB.Logical;
 using RainDB.Query.Plans;
 using RainDB.Schema;
 using RainDB.Sql;
+using RainDB.Sql.Compilation;
 
 namespace RainDB.Sql.Compilation;
 
@@ -41,7 +42,7 @@ public sealed class UncorrelatedSubqueryBinder
                         catalog,
                         scanOptions,
                         joinAlgorithm,
-                        (col, schema, table) => LogicalTableScanBinder.ResolveColumn(schema, col.ColumnName, table)));
+                        col => (LogicalTableScanBinder.ResolveColumn(outerSchema, col.ColumnName, outerTableName), CorrelatedOuterColumnSource.SingleTable)));
                     break;
                 case LogicalUncorrelatedSubqueryPredicate.Kind.Exists:
                 case LogicalUncorrelatedSubqueryPredicate.Kind.NotExists:
@@ -52,7 +53,7 @@ public sealed class UncorrelatedSubqueryBinder
                         catalog,
                         scanOptions,
                         joinAlgorithm,
-                        (col, schema, table) => LogicalTableScanBinder.ResolveColumn(schema, col.ColumnName, table)));
+                        col => (LogicalTableScanBinder.ResolveColumn(outerSchema, col.ColumnName, outerTableName), CorrelatedOuterColumnSource.SingleTable)));
                     break;
             }
         }
@@ -68,7 +69,9 @@ public sealed class UncorrelatedSubqueryBinder
         ITableSource left,
         ITableSource right,
         VectorizedScanExecutionOptions scanOptions,
-        PhysicalJoinAlgorithm joinAlgorithm)
+        PhysicalJoinAlgorithm joinAlgorithm,
+        string? leftAlias = null,
+        string? rightAlias = null)
     {
         if (predicates is null or { Count: 0 })
             return new JoinSubqueryPhysicalSpecs();
@@ -83,16 +86,19 @@ public sealed class UncorrelatedSubqueryBinder
                 case LogicalUncorrelatedSubqueryPredicate.Kind.In:
                 case LogicalUncorrelatedSubqueryPredicate.Kind.NotIn:
                 {
-                    UncorrelatedSubqueryValidator.ValidateForJoin(p, left.Name, right.Name);
-                    var physical = _compiler.CompilePhysical(p.Subquery.Root, catalog, scanOptions, joinAlgorithm);
-                    var (onProbe, colIx, colType) = ResolveJoinInColumn(p, left, right);
-                    var subCol = ResolveSingleSubqueryColumn(physical, catalog);
-                    var spec = new SubqueryInPhysicalSpec(
-                        colIx,
-                        colType,
-                        p.PredicateKind == LogicalUncorrelatedSubqueryPredicate.Kind.NotIn,
-                        physical,
-                        subCol);
+                    var spec = BindIn(
+                        p,
+                        CollectJoinOuterNames(left, right, leftAlias, rightAlias),
+                        left.Schema,
+                        catalog,
+                        scanOptions,
+                        joinAlgorithm,
+                        col => ResolveJoinOuterBinding(col, left, right, leftAlias, rightAlias),
+                        joinLeft: left,
+                        joinRight: right,
+                        joinLeftAlias: leftAlias,
+                        joinRightAlias: rightAlias);
+                    var (onProbe, _, _) = ResolveJoinInColumn(p, left, right, leftAlias, rightAlias);
                     if (onProbe)
                         probeIn.Add(spec);
                     else
@@ -103,12 +109,12 @@ public sealed class UncorrelatedSubqueryBinder
                 case LogicalUncorrelatedSubqueryPredicate.Kind.NotExists:
                     existsList.Add(BindExists(
                         p,
-                        [left.Name, right.Name],
+                        CollectJoinOuterNames(left, right, leftAlias, rightAlias),
                         left.Schema,
                         catalog,
                         scanOptions,
                         joinAlgorithm,
-                        (col, _, _) => ResolveJoinOuterColumn(col, left, right)));
+                        col => ResolveJoinOuterBinding(col, left, right, leftAlias, rightAlias)));
                     break;
             }
         }
@@ -124,7 +130,9 @@ public sealed class UncorrelatedSubqueryBinder
     private static (bool OnProbe, int ColumnIndex, RainDbType ColumnType) ResolveJoinInColumn(
         LogicalUncorrelatedSubqueryPredicate predicate,
         ITableSource left,
-        ITableSource right)
+        ITableSource right,
+        string? leftAlias = null,
+        string? rightAlias = null)
     {
         if (predicate.Column is null)
             throw new SqlCompileException("IN subquery predicate requires a column reference.");
@@ -132,13 +140,13 @@ public sealed class UncorrelatedSubqueryBinder
         var col = predicate.Column;
         if (col.QualifierTableName is { } qt)
         {
-            if (TableEq(qt, left.Name))
+            if (TableQualifier.Matches(qt, left.Name, leftAlias))
             {
                 var ix = LogicalTableScanBinder.ResolveColumn(left.Schema, col.ColumnName, left.Name);
                 return (true, ix, left.Schema.Columns[ix].Type);
             }
 
-            if (TableEq(qt, right.Name))
+            if (TableQualifier.Matches(qt, right.Name, rightAlias))
             {
                 var ix = LogicalTableScanBinder.ResolveColumn(right.Schema, col.ColumnName, right.Name);
                 return (false, ix, right.Schema.Columns[ix].Type);
@@ -178,21 +186,31 @@ public sealed class UncorrelatedSubqueryBinder
 
     private static bool TableEq(string a, string b) => a.Equals(b, StringComparison.OrdinalIgnoreCase);
 
-    private static int ResolveJoinOuterColumn(
+    private static (int ColumnIndex, CorrelatedOuterColumnSource Source) ResolveJoinOuterBinding(
         LogicalColumnScalarRef col,
         ITableSource left,
-        ITableSource right)
+        ITableSource right,
+        string? leftAlias = null,
+        string? rightAlias = null)
     {
-        if (col.QualifierTableName is { } q)
-        {
-            if (TableEq(q, left.Name))
-                return LogicalTableScanBinder.ResolveColumn(left.Schema, col.ColumnName, left.Name);
-            if (TableEq(q, right.Name))
-                return LogicalTableScanBinder.ResolveColumn(right.Schema, col.ColumnName, right.Name);
-            throw new SqlCompileException($"Unknown outer table '{q}' in correlated subquery.");
-        }
+        if (col.QualifierTableName is not { } q)
+            throw new SqlCompileException("Correlated subquery columns must be qualified with a table name.");
 
-        throw new SqlCompileException("Correlated subquery columns must be qualified with a table name.");
+        if (TableQualifier.Matches(q, left.Name, leftAlias))
+            return (LogicalTableScanBinder.ResolveColumn(left.Schema, col.ColumnName, left.Name), CorrelatedOuterColumnSource.JoinProbe);
+        if (TableQualifier.Matches(q, right.Name, rightAlias))
+            return (LogicalTableScanBinder.ResolveColumn(right.Schema, col.ColumnName, right.Name), CorrelatedOuterColumnSource.JoinBuild);
+        throw new SqlCompileException($"Unknown outer table '{q}' in correlated subquery.");
+    }
+
+    private static string[] CollectJoinOuterNames(ITableSource left, ITableSource right, string? leftAlias = null, string? rightAlias = null)
+    {
+        var list = new List<string> { left.Name, right.Name };
+        if (leftAlias is not null)
+            list.Add(leftAlias);
+        if (rightAlias is not null)
+            list.Add(rightAlias);
+        return list.ToArray();
     }
 
     private SubqueryInPhysicalSpec BindIn(
@@ -202,14 +220,26 @@ public sealed class UncorrelatedSubqueryBinder
         ICatalog catalog,
         VectorizedScanExecutionOptions scanOptions,
         PhysicalJoinAlgorithm joinAlgorithm,
-        Func<LogicalColumnScalarRef, TableSchema, string, int> resolveOuterColumn)
+        Func<LogicalColumnScalarRef, (int ColumnIndex, CorrelatedOuterColumnSource Source)> resolveOuterBinding,
+        ITableSource? joinLeft = null,
+        ITableSource? joinRight = null,
+        string? joinLeftAlias = null,
+        string? joinRightAlias = null)
     {
         if (predicate.Column is null)
             throw new SqlCompileException("IN subquery predicate requires a column reference.");
 
-        var outerTable = predicate.Column.QualifierTableName ?? outerTableNames[0];
-        var colIx = resolveOuterColumn(predicate.Column, outerSchema, outerTable);
-        var colType = outerSchema.Columns[colIx].Type;
+        int colIx;
+        RainDbType colType;
+        if (joinLeft is not null && joinRight is not null)
+        {
+            (_, colIx, colType) = ResolveJoinInColumn(predicate, joinLeft, joinRight, joinLeftAlias, joinRightAlias);
+        }
+        else
+        {
+            (colIx, _) = resolveOuterBinding(predicate.Column);
+            colType = outerSchema.Columns[colIx].Type;
+        }
 
         var innerRoot = predicate.Subquery.Root;
         CorrelatedEqualityBinding[]? bindings = null;
@@ -219,10 +249,8 @@ public sealed class UncorrelatedSubqueryBinder
                 out var correlations,
                 out var rewritten))
         {
-            if (outerTableNames.Length > 1)
-                throw new SqlCompileException("Correlated IN on joins is not supported yet.");
             innerRoot = rewritten;
-            bindings = BindCorrelations(correlations, outerSchema, innerRoot, catalog, resolveOuterColumn);
+            bindings = BindCorrelations(correlations, innerRoot, catalog, resolveOuterBinding);
         }
         else if (outerTableNames.Length == 1)
         {
@@ -251,7 +279,7 @@ public sealed class UncorrelatedSubqueryBinder
         ICatalog catalog,
         VectorizedScanExecutionOptions scanOptions,
         PhysicalJoinAlgorithm joinAlgorithm,
-        Func<LogicalColumnScalarRef, TableSchema, string, int> resolveOuterColumn)
+        Func<LogicalColumnScalarRef, (int ColumnIndex, CorrelatedOuterColumnSource Source)> resolveOuterBinding)
     {
         var innerRoot = predicate.Subquery.Root;
         CorrelatedEqualityBinding[]? bindings = null;
@@ -261,10 +289,8 @@ public sealed class UncorrelatedSubqueryBinder
                 out var correlations,
                 out var rewritten))
         {
-            if (outerTableNames.Length > 1)
-                throw new SqlCompileException("Correlated EXISTS on joins is not supported yet.");
             innerRoot = rewritten;
-            bindings = BindCorrelations(correlations, outerSchema, innerRoot, catalog, resolveOuterColumn);
+            bindings = BindCorrelations(correlations, innerRoot, catalog, resolveOuterBinding);
         }
         else if (outerTableNames.Length == 1)
         {
@@ -284,12 +310,21 @@ public sealed class UncorrelatedSubqueryBinder
         };
     }
 
+    private static RainDbType ResolveInColumnType(
+        LogicalColumnScalarRef col,
+        TableSchema singleTableSchema,
+        string[] outerTableNames)
+    {
+        if (outerTableNames.Length == 1)
+            return singleTableSchema.Columns[LogicalTableScanBinder.ResolveColumn(singleTableSchema, col.ColumnName, outerTableNames[0])].Type;
+        throw new SqlCompileException("IN column type for join queries must be resolved via BindForJoin.");
+    }
+
     private static CorrelatedEqualityBinding[] BindCorrelations(
         IReadOnlyList<LogicalSubqueryCorrelation> correlations,
-        TableSchema outerSchema,
         ILogicalRoot innerRoot,
         ICatalog catalog,
-        Func<LogicalColumnScalarRef, TableSchema, string, int> resolveOuterColumn)
+        Func<LogicalColumnScalarRef, (int ColumnIndex, CorrelatedOuterColumnSource Source)> resolveOuterBinding)
     {
         if (innerRoot is not LogicalTableScan innerScan)
             throw new SqlCompileException("Correlated subqueries must use a single-table inner SELECT.");
@@ -300,15 +335,15 @@ public sealed class UncorrelatedSubqueryBinder
         for (var i = 0; i < correlations.Count; i++)
         {
             var c = correlations[i];
-            var outerTable = c.OuterColumn.QualifierTableName
-                ?? throw new SqlCompileException("Correlated outer column must be qualified.");
-            var outerIx = resolveOuterColumn(c.OuterColumn, outerSchema, outerTable);
+            if (c.OuterColumn.QualifierTableName is null)
+                throw new SqlCompileException("Correlated outer column must be qualified.");
+            var (outerIx, source) = resolveOuterBinding(c.OuterColumn);
             var innerTable = c.InnerColumn.QualifierTableName ?? innerScan.TableName;
             if (!innerTable.Equals(innerScan.TableName, StringComparison.OrdinalIgnoreCase))
                 throw new SqlCompileException("Correlated inner column must reference the inner FROM table.");
             var innerIx = LogicalTableScanBinder.ResolveColumn(innerSchema, c.InnerColumn.ColumnName, innerScan.TableName);
             var t = innerSchema.Columns[innerIx].Type;
-            arr[i] = new CorrelatedEqualityBinding(outerIx, innerIx, t);
+            arr[i] = new CorrelatedEqualityBinding(outerIx, innerIx, t, source);
         }
 
         return arr;

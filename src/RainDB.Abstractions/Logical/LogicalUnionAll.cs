@@ -7,7 +7,13 @@ public sealed class LogicalUnionAll : ILogicalRoot
 {
     public required IReadOnlyList<ILogicalRoot> Branches { get; init; }
 
-    /// <summary>When <see langword="true"/>, keeps duplicate rows (<c>UNION ALL</c>); otherwise <c>UNION</c> deduplicates.</summary>
+    /// <summary>
+    /// For each <c>i</c> in <c>0 .. Branches.Count - 2</c>, when <see langword="true"/> the merge before branch <c>i + 1</c> is
+    /// <c>UNION</c> (dedup); when <see langword="false"/>, <c>UNION ALL</c>. Left-associative chain.
+    /// </summary>
+    public IReadOnlyList<bool>? DistinctBetweenBranches { get; init; }
+
+    /// <summary>When <see langword="true"/>, entire chain is <c>UNION ALL</c> (legacy when <see cref="DistinctBetweenBranches"/> is unset).</summary>
     public bool UnionAll { get; init; } = true;
 
     public string Explain(string indent = "")

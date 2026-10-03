@@ -115,6 +115,7 @@ public sealed class DistinctOperator : Operators.IDistinctOperator
 
     private readonly struct RowSignature : IEquatable<RowSignature>
     {
+        public bool[] NullCells { get; init; }
         public int[] Int32Cells { get; init; }
         public long[] Int64Cells { get; init; }
         public byte[][] Float64Bits { get; init; }
@@ -122,6 +123,7 @@ public sealed class DistinctOperator : Operators.IDistinctOperator
 
         public static RowSignature FromBatch(IColumnarBatch batch, int row, int colCount, SelectionEvaluator selection)
         {
+            var nulls = new bool[colCount];
             var i32 = new int[colCount];
             var i64 = new long[colCount];
             var f64 = new byte[colCount][];
@@ -131,7 +133,12 @@ public sealed class DistinctOperator : Operators.IDistinctOperator
                 var col = batch.Columns[c];
                 var nb = col.HasNulls ? col.NullBitmap.Span : ReadOnlySpan<byte>.Empty;
                 if (selection.IsNull(nb, row, col.HasNulls))
-                    throw new NotSupportedException("DISTINCT with NULL cells is not supported yet.");
+                {
+                    nulls[c] = true;
+                    f64[c] = [];
+                    utf8[c] = [];
+                    continue;
+                }
 
                 switch (col.PhysicalType)
                 {
@@ -152,7 +159,7 @@ public sealed class DistinctOperator : Operators.IDistinctOperator
                 }
             }
 
-            return new RowSignature { Int32Cells = i32, Int64Cells = i64, Float64Bits = f64, Utf8Cells = utf8 };
+            return new RowSignature { NullCells = nulls, Int32Cells = i32, Int64Cells = i64, Float64Bits = f64, Utf8Cells = utf8 };
         }
 
         private static byte[] ReadUtf8Payload(IColumnChunk col, int row) =>
@@ -167,6 +174,10 @@ public sealed class DistinctOperator : Operators.IDistinctOperator
         {
             for (var i = 0; i < Int32Cells.Length; i++)
             {
+                if (NullCells[i] != other.NullCells[i])
+                    return false;
+                if (NullCells[i])
+                    continue;
                 if (Int32Cells[i] != other.Int32Cells[i]
                     || Int64Cells[i] != other.Int64Cells[i]
                     || !Float64Bits[i].AsSpan().SequenceEqual(other.Float64Bits[i])
@@ -182,11 +193,16 @@ public sealed class DistinctOperator : Operators.IDistinctOperator
         public override int GetHashCode()
         {
             var hc = new HashCode();
-            hc.AddBytes(Float64Bits.Length > 0 ? Float64Bits[0] : []);
-            foreach (var u in Utf8Cells)
-                hc.AddBytes(u);
+            foreach (var n in NullCells)
+                hc.Add(n);
             foreach (var v in Int32Cells)
                 hc.Add(v);
+            foreach (var v in Int64Cells)
+                hc.Add(v);
+            foreach (var f in Float64Bits)
+                hc.AddBytes(f);
+            foreach (var u in Utf8Cells)
+                hc.AddBytes(u);
             return hc.ToHashCode();
         }
     }

@@ -19,6 +19,7 @@ internal sealed class LogicalPlanCloner
             {
                 Branches = u.Branches.Select(CloneRoot).ToArray(),
                 UnionAll = u.UnionAll,
+                DistinctBetweenBranches = u.DistinctBetweenBranches is null ? null : u.DistinctBetweenBranches.ToArray(),
             },
             LogicalDerivedTableScan d => new LogicalDerivedTableScan
             {
@@ -41,6 +42,7 @@ internal sealed class LogicalPlanCloner
         new()
         {
             TableName = s.TableName,
+            TableAlias = s.TableAlias,
             SelectDistinct = s.SelectDistinct,
             Projection = projectionOverride ?? CloneProjectionList(s.Projection),
             GroupByColumns = CloneProjectionList(s.GroupByColumns),
@@ -64,7 +66,9 @@ internal sealed class LogicalPlanCloner
         {
             Semantics = j.Semantics,
             LeftTableName = j.LeftTableName,
+            LeftTableAlias = j.LeftTableAlias,
             RightTableName = j.RightTableName,
+            RightTableAlias = j.RightTableAlias,
             LeftKeyColumns = CloneQualifiedColumns(j.LeftKeyColumns),
             RightKeyColumns = CloneQualifiedColumns(j.RightKeyColumns),
             SelectProjection = selectProjectionOverride ?? CloneProjectionList(j.SelectProjection),

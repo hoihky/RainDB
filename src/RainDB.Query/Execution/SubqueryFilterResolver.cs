@@ -77,20 +77,21 @@ internal static class SubqueryFilterResolver
         if (probeIn is null && buildIn is null && existsFilters is null)
             return ResolvedJoinSubqueryFilters.Empty;
 
-        ColumnInSetFilter[]? probeResolved = null;
-        if (probeIn is { Length: > 0 })
-            probeResolved = await ResolveInListAsync(probeIn, executor, context).ConfigureAwait(false);
+        var (probeResolved, corrProbeIn) = await SplitInListAsync(probeIn, executor, context).ConfigureAwait(false);
+        var (buildResolved, corrBuildIn) = await SplitInListAsync(buildIn, executor, context).ConfigureAwait(false);
 
-        ColumnInSetFilter[]? buildResolved = null;
-        if (buildIn is { Length: > 0 })
-            buildResolved = await ResolveInListAsync(buildIn, executor, context).ConfigureAwait(false);
-
+        SubqueryExistsPhysicalSpec[]? correlatedExists = null;
         if (existsFilters is { Length: > 0 })
         {
+            var corr = new List<SubqueryExistsPhysicalSpec>();
             foreach (var ex in existsFilters)
             {
                 if (ex.Correlations is { Length: > 0 })
-                    throw new NotSupportedException("Correlated EXISTS is not supported on join queries yet.");
+                {
+                    corr.Add(ex);
+                    continue;
+                }
+
                 var result = await executor.ExecuteAsync(ex.Subquery, context).ConfigureAwait(false);
                 var any = result is IColumnarQueryResult c && c.RowCount > 0;
                 if (ex.Negated)
@@ -98,28 +99,42 @@ internal static class SubqueryFilterResolver
                 if (!any)
                     return ResolvedJoinSubqueryFilters.AllDenied;
             }
+
+            correlatedExists = corr.Count > 0 ? corr.ToArray() : null;
         }
 
-        return new ResolvedJoinSubqueryFilters(probeResolved, buildResolved);
+        return new ResolvedJoinSubqueryFilters(probeResolved, buildResolved, correlatedExists, corrProbeIn, corrBuildIn);
     }
 
-    private static async Task<ColumnInSetFilter[]> ResolveInListAsync(
-        SubqueryInPhysicalSpec[] inFilters,
+    private static async ValueTask<(ColumnInSetFilter[]? Resolved, SubqueryInPhysicalSpec[]? Correlated)> SplitInListAsync(
+        SubqueryInPhysicalSpec[]? inFilters,
         IQueryExecutor executor,
         IExecutionContext context)
     {
-        var inResolved = new ColumnInSetFilter[inFilters.Length];
+        if (inFilters is null or { Length: 0 })
+            return (null, null);
+
+        var resolved = new List<ColumnInSetFilter>();
+        var corr = new List<SubqueryInPhysicalSpec>();
         for (var i = 0; i < inFilters.Length; i++)
         {
             var spec = inFilters[i];
+            if (spec.Correlations is { Length: > 0 })
+            {
+                corr.Add(spec);
+                continue;
+            }
+
             var result = await executor.ExecuteAsync(spec.Subquery, context).ConfigureAwait(false);
             if (result is not IColumnarQueryResult col)
                 throw new InvalidOperationException("IN subquery must return a columnar row set.");
             var set = ScalarValueSet.FromSingleColumn(col, spec.SubqueryResultColumnIndex, spec.ColumnType);
-            inResolved[i] = new ColumnInSetFilter(spec.ColumnIndex, spec.Negated, set);
+            resolved.Add(new ColumnInSetFilter(spec.ColumnIndex, spec.Negated, set));
         }
 
-        return inResolved;
+        return (
+            resolved.Count > 0 ? resolved.ToArray() : null,
+            corr.Count > 0 ? corr.ToArray() : null);
     }
 }
 
@@ -128,10 +143,19 @@ internal sealed class ResolvedJoinSubqueryFilters
     public static readonly ResolvedJoinSubqueryFilters Empty = new(null, null);
     public static readonly ResolvedJoinSubqueryFilters AllDenied = new(null, null, denyAll: true);
 
-    public ResolvedJoinSubqueryFilters(ColumnInSetFilter[]? probeInFilters, ColumnInSetFilter[]? buildInFilters, bool denyAll = false)
+    public ResolvedJoinSubqueryFilters(
+        ColumnInSetFilter[]? probeInFilters,
+        ColumnInSetFilter[]? buildInFilters,
+        SubqueryExistsPhysicalSpec[]? correlatedExists = null,
+        SubqueryInPhysicalSpec[]? correlatedProbeIn = null,
+        SubqueryInPhysicalSpec[]? correlatedBuildIn = null,
+        bool denyAll = false)
     {
         ProbeInFilters = probeInFilters;
         BuildInFilters = buildInFilters;
+        CorrelatedExists = correlatedExists;
+        CorrelatedProbeIn = correlatedProbeIn;
+        CorrelatedBuildIn = correlatedBuildIn;
         IsDenyAll = denyAll;
     }
 
@@ -139,7 +163,18 @@ internal sealed class ResolvedJoinSubqueryFilters
 
     public ColumnInSetFilter[]? BuildInFilters { get; }
 
+    public SubqueryExistsPhysicalSpec[]? CorrelatedExists { get; }
+
+    public SubqueryInPhysicalSpec[]? CorrelatedProbeIn { get; }
+
+    public SubqueryInPhysicalSpec[]? CorrelatedBuildIn { get; }
+
     public bool IsDenyAll { get; }
+
+    public bool HasCorrelated =>
+        CorrelatedExists is { Length: > 0 }
+        || CorrelatedProbeIn is { Length: > 0 }
+        || CorrelatedBuildIn is { Length: > 0 };
 }
 
 internal sealed class ResolvedSubqueryFilters

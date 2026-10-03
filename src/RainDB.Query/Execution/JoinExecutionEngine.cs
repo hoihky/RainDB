@@ -73,7 +73,15 @@ public sealed class JoinOperator : Operators.IJoinOperator
         _resolvedJoinSubqueries = subqueryFilters;
         try
         {
-            RunJoinCore(plan, probeTable, buildTable, context, emitBatch, matchChunkRowCount);
+            Func<JoinRowMatch, bool>? correlatedGate = null;
+            if (subqueryFilters.HasCorrelated)
+            {
+                var probeBatches = probeTable.Batches;
+                var buildBatches = buildTable.Batches;
+                correlatedGate = m => PassesCorrelatedJoinFilters(m, probeBatches, buildBatches, context);
+            }
+
+            RunJoinCore(plan, probeTable, buildTable, context, emitBatch, matchChunkRowCount, correlatedGate);
         }
         finally
         {
@@ -87,7 +95,8 @@ public sealed class JoinOperator : Operators.IJoinOperator
         IColumnarTableSource buildTable,
         IExecutionContext context,
         Action<ColumnarBatch> emitBatch,
-        int matchChunkRowCount)
+        int matchChunkRowCount,
+        Func<JoinRowMatch, bool>? correlatedMatchGate = null)
     {
         var probeSchema = probeTable.Schema;
         var buildSchema = buildTable.Schema;
@@ -103,7 +112,8 @@ public sealed class JoinOperator : Operators.IJoinOperator
             buildSchema,
             emitBatch,
             _deps.JoinMaterializer,
-            matchChunkRowCount);
+            matchChunkRowCount,
+            correlatedMatchGate);
 
         var utf8JoinKeys = JoinKeysIncludeUtf8(probeSchema, plan.ProbeKeyColumnIndices);
         switch (plan.Algorithm)
@@ -146,7 +156,7 @@ public sealed class JoinOperator : Operators.IJoinOperator
         return r;
     }
 
-    private static async ValueTask<ResolvedJoinSubqueryFilters> ResolveJoinSubqueryFiltersAsync(
+    internal static async ValueTask<ResolvedJoinSubqueryFilters> ResolveJoinSubqueryFiltersAsync(
         JoinPhysicalPlan plan,
         IExecutionContext context)
     {
@@ -162,6 +172,83 @@ public sealed class JoinOperator : Operators.IJoinOperator
             plan.ExistsSubqueries,
             executor,
             context).ConfigureAwait(false);
+    }
+
+    private bool PassesCorrelatedJoinFilters(
+        JoinRowMatch match,
+        IReadOnlyList<IColumnarBatch> probeBatches,
+        IReadOnlyList<IColumnarBatch> buildBatches,
+        IExecutionContext context) =>
+        PassesCorrelatedJoinFiltersAsync(match, probeBatches, buildBatches, context).AsTask().GetAwaiter().GetResult();
+
+    private async ValueTask<bool> PassesCorrelatedJoinFiltersAsync(
+        JoinRowMatch match,
+        IReadOnlyList<IColumnarBatch> probeBatches,
+        IReadOnlyList<IColumnarBatch> buildBatches,
+        IExecutionContext context)
+    {
+        if (context is not RainDbExecutionContext rc || rc.NestedExecutor is not { } executor)
+            return false;
+
+        if (!match.HasLeft && !match.HasRight)
+            return false;
+
+        IColumnarBatch? probeBatch = match.HasLeft ? probeBatches[match.LeftBatchIdx] : null;
+        IColumnarBatch? buildBatch = match.HasRight ? buildBatches[match.RightBatchIdx] : null;
+        var probeRow = match.HasLeft ? match.LeftRow : 0;
+        var buildRow = match.HasRight ? match.RightRow : 0;
+
+        if (_resolvedJoinSubqueries.CorrelatedExists is { Length: > 0 } existsList)
+        {
+            foreach (var ex in existsList)
+            {
+                var ok = probeBatch is not null && buildBatch is not null
+                    ? await CorrelatedSubqueryExecutor.ExistsForJoinMatchAsync(
+                        ex, probeBatch, probeRow, buildBatch, buildRow, executor, context).ConfigureAwait(false)
+                    : probeBatch is not null
+                        ? await CorrelatedSubqueryExecutor.ExistsForOuterRowAsync(ex, probeBatch, probeRow, executor, context)
+                            .ConfigureAwait(false)
+                        : false;
+                if (!ok)
+                    return false;
+            }
+        }
+
+        if (_resolvedJoinSubqueries.CorrelatedProbeIn is { Length: > 0 } probeIn)
+        {
+            foreach (var spec in probeIn)
+            {
+                if (probeBatch is null)
+                    return false;
+                var ok = buildBatch is not null
+                    ? await CorrelatedSubqueryExecutor.InForJoinMatchAsync(
+                        spec, inColumnOnProbe: true, probeBatch, probeRow, buildBatch, buildRow, executor, context, _deps.Selection)
+                        .ConfigureAwait(false)
+                    : await CorrelatedSubqueryExecutor.InForOuterRowAsync(spec, probeBatch, probeRow, executor, context, _deps.Selection)
+                        .ConfigureAwait(false);
+                if (!ok)
+                    return false;
+            }
+        }
+
+        if (_resolvedJoinSubqueries.CorrelatedBuildIn is { Length: > 0 } buildIn)
+        {
+            foreach (var spec in buildIn)
+            {
+                if (buildBatch is null)
+                    return false;
+                var ok = probeBatch is not null
+                    ? await CorrelatedSubqueryExecutor.InForJoinMatchAsync(
+                        spec, inColumnOnProbe: false, probeBatch, probeRow, buildBatch, buildRow, executor, context, _deps.Selection)
+                        .ConfigureAwait(false)
+                    : await CorrelatedSubqueryExecutor.InForOuterRowAsync(spec, buildBatch, buildRow, executor, context, _deps.Selection)
+                        .ConfigureAwait(false);
+                if (!ok)
+                    return false;
+            }
+        }
+
+        return true;
     }
 
     private static void Validate(JoinPhysicalPlan plan, IColumnarTableSource probe, IColumnarTableSource build)

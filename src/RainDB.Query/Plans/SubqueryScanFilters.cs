@@ -12,8 +12,20 @@ public readonly record struct SubqueryInPhysicalSpec(
     int SubqueryResultColumnIndex,
     CorrelatedEqualityBinding[]? Correlations = null);
 
+/// <summary>Which row supplies the outer side of a correlation binding.</summary>
+public enum CorrelatedOuterColumnSource : byte
+{
+    SingleTable,
+    JoinProbe,
+    JoinBuild,
+}
+
 /// <summary>Equality between one outer column and one inner column (correlated execution).</summary>
-public readonly record struct CorrelatedEqualityBinding(int OuterColumnIndex, int InnerColumnIndex, RainDbType CompareType);
+public readonly record struct CorrelatedEqualityBinding(
+    int OuterColumnIndex,
+    int InnerColumnIndex,
+    RainDbType CompareType,
+    CorrelatedOuterColumnSource OuterSource = CorrelatedOuterColumnSource.SingleTable);
 
 /// <summary><c>EXISTS</c> / <c>NOT EXISTS</c> (uncorrelated or correlated).</summary>
 public sealed class SubqueryExistsPhysicalSpec

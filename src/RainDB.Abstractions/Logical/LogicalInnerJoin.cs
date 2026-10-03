@@ -10,7 +10,11 @@ public sealed class LogicalInnerJoin : ILogicalRoot
 
     public required string LeftTableName { get; init; }
 
+    public string? LeftTableAlias { get; init; }
+
     public required string RightTableName { get; init; }
+
+    public string? RightTableAlias { get; init; }
 
     /// <summary>Key columns on the left table (same length as <see cref="RightKeyColumns"/>).</summary>
     public required IReadOnlyList<LogicalQualifiedColumn> LeftKeyColumns { get; init; }

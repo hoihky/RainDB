@@ -15,6 +15,18 @@ namespace RainDB.Tests;
 public class PhaseD5Tests
 {
     [Fact]
+    public async Task Distinct_int64_deduplicates_all_unique_values()
+    {
+        var engine = RainDbEngine.CreateDefault();
+        var t = new MemoryTable("t", new TableSchema([new ColumnDef("k", RainDbType.Int64)]));
+        t.AppendBatch(new ColumnarBatch(4, [Int64Chunk([100L, 200L, 100L, 300L])]));
+        engine.Catalog.Register(t);
+
+        await using var r = await engine.ExecuteSqlAsync("SELECT DISTINCT k FROM t ORDER BY k");
+        Assert.Equal([100L, 200L, 300L], ReadInt64Column(r, 0));
+    }
+
+    [Fact]
     public async Task Select_distinct_deduplicates_rows()
     {
         var engine = RainDbEngine.CreateDefault();
@@ -204,6 +216,110 @@ public class PhaseD5Tests
         var plan = StrictSqlSubset.ParseLogicalPlan("SELECT * FROM L FULL OUTER JOIN R ON L.id = R.id");
         var join = Assert.IsType<LogicalInnerJoin>(plan.Root);
         Assert.Equal(LogicalJoinSemantics.FullOuter, join.Semantics);
+    }
+
+    [Fact]
+    public async Task Mixed_union_and_union_all_is_left_associative()
+    {
+        var engine = RainDbEngine.CreateDefault();
+        var a = new MemoryTable("a", new TableSchema([new ColumnDef("x", RainDbType.Int32)]));
+        a.AppendBatch(Int32Batch([1, 2]));
+        var b = new MemoryTable("b", new TableSchema([new ColumnDef("x", RainDbType.Int32)]));
+        b.AppendBatch(Int32Batch([2, 3]));
+        var c = new MemoryTable("c", new TableSchema([new ColumnDef("x", RainDbType.Int32)]));
+        c.AppendBatch(Int32Batch([3, 4]));
+        engine.Catalog.Register(a);
+        engine.Catalog.Register(b);
+        engine.Catalog.Register(c);
+
+        await using var r = await engine.ExecuteSqlAsync(
+            "SELECT x FROM a UNION ALL SELECT x FROM b UNION SELECT x FROM c ORDER BY x");
+        Assert.Equal([1, 2, 3, 4], ReadInt32Column(r, 0));
+    }
+
+    [Fact]
+    public async Task Distinct_treats_nulls_as_equal()
+    {
+        var engine = RainDbEngine.CreateDefault();
+        var t = new MemoryTable("t", new TableSchema([new ColumnDef("x", RainDbType.Int32)]));
+        t.AppendBatch(new ColumnarBatch(2, [
+            new FixedWidthColumnChunk(RainDbType.Int32, 2, new byte[8], new byte[] { 0b_0000_0011 }, true),
+        ]));
+        engine.Catalog.Register(t);
+
+        await using var r = await engine.ExecuteSqlAsync("SELECT DISTINCT x FROM t");
+        Assert.Equal(1, Assert.IsAssignableFrom<IColumnarQueryResult>(r).RowCount);
+    }
+
+    [Fact]
+    public async Task Count_distinct_int64_column()
+    {
+        var engine = RainDbEngine.CreateDefault();
+        var t = new MemoryTable("t", new TableSchema([
+            new ColumnDef("g", RainDbType.Int32),
+            new ColumnDef("v", RainDbType.Int64),
+        ]));
+        t.AppendBatch(new ColumnarBatch(3, [Int32Chunk([1, 1, 1]), Int64Chunk([10L, 10L, 20L])]));
+        engine.Catalog.Register(t);
+
+        await using var r = await engine.ExecuteSqlAsync("SELECT g, COUNT(DISTINCT v) FROM t GROUP BY g");
+        Assert.Equal([2L], ReadInt64Column(r, 1));
+    }
+
+    [Fact]
+    public async Task Table_alias_in_from_clause()
+    {
+        var engine = TestDataBuilders.CreateEngine();
+        TestDataBuilders.RegisterAnalyticsDemoTables(engine);
+        await using var r = await engine.ExecuteSqlAsync("SELECT o.region FROM order_lines o ORDER BY o.region LIMIT 1");
+        Assert.Equal(1, Assert.IsAssignableFrom<IColumnarQueryResult>(r).RowCount);
+    }
+
+    [Fact]
+    public async Task Correlated_not_exists_filters_outer_rows()
+    {
+        var engine = RainDbEngine.CreateDefault();
+        var orders = new MemoryTable("order_lines", new TableSchema([
+            new ColumnDef("quantity", RainDbType.Int32),
+        ]));
+        orders.AppendBatch(Int32Batch([6, 7, 20]));
+        var tiers = new MemoryTable("rebate_tiers", new TableSchema([
+            new ColumnDef("min_qty", RainDbType.Int32),
+        ]));
+        tiers.AppendBatch(Int32Batch([6, 20]));
+        engine.Catalog.Register(orders);
+        engine.Catalog.Register(tiers);
+
+        await using var r = await engine.ExecuteSqlAsync("""
+            SELECT quantity FROM order_lines
+            WHERE NOT EXISTS (
+              SELECT 1 FROM rebate_tiers
+              WHERE rebate_tiers.min_qty = order_lines.quantity
+            )
+            ORDER BY quantity
+            """);
+        Assert.Equal([7], ReadInt32Column(r, 0));
+    }
+
+    [Fact]
+    public async Task Demo_select_distinct_region()
+    {
+        var engine = TestDataBuilders.CreateEngine();
+        TestDataBuilders.RegisterAnalyticsDemoTables(engine);
+        await using var r = await engine.ExecuteSqlAsync("SELECT DISTINCT region FROM order_lines ORDER BY region");
+        Assert.Equal(3, Assert.IsAssignableFrom<IColumnarQueryResult>(r).RowCount);
+    }
+
+    [Fact]
+    public async Task Demo_count_distinct_quantity_by_region()
+    {
+        var engine = TestDataBuilders.CreateEngine();
+        TestDataBuilders.RegisterAnalyticsDemoTables(engine);
+        await using var r = await engine.ExecuteSqlAsync(
+            "SELECT region, COUNT(DISTINCT quantity) FROM order_lines GROUP BY region ORDER BY region");
+        var colR = Assert.IsAssignableFrom<IColumnarQueryResult>(r);
+        Assert.Equal(3, colR.RowCount);
+        Assert.Equal([2L, 3L, 2L], ReadInt64Column(r, 1));
     }
 
     private static void RegisterLR(RainDbEngine engine, int[] leftIds, int[] rightIds, long[] rightB)

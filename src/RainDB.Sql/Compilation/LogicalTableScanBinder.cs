@@ -38,7 +38,7 @@ public sealed class LogicalTableScanBinder
         var schema = ts.Schema;
 
         if (scan.GroupByColumns is { Count: > 0 })
-            return BindHashAggregate(scan, colTable, schema, catalog, scanOptions);
+            return BindHashAggregate(scan, colTable, schema, catalog, scanOptions, joinAlgorithm);
 
         return BindVectorizedScan(scan, colTable.Id, schema, scan.TableName, catalog, scanOptions, joinAlgorithm);
     }
@@ -69,7 +69,8 @@ public sealed class LogicalTableScanBinder
         IColumnarTableSource colTable,
         TableSchema schema,
         ICatalog catalog,
-        VectorizedScanExecutionOptions scanOptions)
+        VectorizedScanExecutionOptions scanOptions,
+        PhysicalJoinAlgorithm joinAlgorithm)
     {
         if (scan.SelectList is not { Count: > 0 })
             throw new SqlCompileException("GROUP BY query requires a SELECT list.");
@@ -78,7 +79,7 @@ public sealed class LogicalTableScanBinder
         for (var i = 0; i < scan.GroupByColumns.Count; i++)
         {
             var p = scan.GroupByColumns[i];
-            ValidateProjectionTableQualifier(p, scan.TableName);
+            ValidateProjectionTableQualifier(p, scan.TableName, scan.TableAlias);
             var ix = ResolveColumn(schema, p.ColumnName, scan.TableName);
             groupIndices[i] = ix;
         }
@@ -111,10 +112,27 @@ public sealed class LogicalTableScanBinder
         if (scan.HavingConjuncts is { Count: > 0 } && aggs.Count == 0)
             throw new SqlCompileException("HAVING requires at least one aggregate in the SELECT list.");
 
-        ValidateWhereTableQualifiers(scan.WhereConjuncts, scan.TableName);
+        ValidateWhereTableQualifiers(scan.WhereConjuncts, scan.TableName, scan.TableAlias);
         var filters = BuildColumnCompareFilters(scan.WhereConjuncts, schema, scan.TableName);
+        var (inSub, existsSub) = BindScanSubqueryPredicates(
+            scan.SubqueryPredicates,
+            catalog,
+            scan.TableName,
+            schema,
+            scanOptions,
+            joinAlgorithm,
+            rejectCorrelated: true);
         var having = _havingBinder.Bind(scan.HavingConjuncts, scan.SelectList!, scan.GroupByColumns!, schema, scan.TableName, aggs.ToArray());
-        var aggPlan = new HashAggregatePhysicalPlan(colTable.Id, groupIndices, aggs.ToArray(), slots.ToArray(), filters, having, scanOptions);
+        var aggPlan = new HashAggregatePhysicalPlan(
+            colTable.Id,
+            groupIndices,
+            aggs.ToArray(),
+            slots.ToArray(),
+            filters,
+            having,
+            scanOptions,
+            inSubqueries: inSub,
+            existsSubqueries: existsSub);
         if (scan.OrderBy is not { Count: > 0 } && scan.Limit is null)
             return MaybeWrapDistinct(scan, aggPlan, catalog);
 
@@ -263,16 +281,17 @@ public sealed class LogicalTableScanBinder
         VectorizedScanExecutionOptions scanOptions,
         PhysicalJoinAlgorithm joinAlgorithm)
     {
-        ValidateWhereTableQualifiers(scan.WhereConjuncts, tableName);
+        ValidateWhereTableQualifiers(scan.WhereConjuncts, tableName, scan.TableAlias);
         var colCount = schema.Columns.Count;
         var filters = BuildColumnCompareFilters(scan.WhereConjuncts, schema, tableName);
-        var (inSub, existsSub) = _subqueryBinder?.Bind(
+        var (inSub, existsSub) = BindScanSubqueryPredicates(
             scan.SubqueryPredicates,
             catalog,
             tableName,
             schema,
             scanOptions,
-            joinAlgorithm) ?? (null, null);
+            joinAlgorithm,
+            rejectCorrelated: false);
 
         AggregateSpec? aggregate = null;
         ScanOutputColumn[] outputColumns;
@@ -298,7 +317,7 @@ public sealed class LogicalTableScanBinder
         }
         else if (scan.SelectList is { Count: > 0 } selectList)
         {
-            outputColumns = BindScanOutputColumns(selectList, schema, tableName);
+            outputColumns = BindScanOutputColumns(selectList, schema, tableName, scan.TableAlias);
         }
         else if (scan.Projection is null)
         {
@@ -312,7 +331,7 @@ public sealed class LogicalTableScanBinder
             for (var i = 0; i < scan.Projection.Count; i++)
             {
                 var p = scan.Projection[i];
-                ValidateProjectionTableQualifier(p, tableName);
+                ValidateProjectionTableQualifier(p, tableName, scan.TableAlias);
                 outputColumns[i] = new ScanOutputColumn(ResolveColumn(schema, p.ColumnName, tableName));
             }
         }
@@ -325,7 +344,7 @@ public sealed class LogicalTableScanBinder
         if (scan.OrderBy is { Count: > 0 } || scan.Limit is not null)
         {
             var sortSpecs = scan.OrderBy is { Count: > 0 } ob
-                ? BuildTableSortKeySpecs(schema, tableName, ob)
+                ? BuildTableSortKeySpecs(schema, tableName, ob, scan.TableAlias)
                 : Array.Empty<SortKeyPhysicalSpec>();
             var sortOutputIndices = Array.ConvertAll(outputColumns, static c =>
                 c.Int32Expression is null && c.Float64Expression is null ? c.ColumnIndex : -1);
@@ -348,7 +367,8 @@ public sealed class LogicalTableScanBinder
     private ScanOutputColumn[] BindScanOutputColumns(
         IReadOnlyList<LogicalSelectListItem> items,
         TableSchema schema,
-        string tableName)
+        string tableName,
+        string? tableAlias = null)
     {
         var cols = new ScanOutputColumn[items.Count];
         for (var i = 0; i < items.Count; i++)
@@ -356,7 +376,7 @@ public sealed class LogicalTableScanBinder
             switch (items[i])
             {
                 case LogicalColumnProjection p:
-                    ValidateProjectionTableQualifier(p, tableName);
+                    ValidateProjectionTableQualifier(p, tableName, tableAlias);
                     cols[i] = new ScanOutputColumn(ResolveColumn(schema, p.ColumnName, tableName));
                     break;
                 case LogicalScalarProjection sp:
@@ -384,7 +404,8 @@ public sealed class LogicalTableScanBinder
     private SortKeyPhysicalSpec[] BuildTableSortKeySpecs(
         TableSchema schema,
         string tableName,
-        IReadOnlyList<LogicalSortKey> keys)
+        IReadOnlyList<LogicalSortKey> keys,
+        string? tableAlias = null)
     {
         var arr = new SortKeyPhysicalSpec[keys.Count];
         for (var i = 0; i < keys.Count; i++)
@@ -404,7 +425,7 @@ public sealed class LogicalTableScanBinder
 
             if (k.Column is null)
                 throw new SqlCompileException("ORDER BY requires a column or expression.");
-            ValidateProjectionTableQualifier(k.Column, tableName);
+            ValidateProjectionTableQualifier(k.Column, tableName, tableAlias);
             var ix = ResolveColumn(schema, k.Column.ColumnName, tableName);
             var colType = schema.Columns[ix].Type;
             if (colType != RainDbType.Utf8 && !ColumnTypeSizes.IsFixedWidth(colType))
@@ -417,6 +438,51 @@ public sealed class LogicalTableScanBinder
         }
 
         return arr;
+    }
+
+    private (SubqueryInPhysicalSpec[]? In, SubqueryExistsPhysicalSpec[]? Exists) BindScanSubqueryPredicates(
+        IReadOnlyList<LogicalUncorrelatedSubqueryPredicate>? predicates,
+        ICatalog catalog,
+        string tableName,
+        TableSchema schema,
+        VectorizedScanExecutionOptions scanOptions,
+        PhysicalJoinAlgorithm joinAlgorithm,
+        bool rejectCorrelated)
+    {
+        if (predicates is null or { Count: 0 })
+            return (null, null);
+        if (_subqueryBinder is null)
+            throw new SqlCompileException("Subquery predicates require a configured subquery binder.");
+
+        var (inSub, existsSub) = _subqueryBinder.Bind(
+            predicates,
+            catalog,
+            tableName,
+            schema,
+            scanOptions,
+            joinAlgorithm);
+        if (rejectCorrelated)
+        {
+            if (inSub is not null)
+            {
+                foreach (var s in inSub)
+                {
+                    if (s.Correlations is { Length: > 0 })
+                        throw new SqlCompileException("Correlated subqueries are not supported with GROUP BY yet.");
+                }
+            }
+
+            if (existsSub is not null)
+            {
+                foreach (var s in existsSub)
+                {
+                    if (s.Correlations is { Length: > 0 })
+                        throw new SqlCompileException("Correlated subqueries are not supported with GROUP BY yet.");
+                }
+            }
+        }
+
+        return (inSub, existsSub);
     }
 
     internal ColumnCompareFilter[]? BuildColumnCompareFilters(IReadOnlyList<SimpleWhereClause>? conjuncts, TableSchema schema, string tableName)
@@ -434,6 +500,9 @@ public sealed class LogicalTableScanBinder
     {
         if (where.UsesParameter)
             throw new SqlCompileException($"Parameter '@{where.ParameterName}' must be bound before physical compilation.");
+        if (where.CompareColumn is not null)
+            throw new SqlCompileException(
+                "Column-to-column comparisons are only supported inside correlated subqueries (e.g. outer.col = inner.col).");
         if (where.Literal is not { } literal)
             throw new SqlCompileException($"WHERE predicate is missing a literal value.");
         if (where.LeftExpression is { } lex)
@@ -478,26 +547,27 @@ public sealed class LogicalTableScanBinder
         return new ColumnCompareFilter(wi, where.Operator, bits);
     }
 
-    internal static void ValidateWhereTableQualifiers(IReadOnlyList<SimpleWhereClause>? conjuncts, string scannedTableName)
+    internal static void ValidateWhereTableQualifiers(IReadOnlyList<SimpleWhereClause>? conjuncts, string scannedTableName, string? tableAlias = null)
     {
         if (conjuncts is null)
             return;
         foreach (var w in conjuncts)
-            ValidateWhereTableQualifier(w, scannedTableName);
+            ValidateWhereTableQualifier(w, scannedTableName, tableAlias);
     }
 
-    private static void ValidateProjectionTableQualifier(LogicalColumnProjection p, string scannedTableName)
+    private static void ValidateProjectionTableQualifier(LogicalColumnProjection p, string scannedTableName, string? tableAlias = null)
     {
-        if (p.QualifierTableName is { } q && !q.Equals(scannedTableName, StringComparison.OrdinalIgnoreCase))
+        if (p.QualifierTableName is { } q && !TableQualifier.Matches(q, scannedTableName, tableAlias))
             throw new SqlCompileException(
                 $"SELECT references table '{q}' but the FROM clause scans '{scannedTableName}' only.");
     }
 
-    internal static void ValidateWhereTableQualifier(SimpleWhereClause? where, string scannedTableName)
+    internal static void ValidateWhereTableQualifier(SimpleWhereClause? where, string scannedTableName, string? tableAlias = null)
     {
         if (where?.LeftExpression is { } lex)
             ScalarExpressionBindingPipeline.ValidateTableRefs(lex, scannedTableName);
-        if (where?.QualifierTableName is { } q && !q.Equals(scannedTableName, StringComparison.OrdinalIgnoreCase))
+        if (where?.QualifierTableName is { } q
+            && !TableQualifier.Matches(q, scannedTableName, tableAlias))
             throw new SqlCompileException(
                 $"WHERE references table '{q}' but the FROM clause scans '{scannedTableName}' only.");
     }

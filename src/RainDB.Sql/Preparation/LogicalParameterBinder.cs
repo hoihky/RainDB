@@ -64,6 +64,7 @@ public sealed class LogicalParameterBinder
             {
                 Branches = u.Branches.Select(b => BindRoot(b, parameters)).ToArray(),
                 UnionAll = u.UnionAll,
+                DistinctBetweenBranches = u.DistinctBetweenBranches is null ? null : u.DistinctBetweenBranches.ToArray(),
             },
             LogicalDerivedTableScan d => BindDerivedScan(d, parameters),
             _ => throw new InvalidOperationException($"Unsupported logical root {root.GetType().Name}."),
