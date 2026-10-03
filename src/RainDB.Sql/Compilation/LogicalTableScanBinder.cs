@@ -16,11 +16,18 @@ public sealed class LogicalTableScanBinder
 {
     private readonly ScalarExpressionBindingPipeline _expressions = new();
     private readonly GroupedHavingBinder _havingBinder = new();
+    private readonly UncorrelatedSubqueryBinder? _subqueryBinder;
+
+    public LogicalTableScanBinder(UncorrelatedSubqueryBinder? subqueryBinder = null) =>
+        _subqueryBinder = subqueryBinder;
+
+    internal UncorrelatedSubqueryBinder? SubqueryBinder => _subqueryBinder;
 
     public IPhysicalPlan BindAndLower(
         LogicalTableScan scan,
         ICatalog catalog,
-        VectorizedScanExecutionOptions scanOptions = default)
+        VectorizedScanExecutionOptions scanOptions = default,
+        PhysicalJoinAlgorithm joinAlgorithm = PhysicalJoinAlgorithm.Hash)
     {
         ArgumentNullException.ThrowIfNull(scan);
         ArgumentNullException.ThrowIfNull(catalog);
@@ -33,7 +40,28 @@ public sealed class LogicalTableScanBinder
         if (scan.GroupByColumns is { Count: > 0 })
             return BindHashAggregate(scan, colTable, schema, scanOptions);
 
-        return BindVectorizedScan(scan, colTable, schema, scanOptions);
+        return BindVectorizedScan(scan, colTable.Id, schema, scan.TableName, catalog, scanOptions, joinAlgorithm);
+    }
+
+    internal IPhysicalPlan BindDerivedScan(
+        LogicalDerivedTableScan scan,
+        TableId ephemeralTableId,
+        TableSchema derivedSchema,
+        ICatalog catalog,
+        VectorizedScanExecutionOptions scanOptions,
+        PhysicalJoinAlgorithm joinAlgorithm)
+    {
+        var pseudo = new LogicalTableScan
+        {
+            TableName = scan.Alias,
+            Projection = scan.Projection,
+            SelectList = scan.SelectList,
+            WhereConjuncts = scan.WhereConjuncts,
+            SubqueryPredicates = scan.SubqueryPredicates,
+            OrderBy = scan.OrderBy,
+            Limit = scan.Limit,
+        };
+        return BindVectorizedScan(pseudo, ephemeralTableId, derivedSchema, scan.Alias, catalog, scanOptions, joinAlgorithm);
     }
 
     private HashAggregatePhysicalPlan BindHashAggregate(
@@ -127,13 +155,23 @@ public sealed class LogicalTableScanBinder
 
     private IPhysicalPlan BindVectorizedScan(
         LogicalTableScan scan,
-        IColumnarTableSource colTable,
+        TableId tableId,
         TableSchema schema,
-        VectorizedScanExecutionOptions scanOptions)
+        string tableName,
+        ICatalog catalog,
+        VectorizedScanExecutionOptions scanOptions,
+        PhysicalJoinAlgorithm joinAlgorithm)
     {
-        ValidateWhereTableQualifiers(scan.WhereConjuncts, scan.TableName);
+        ValidateWhereTableQualifiers(scan.WhereConjuncts, tableName);
         var colCount = schema.Columns.Count;
-        var filters = BuildColumnCompareFilters(scan.WhereConjuncts, schema, scan.TableName);
+        var filters = BuildColumnCompareFilters(scan.WhereConjuncts, schema, tableName);
+        var (inSub, existsSub) = _subqueryBinder?.Bind(
+            scan.SubqueryPredicates,
+            catalog,
+            tableName,
+            schema,
+            scanOptions,
+            joinAlgorithm) ?? (null, null);
 
         AggregateSpec? aggregate = null;
         ScanOutputColumn[] outputColumns;
@@ -143,9 +181,9 @@ public sealed class LogicalTableScanBinder
             if (a.Kind == AggregateKind.Count && a.ColumnName is null)
                 spec = new AggregateSpec(-1, AggregateKind.Count);
             else if (a.Kind == AggregateKind.Count)
-                spec = new AggregateSpec(ResolveColumn(schema, a.ColumnName!, scan.TableName), AggregateKind.Count);
+                spec = new AggregateSpec(ResolveColumn(schema, a.ColumnName!, tableName), AggregateKind.Count);
             else
-                spec = new AggregateSpec(ResolveColumn(schema, a.ColumnName!, scan.TableName), a.Kind);
+                spec = new AggregateSpec(ResolveColumn(schema, a.ColumnName!, tableName), a.Kind);
 
             if (spec.SourceColumnIndex >= 0)
                 AggregateTypeRules.EnsureSupported(schema.Columns[spec.SourceColumnIndex].Type, spec.Kind);
@@ -159,7 +197,7 @@ public sealed class LogicalTableScanBinder
         }
         else if (scan.SelectList is { Count: > 0 } selectList)
         {
-            outputColumns = BindScanOutputColumns(selectList, schema, scan.TableName);
+            outputColumns = BindScanOutputColumns(selectList, schema, tableName);
         }
         else if (scan.Projection is null)
         {
@@ -173,25 +211,25 @@ public sealed class LogicalTableScanBinder
             for (var i = 0; i < scan.Projection.Count; i++)
             {
                 var p = scan.Projection[i];
-                ValidateProjectionTableQualifier(p, scan.TableName);
-                outputColumns[i] = new ScanOutputColumn(ResolveColumn(schema, p.ColumnName, scan.TableName));
+                ValidateProjectionTableQualifier(p, tableName);
+                outputColumns[i] = new ScanOutputColumn(ResolveColumn(schema, p.ColumnName, tableName));
             }
         }
 
-        var scanPlan = new VectorizedScanPhysicalPlan(colTable.Id, outputColumns, filters, aggregate, scanOptions);
+        var scanPlan = new VectorizedScanPhysicalPlan(tableId, outputColumns, filters, aggregate, scanOptions, inSub, existsSub);
         if (scan.Aggregate is not null)
             return scanPlan;
         if (scan.OrderBy is not { Count: > 0 } && scan.Limit is null)
             return scanPlan;
 
         var sortSpecs = scan.OrderBy is { Count: > 0 } ob
-            ? BuildTableSortKeySpecs(schema, scan.TableName, ob)
+            ? BuildTableSortKeySpecs(schema, tableName, ob)
             : Array.Empty<SortKeyPhysicalSpec>();
         var sortOutputIndices = Array.ConvertAll(outputColumns, static c =>
             c.Int32Expression is null && c.Float64Expression is null ? c.ColumnIndex : -1);
         if (sortOutputIndices.Any(static i => i < 0))
             throw new SqlCompileException("ORDER BY / LIMIT with computed SELECT expressions is not supported yet.");
-        return new SortTopNPhysicalPlan(colTable.Id, sortOutputIndices, filters, sortSpecs, scan.Limit, scanOptions);
+        return new SortTopNPhysicalPlan(tableId, sortOutputIndices, filters, sortSpecs, scan.Limit, scanOptions, inSub, existsSub);
     }
 
     private ScanOutputColumn[] BindScanOutputColumns(

@@ -23,6 +23,7 @@ internal static class PhysicalPlanOutputSchema
             VectorizedScanPhysicalPlan v => ResolveScan(v, catalog),
             SortTopNPhysicalPlan st => ResolveScanTable(st.TableId, st.OutputColumnIndices, catalog),
             HashAggregatePhysicalPlan => throw new SqlCompileException("UNION ALL cannot include GROUP BY queries."),
+            DerivedTableScanPhysicalPlan d => d.DerivedSchema,
             _ => throw new SqlCompileException($"Physical plan type '{plan.GetType().Name}' is not supported in UNION ALL."),
         };
     }

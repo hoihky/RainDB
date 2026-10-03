@@ -26,6 +26,9 @@ public sealed class LogicalTableScan : ILogicalRoot
     /// <summary>AND conjunction of single-column predicates.</summary>
     public IReadOnlyList<SimpleWhereClause>? WhereConjuncts { get; init; }
 
+    /// <summary>Uncorrelated <c>IN</c> / <c>EXISTS</c> predicates (AND-ed with <see cref="WhereConjuncts"/>).</summary>
+    public IReadOnlyList<LogicalUncorrelatedSubqueryPredicate>? SubqueryPredicates { get; init; }
+
     /// <summary>AND conjunction applied after <c>GROUP BY</c> aggregation.</summary>
     public IReadOnlyList<LogicalHavingConjunct>? HavingConjuncts { get; init; }
 

@@ -30,7 +30,10 @@ public sealed class JoinPhysicalPlan : IPhysicalPlan
         JoinOutputColumnRef[]? outputColumnOrder = null,
         ColumnCompareFilter[]? probeSideFilters = null,
         ColumnCompareFilter[]? buildSideFilters = null,
-        LogicalJoinSemantics semantics = LogicalJoinSemantics.Inner)
+        LogicalJoinSemantics semantics = LogicalJoinSemantics.Inner,
+        SubqueryInPhysicalSpec[]? probeInSubqueries = null,
+        SubqueryInPhysicalSpec[]? buildInSubqueries = null,
+        SubqueryExistsPhysicalSpec[]? existsSubqueries = null)
     {
         ArgumentNullException.ThrowIfNull(probeKeyColumnIndices);
         ArgumentNullException.ThrowIfNull(buildKeyColumnIndices);
@@ -47,6 +50,9 @@ public sealed class JoinPhysicalPlan : IPhysicalPlan
         ProbeSideFilters = probeSideFilters is { Length: > 0 } ? (ColumnCompareFilter[])probeSideFilters.Clone() : null;
         BuildSideFilters = buildSideFilters is { Length: > 0 } ? (ColumnCompareFilter[])buildSideFilters.Clone() : null;
         Semantics = semantics;
+        ProbeInSubqueries = probeInSubqueries is { Length: > 0 } ? (SubqueryInPhysicalSpec[])probeInSubqueries.Clone() : null;
+        BuildInSubqueries = buildInSubqueries is { Length: > 0 } ? (SubqueryInPhysicalSpec[])buildInSubqueries.Clone() : null;
+        ExistsSubqueries = existsSubqueries is { Length: > 0 } ? (SubqueryExistsPhysicalSpec[])existsSubqueries.Clone() : null;
     }
 
     public PhysicalJoinAlgorithm Algorithm { get; }
@@ -74,6 +80,12 @@ public sealed class JoinPhysicalPlan : IPhysicalPlan
 
     /// <summary>AND predicates on build rows.</summary>
     public ColumnCompareFilter[]? BuildSideFilters { get; }
+
+    public SubqueryInPhysicalSpec[]? ProbeInSubqueries { get; }
+
+    public SubqueryInPhysicalSpec[]? BuildInSubqueries { get; }
+
+    public SubqueryExistsPhysicalSpec[]? ExistsSubqueries { get; }
 
     public string Explain(string indent = "")
     {

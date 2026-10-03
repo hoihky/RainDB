@@ -118,6 +118,15 @@ Example scripts (run against `TestDataBuilders.RegisterAnalyticsDemoTables` or `
 
 Only `INNER JOIN` and `LEFT JOIN` are supported for joins; `UNION` without `ALL` is rejected. `LEFT JOIN` with `GROUP BY` is not supported yet.
 
+### 2.2.4 Uncorrelated subqueries (Phase D4)
+
+| File | Topic |
+|------|--------|
+| `samples/sql/14_subquery_in_exists.sql` | `IN` and `EXISTS` in `WHERE` |
+| `samples/sql/15_derived_table.sql` | Derived table in `FROM` |
+
+Supported: uncorrelated `IN` / `NOT IN` / `EXISTS` / `NOT EXISTS` on single-table scans and join `WHERE` (probe/build side from qualified or unambiguous `IN` columns); `FROM (SELECT …) alias` with outer `WHERE`, `ORDER BY`, and `LIMIT`. The `IN` subquery must return exactly one column. Correlated subqueries (inner query references an outer table) are rejected.
+
 ### 2.3 Custom catalog
 
 ```csharp

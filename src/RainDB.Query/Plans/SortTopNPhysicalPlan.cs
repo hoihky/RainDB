@@ -23,7 +23,9 @@ public sealed class SortTopNPhysicalPlan : IPhysicalPlan
         ColumnCompareFilter[]? filters,
         SortKeyPhysicalSpec[] sortKeys,
         int? limit,
-        VectorizedScanExecutionOptions options = default)
+        VectorizedScanExecutionOptions options = default,
+        SubqueryInPhysicalSpec[]? inSubqueries = null,
+        SubqueryExistsPhysicalSpec[]? existsSubqueries = null)
     {
         ArgumentNullException.ThrowIfNull(outputColumnIndices);
         ArgumentNullException.ThrowIfNull(sortKeys);
@@ -33,6 +35,8 @@ public sealed class SortTopNPhysicalPlan : IPhysicalPlan
         SortKeys = (SortKeyPhysicalSpec[])sortKeys.Clone();
         Limit = limit;
         Options = options;
+        InSubqueries = inSubqueries is { Length: > 0 } ? (SubqueryInPhysicalSpec[])inSubqueries.Clone() : null;
+        ExistsSubqueries = existsSubqueries is { Length: > 0 } ? (SubqueryExistsPhysicalSpec[])existsSubqueries.Clone() : null;
         if (limit is < 1)
             throw new ArgumentOutOfRangeException(nameof(limit), "LIMIT must be a positive integer.");
     }
@@ -48,6 +52,10 @@ public sealed class SortTopNPhysicalPlan : IPhysicalPlan
     public int? Limit { get; }
 
     public VectorizedScanExecutionOptions Options { get; }
+
+    public SubqueryInPhysicalSpec[]? InSubqueries { get; }
+
+    public SubqueryExistsPhysicalSpec[]? ExistsSubqueries { get; }
 
     public string Explain(string indent = "")
     {

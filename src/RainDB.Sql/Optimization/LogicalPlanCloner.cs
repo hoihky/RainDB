@@ -19,6 +19,17 @@ internal sealed class LogicalPlanCloner
             {
                 Branches = u.Branches.Select(CloneRoot).ToArray(),
             },
+            LogicalDerivedTableScan d => new LogicalDerivedTableScan
+            {
+                Alias = d.Alias,
+                Subquery = new LogicalSubquery { Root = CloneRoot(d.Subquery.Root) },
+                Projection = CloneProjectionList(d.Projection),
+                SelectList = CloneSelectList(d.SelectList),
+                WhereConjuncts = CloneWhereList(d.WhereConjuncts),
+                SubqueryPredicates = CloneSubqueryPredicates(d.SubqueryPredicates),
+                OrderBy = CloneOrderBy(d.OrderBy),
+                Limit = d.Limit,
+            },
             _ => throw new InvalidOperationException($"Unsupported logical root {root.GetType().Name}."),
         };
 
@@ -33,6 +44,7 @@ internal sealed class LogicalPlanCloner
             GroupByColumns = CloneProjectionList(s.GroupByColumns),
             SelectList = CloneSelectList(s.SelectList),
             WhereConjuncts = whereOverride ?? CloneWhereList(s.WhereConjuncts),
+            SubqueryPredicates = CloneSubqueryPredicates(s.SubqueryPredicates),
             Aggregate = s.Aggregate is null
                 ? null
                 : new LogicalAggregate { Kind = s.Aggregate.Kind, ColumnName = s.Aggregate.ColumnName },
@@ -55,6 +67,7 @@ internal sealed class LogicalPlanCloner
             RightKeyColumns = CloneQualifiedColumns(j.RightKeyColumns),
             SelectProjection = selectProjectionOverride ?? CloneProjectionList(j.SelectProjection),
             WhereConjuncts = ResolveWhereOverride(whereOverride, j.WhereConjuncts),
+            SubqueryPredicates = CloneSubqueryPredicates(j.SubqueryPredicates),
             ProbeSideWhereConjuncts = ResolveWhereOverride(probeWhereOverride, j.ProbeSideWhereConjuncts),
             BuildSideWhereConjuncts = ResolveWhereOverride(buildWhereOverride, j.BuildSideWhereConjuncts),
             GroupByColumns = CloneProjectionList(j.GroupByColumns),
@@ -91,6 +104,31 @@ internal sealed class LogicalPlanCloner
         if (overrideList is null)
             return CloneWhereList(original);
         return overrideList.Count == 0 ? null : overrideList;
+    }
+
+    private IReadOnlyList<LogicalUncorrelatedSubqueryPredicate>? CloneSubqueryPredicates(
+        IReadOnlyList<LogicalUncorrelatedSubqueryPredicate>? preds)
+    {
+        if (preds is null)
+            return null;
+        var list = new List<LogicalUncorrelatedSubqueryPredicate>(preds.Count);
+        foreach (var p in preds)
+        {
+            list.Add(new LogicalUncorrelatedSubqueryPredicate
+            {
+                PredicateKind = p.PredicateKind,
+                Column = p.Column is null
+                    ? null
+                    : new LogicalColumnScalarRef
+                    {
+                        QualifierTableName = p.Column.QualifierTableName,
+                        ColumnName = p.Column.ColumnName,
+                    },
+                Subquery = new LogicalSubquery { Root = CloneRoot(p.Subquery.Root) },
+            });
+        }
+
+        return list;
     }
 
     private IReadOnlyList<SimpleWhereClause>? CloneWhereList(IReadOnlyList<SimpleWhereClause>? conjuncts)

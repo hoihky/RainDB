@@ -34,4 +34,7 @@ public sealed class RainDbExecutionContext : IExecutionContext
     public CancellationToken CancellationToken { get; }
 
     public IMappedBatchScanObserver? MappedBatchScanObserver { get; }
+
+    /// <summary>When set, operators may execute uncorrelated subquery plans nested in the current query.</summary>
+    public IQueryExecutor? NestedExecutor { get; init; }
 }

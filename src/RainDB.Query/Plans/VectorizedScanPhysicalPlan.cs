@@ -14,7 +14,9 @@ public sealed class VectorizedScanPhysicalPlan : IPhysicalPlan
         ScanOutputColumn[] outputColumns,
         ColumnCompareFilter[]? filters = null,
         AggregateSpec? aggregate = null,
-        VectorizedScanExecutionOptions options = default)
+        VectorizedScanExecutionOptions options = default,
+        SubqueryInPhysicalSpec[]? inSubqueries = null,
+        SubqueryExistsPhysicalSpec[]? existsSubqueries = null)
     {
         ArgumentNullException.ThrowIfNull(outputColumns);
         TableId = tableId;
@@ -22,6 +24,8 @@ public sealed class VectorizedScanPhysicalPlan : IPhysicalPlan
         Filters = filters is { Length: > 0 } ? (ColumnCompareFilter[])filters.Clone() : null;
         Aggregate = aggregate;
         Options = options;
+        InSubqueries = inSubqueries is { Length: > 0 } ? (SubqueryInPhysicalSpec[])inSubqueries.Clone() : null;
+        ExistsSubqueries = existsSubqueries is { Length: > 0 } ? (SubqueryExistsPhysicalSpec[])existsSubqueries.Clone() : null;
     }
 
     public VectorizedScanPhysicalPlan(
@@ -67,6 +71,10 @@ public sealed class VectorizedScanPhysicalPlan : IPhysicalPlan
     public AggregateSpec? Aggregate { get; }
 
     public VectorizedScanExecutionOptions Options { get; }
+
+    public SubqueryInPhysicalSpec[]? InSubqueries { get; }
+
+    public SubqueryExistsPhysicalSpec[]? ExistsSubqueries { get; }
 
     public string Explain(string indent = "")
     {

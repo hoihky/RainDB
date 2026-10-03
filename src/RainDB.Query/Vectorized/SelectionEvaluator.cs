@@ -31,10 +31,17 @@ internal sealed class SelectionEvaluator
     }
 
     /// <summary>Writes matching row indices; returns count.</summary>
-    internal int FillSelectedRowsConjunctive(IColumnarBatch batch, ReadOnlySpan<ColumnCompareFilter> filters, Span<int> dest)
+    internal int FillSelectedRowsConjunctive(IColumnarBatch batch, ReadOnlySpan<ColumnCompareFilter> filters, Span<int> dest) =>
+        FillSelectedRowsConjunctive(batch, filters, ReadOnlySpan<ColumnInSetFilter>.Empty, dest);
+
+    internal int FillSelectedRowsConjunctive(
+        IColumnarBatch batch,
+        ReadOnlySpan<ColumnCompareFilter> filters,
+        ReadOnlySpan<ColumnInSetFilter> inFilters,
+        Span<int> dest)
     {
         var n = batch.RowCount;
-        if (filters.Length == 0)
+        if (filters.Length == 0 && inFilters.Length == 0)
         {
             if (dest.Length < n)
                 throw new ArgumentException(nameof(dest));
@@ -46,11 +53,56 @@ internal sealed class SelectionEvaluator
         if (dest.Length < n)
             throw new ArgumentException("Selection buffer too small.", nameof(dest));
 
-        var count = ApplyFilter(batch, filters[0], dest);
+        var count = filters.Length > 0
+            ? ApplyFilter(batch, filters[0], dest)
+            : FillAllRows(batch, dest);
         for (var f = 1; f < filters.Length; f++)
             count = IntersectFilter(batch, filters[f], dest, count);
+        for (var i = 0; i < inFilters.Length; i++)
+            count = IntersectInSet(batch, inFilters[i], dest, count);
 
         return count;
+    }
+
+    private static int FillAllRows(IColumnarBatch batch, Span<int> dest)
+    {
+        var n = batch.RowCount;
+        for (var i = 0; i < n; i++)
+            dest[i] = i;
+        return n;
+    }
+
+    internal bool RowMatchesInSetFilters(IColumnarBatch batch, int row, ReadOnlySpan<ColumnInSetFilter> filters)
+    {
+        for (var i = 0; i < filters.Length; i++)
+        {
+            var filter = filters[i];
+            var col = batch.Columns[filter.ColumnIndex];
+            var member = filter.Values.Contains(col, row, this);
+            if (filter.Negated)
+                member = !member;
+            if (!member)
+                return false;
+        }
+
+        return true;
+    }
+
+    private int IntersectInSet(IColumnarBatch batch, ColumnInSetFilter filter, Span<int> dest, int count)
+    {
+        var write = 0;
+        for (var r = 0; r < count; r++)
+        {
+            var row = dest[r];
+            var col = batch.Columns[filter.ColumnIndex];
+            var member = filter.Values.Contains(col, row, this);
+            if (filter.Negated)
+                member = !member;
+            if (member)
+                dest[write++] = row;
+        }
+
+        return write;
     }
 
     private int ApplyFilter(IColumnarBatch batch, ColumnCompareFilter filter, Span<int> dest)

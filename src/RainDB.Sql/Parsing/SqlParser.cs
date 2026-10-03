@@ -67,7 +67,7 @@ public sealed class SqlParser
 
             if (from is JoinFrom jf)
             {
-                var joinWhereConjuncts = TryParseWhereClause();
+                var (joinWhereConjuncts, joinSubqueryPreds) = TryParseWhereExtended();
                 var groupByCols = TryParseGroupByColumns();
                 if (groupByCols is { Count: > 0 })
                 {
@@ -85,6 +85,7 @@ public sealed class SqlParser
                         LeftKeyColumns = jf.LeftKeys,
                         RightKeyColumns = jf.RightKeys,
                         WhereConjuncts = joinWhereConjuncts,
+                        SubqueryPredicates = joinSubqueryPreds,
                         SelectProjection = null,
                         GroupByColumns = groupByCols,
                         SelectList = selectItems,
@@ -111,14 +112,59 @@ public sealed class SqlParser
                     LeftKeyColumns = jf.LeftKeys,
                     RightKeyColumns = jf.RightKeys,
                     WhereConjuncts = joinWhereConjuncts,
+                    SubqueryPredicates = joinSubqueryPreds,
                     SelectProjection = joinProj,
                     OrderBy = joinOrderBy,
                     Limit = joinLimit,
                 };
             }
 
+            if (from is SubqueryFrom derived)
+            {
+                if (TryParseGroupByColumns() is { Count: > 0 })
+                    throw new SqlCompileException("GROUP BY on a derived table is not supported yet.");
+                var (whereConjunctsD, subPredsD) = TryParseWhereExtended();
+                if (starOnly)
+                {
+                    var ob = TryParseOrderBy();
+                    var lim = TryParseLimit();
+                    return new LogicalDerivedTableScan
+                    {
+                        Alias = derived.Alias,
+                        Subquery = new LogicalSubquery { Root = derived.Root },
+                        Projection = null,
+                        WhereConjuncts = whereConjunctsD,
+                        SubqueryPredicates = subPredsD,
+                        OrderBy = ob,
+                        Limit = lim,
+                    };
+                }
+
+                if (selectItems.TrueForAll(static x => x is LogicalColumnProjection or LogicalScalarProjection))
+                {
+                    var ob2 = TryParseOrderBy();
+                    var lim2 = TryParseLimit();
+                    var columnOnly = selectItems.TrueForAll(static x => x is LogicalColumnProjection);
+                    return new LogicalDerivedTableScan
+                    {
+                        Alias = derived.Alias,
+                        Subquery = new LogicalSubquery { Root = derived.Root },
+                        WhereConjuncts = whereConjunctsD,
+                        SubqueryPredicates = subPredsD,
+                        Projection = columnOnly
+                            ? selectItems.Cast<LogicalColumnProjection>().ToList()
+                            : null,
+                        SelectList = columnOnly ? null : selectItems,
+                        OrderBy = ob2,
+                        Limit = lim2,
+                    };
+                }
+
+                throw new SqlCompileException("Derived table queries support column projections only (no aggregates).");
+            }
+
             var table = ((SingleTableFrom)from).TableName;
-            var whereConjuncts = TryParseWhereClause();
+            var (whereConjuncts, subqueryPreds) = TryParseWhereExtended();
             var groupByColsSingle = TryParseGroupByColumns();
 
             if (groupByColsSingle is { Count: > 0 })
@@ -134,6 +180,7 @@ public sealed class SqlParser
                 {
                     TableName = table,
                     WhereConjuncts = whereConjuncts,
+                    SubqueryPredicates = subqueryPreds,
                     GroupByColumns = groupByColsSingle,
                     SelectList = selectItems,
                     HavingConjuncts = havingConjuncts,
@@ -148,6 +195,7 @@ public sealed class SqlParser
                 {
                     TableName = table,
                     WhereConjuncts = whereConjuncts,
+                    SubqueryPredicates = subqueryPreds,
                     Projection = null,
                     OrderBy = ob,
                     Limit = lim,
@@ -162,6 +210,7 @@ public sealed class SqlParser
                 {
                     TableName = table,
                     WhereConjuncts = whereConjuncts,
+                    SubqueryPredicates = subqueryPreds,
                     Aggregate = new LogicalAggregate { Kind = lone.Kind, ColumnName = lone.ArgumentColumnName },
                 };
             }
@@ -174,6 +223,7 @@ public sealed class SqlParser
                 {
                     TableName = table,
                     WhereConjuncts = whereConjuncts,
+                    SubqueryPredicates = subqueryPreds,
                     SelectList = selectItems,
                     OrderBy = ob2,
                     Limit = lim2,
@@ -229,8 +279,24 @@ public sealed class SqlParser
             public LogicalJoinSemantics Semantics { get; } = semantics;
         }
 
+        private sealed class SubqueryFrom(ILogicalRoot root, string alias) : FromClause
+        {
+            public ILogicalRoot Root { get; } = root;
+
+            public string Alias { get; } = alias;
+        }
+
         private FromClause ParseFromClause()
         {
+            if (_cur.Kind == SqlTokenKind.LParen)
+            {
+                Advance();
+                var root = ParseUnionAllChain(ParseOneSelectRoot());
+                Expect(SqlTokenKind.RParen, ")");
+                var alias = ParseDerivedTableAlias();
+                return new SubqueryFrom(root, alias);
+            }
+
             var left = ExpectIdentifier("table name");
             if (!TryParseJoinIntro(out var semantics))
                 return new SingleTableFrom(left);
@@ -646,39 +712,109 @@ public sealed class SqlParser
             Advance();
         }
 
-        private List<SimpleWhereClause>? TryParseWhereClause()
+        private string ParseDerivedTableAlias()
+        {
+            if (_cur.Kind == SqlTokenKind.Identifier && LexemeEqualsIgnoreCase(_cur, "AS"))
+                Advance();
+            return ExpectIdentifier("derived table alias");
+        }
+
+        private (List<SimpleWhereClause>? Compares, List<LogicalUncorrelatedSubqueryPredicate>? Subqueries) TryParseWhereExtended()
         {
             if (_cur.Kind != SqlTokenKind.KwWhere)
-                return null;
+                return (null, null);
             Advance();
-            var list = new List<SimpleWhereClause> { ParseWherePredicate() };
+            var compares = new List<SimpleWhereClause>();
+            var subs = new List<LogicalUncorrelatedSubqueryPredicate>();
+            ParseOneWhereItem(compares, subs);
             while (_cur.Kind == SqlTokenKind.KwAnd)
             {
                 Advance();
-                list.Add(ParseWherePredicate());
+                ParseOneWhereItem(compares, subs);
             }
 
-            return list;
+            return (
+                compares.Count > 0 ? compares : null,
+                subs.Count > 0 ? subs : null);
         }
 
-        private LogicalSelectListItem ParseSelectListItem()
+        private void ParseOneWhereItem(
+            List<SimpleWhereClause> compares,
+            List<LogicalUncorrelatedSubqueryPredicate> subs)
         {
-            var expr = ParseAdditiveExpression();
-            string? alias = null;
-            if (_cur.Kind == SqlTokenKind.Identifier && LexemeEqualsIgnoreCase(_cur, "AS"))
+            if (TryParseExistsPredicate(out var exists))
             {
-                Advance();
-                alias = ExpectIdentifier("SELECT alias");
+                subs.Add(exists);
+                return;
             }
 
-            if (expr is LogicalColumnScalarRef col && alias is null)
-                return new LogicalColumnProjection { QualifierTableName = col.QualifierTableName, ColumnName = col.ColumnName };
-            return new LogicalScalarProjection { Expression = expr, OutputAlias = alias };
+            var leftExpr = ParseAdditiveExpression();
+            var negated = false;
+            if (_cur.Kind == SqlTokenKind.Identifier && LexemeEqualsIgnoreCase(_cur, "NOT"))
+            {
+                negated = true;
+                Advance();
+            }
+
+            if (_cur.Kind == SqlTokenKind.Identifier && LexemeEqualsIgnoreCase(_cur, "IN"))
+            {
+                if (leftExpr is not LogicalColumnScalarRef col)
+                    throw new SqlCompileException("IN subquery requires a column reference on the left-hand side.");
+                Advance();
+                var sub = ParseParenthesizedSubqueryRoot();
+                subs.Add(new LogicalUncorrelatedSubqueryPredicate
+                {
+                    PredicateKind = negated
+                        ? LogicalUncorrelatedSubqueryPredicate.Kind.NotIn
+                        : LogicalUncorrelatedSubqueryPredicate.Kind.In,
+                    Column = col,
+                    Subquery = new LogicalSubquery { Root = sub },
+                });
+                return;
+            }
+
+            if (negated)
+                throw new SqlCompileException("Expected IN or EXISTS after NOT in WHERE.");
+
+            compares.Add(ParseComparePredicate(leftExpr));
         }
 
-        private SimpleWhereClause ParseWherePredicate()
+        private bool TryParseExistsPredicate(out LogicalUncorrelatedSubqueryPredicate predicate)
         {
-            var leftExpr = ParseAdditiveExpression();
+            predicate = null!;
+            var negated = false;
+            if (_cur.Kind == SqlTokenKind.Identifier && LexemeEqualsIgnoreCase(_cur, "NOT"))
+            {
+                negated = true;
+                Advance();
+            }
+
+            if (_cur.Kind != SqlTokenKind.Identifier || !LexemeEqualsIgnoreCase(_cur, "EXISTS"))
+                return false;
+            Advance();
+            var sub = ParseParenthesizedSubqueryRoot();
+            predicate = new LogicalUncorrelatedSubqueryPredicate
+            {
+                PredicateKind = negated
+                    ? LogicalUncorrelatedSubqueryPredicate.Kind.NotExists
+                    : LogicalUncorrelatedSubqueryPredicate.Kind.Exists,
+                Subquery = new LogicalSubquery { Root = sub },
+            };
+            return true;
+        }
+
+        private ILogicalRoot ParseParenthesizedSubqueryRoot()
+        {
+            Expect(SqlTokenKind.LParen, "(");
+            if (_cur.Kind != SqlTokenKind.KwSelect)
+                throw new SqlCompileException("Subquery must start with SELECT.");
+            var root = ParseUnionAllChain(ParseOneSelectRoot());
+            Expect(SqlTokenKind.RParen, ")");
+            return root;
+        }
+
+        private SimpleWhereClause ParseComparePredicate(LogicalScalarExpression leftExpr)
+        {
             var op = ParseCompareOp();
             if (_cur.Kind == SqlTokenKind.Parameter)
             {
@@ -710,6 +846,21 @@ public sealed class SqlParser
             }
 
             return new SimpleWhereClause { LeftExpression = leftExpr, Operator = op, Literal = lit };
+        }
+
+        private LogicalSelectListItem ParseSelectListItem()
+        {
+            var expr = ParseAdditiveExpression();
+            string? alias = null;
+            if (_cur.Kind == SqlTokenKind.Identifier && LexemeEqualsIgnoreCase(_cur, "AS"))
+            {
+                Advance();
+                alias = ExpectIdentifier("SELECT alias");
+            }
+
+            if (expr is LogicalColumnScalarRef col && alias is null)
+                return new LogicalColumnProjection { QualifierTableName = col.QualifierTableName, ColumnName = col.ColumnName };
+            return new LogicalScalarProjection { Expression = expr, OutputAlias = alias };
         }
 
         private LogicalScalarExpression ParseAdditiveExpression()

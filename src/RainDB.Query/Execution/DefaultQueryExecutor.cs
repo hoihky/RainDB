@@ -1,6 +1,8 @@
 using RainDB.Catalog;
 using RainDB.Columnar;
+using RainDB.Core.Catalog;
 using RainDB.Execution;
+using RainDB.Query.Runtime;
 using RainDB.Query.Execution.Operators;
 using RainDB.Query.Plans;
 using RainDB.Query.Results;
@@ -63,6 +65,9 @@ public sealed class DefaultQueryExecutor : IQueryExecutor
             return await _operators.GroupedJoin.ExecuteAsync(grouped, probeCols, buildCols, context).ConfigureAwait(false);
         }
 
+        if (plan is DerivedTableScanPhysicalPlan derived)
+            return await ExecuteDerivedTableAsync(derived, context).ConfigureAwait(false);
+
         if (plan is UnionAllPhysicalPlan union)
         {
             var batches = new List<IColumnarBatch>();
@@ -88,6 +93,31 @@ public sealed class DefaultQueryExecutor : IQueryExecutor
             return new ExplainTextQueryResult(bundle.Explain());
 
         throw new NotSupportedException($"Unsupported physical plan type: {plan.GetType().Name}.");
+    }
+
+    private async ValueTask<IQueryResult> ExecuteDerivedTableAsync(
+        DerivedTableScanPhysicalPlan plan,
+        IExecutionContext context)
+    {
+        var inner = await ExecuteAsync(plan.Subquery, context).ConfigureAwait(false);
+        if (inner is not IColumnarQueryResult col)
+            throw new NotSupportedException("Derived table subquery must return columnar rows.");
+        var batches = new List<IColumnarBatch>();
+        foreach (var b in col.Batches)
+            batches.Add(b);
+        var ephemeral = new EphemeralColumnarTableSource(
+            plan.EphemeralTableId,
+            plan.Alias,
+            plan.DerivedSchema,
+            batches);
+        var overlay = new OverlayCatalog(context.Catalog, [ephemeral]);
+        var scoped = context is RainDbExecutionContext rc
+            ? new RainDbExecutionContext(overlay, rc.BufferPool, rc.AlignedBufferPool, rc.SpillWriter, rc.CancellationToken, rc.MappedBatchScanObserver)
+            {
+                NestedExecutor = rc.NestedExecutor ?? this,
+            }
+            : throw new InvalidOperationException("Derived table execution requires RainDbExecutionContext.");
+        return await ExecuteAsync(plan.OuterPlan, scoped).ConfigureAwait(false);
     }
 
     private static IColumnarTableSource RequireColumnarTable(IExecutionContext context, TableId tableId)

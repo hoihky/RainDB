@@ -67,9 +67,10 @@ public sealed class LogicalJoinBinder
             throw new SqlCompileException("LEFT JOIN with GROUP BY is not supported yet.");
 
         if (join.GroupByColumns is { Count: > 0 })
-            return BindGroupedJoin(join, leftCol, rightCol, leftTs, rightTs, probeIx, buildIx, algorithm, scanOptions);
+            return BindGroupedJoin(join, catalog, leftCol, rightCol, leftTs, rightTs, probeIx, buildIx, algorithm, scanOptions);
 
         var (probeFilters, buildFilters) = ResolveJoinWhere(join, leftTs, rightTs);
+        var joinSubqueries = BindJoinSubqueries(join, catalog, leftTs, rightTs, scanOptions, algorithm);
         var (outputOrder, outputSchema) = BindJoinOutputs(join.SelectProjection, leftTs, rightTs);
 
         var joinPlan = new JoinPhysicalPlan(
@@ -82,7 +83,10 @@ public sealed class LogicalJoinBinder
             outputColumnOrder: outputOrder,
             probeSideFilters: probeFilters,
             buildSideFilters: buildFilters,
-            semantics: join.Semantics);
+            semantics: join.Semantics,
+            probeInSubqueries: joinSubqueries.ProbeInSubqueries,
+            buildInSubqueries: joinSubqueries.BuildInSubqueries,
+            existsSubqueries: joinSubqueries.ExistsSubqueries);
         if (join.OrderBy is not { Count: > 0 } && join.Limit is null)
             return joinPlan;
 
@@ -94,6 +98,7 @@ public sealed class LogicalJoinBinder
 
     private GroupedJoinPhysicalPlan BindGroupedJoin(
         LogicalInnerJoin join,
+        ICatalog catalog,
         IColumnarTableSource leftCol,
         IColumnarTableSource rightCol,
         ITableSource leftTs,
@@ -111,6 +116,7 @@ public sealed class LogicalJoinBinder
             throw new SqlCompileException("ORDER BY and LIMIT are not supported with GROUP BY on a join.");
 
         var (probeFilters, buildFilters) = ResolveJoinWhere(join, leftTs, rightTs);
+        var joinSubqueries = BindJoinSubqueries(join, catalog, leftTs, rightTs, scanOptions, algorithm);
         var (_, outputSchema) = BindJoinOutputs(null, leftTs, rightTs);
         var joinPlan = new JoinPhysicalPlan(
             algorithm,
@@ -121,7 +127,10 @@ public sealed class LogicalJoinBinder
             outputSchema,
             outputColumnOrder: null,
             probeSideFilters: probeFilters,
-            buildSideFilters: buildFilters);
+            buildSideFilters: buildFilters,
+            probeInSubqueries: joinSubqueries.ProbeInSubqueries,
+            buildInSubqueries: joinSubqueries.BuildInSubqueries,
+            existsSubqueries: joinSubqueries.ExistsSubqueries);
 
         var leftWidth = leftTs.Schema.Columns.Count;
         var groupIndices = new int[join.GroupByColumns!.Count];
@@ -390,6 +399,21 @@ public sealed class LogicalJoinBinder
 
         return (refs.ToArray(), new TableSchema(cols));
     }
+
+    private JoinSubqueryPhysicalSpecs BindJoinSubqueries(
+        LogicalInnerJoin join,
+        ICatalog catalog,
+        ITableSource left,
+        ITableSource right,
+        VectorizedScanExecutionOptions scanOptions,
+        PhysicalJoinAlgorithm algorithm) =>
+        _scanBinder.SubqueryBinder?.BindForJoin(
+            join.SubqueryPredicates,
+            catalog,
+            left,
+            right,
+            scanOptions,
+            algorithm) ?? new JoinSubqueryPhysicalSpecs();
 
     private (ColumnCompareFilter[]? probe, ColumnCompareFilter[]? build) ResolveJoinWhere(
         LogicalInnerJoin join,

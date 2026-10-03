@@ -90,17 +90,23 @@ public sealed class RainDbEngine
     }
 
     public IExecutionContext CreateSession(CancellationToken cancellationToken = default) =>
+        CreateSessionWithExecutor(cancellationToken);
+
+    private RainDbExecutionContext CreateSessionWithExecutor(CancellationToken cancellationToken = default) =>
         new RainDbExecutionContext(
             Catalog,
             BufferPool,
             AlignedBufferPool,
             SpillWriter,
             cancellationToken,
-            FileDatabase?.MappedBatchScanObserver);
+            FileDatabase?.MappedBatchScanObserver)
+        {
+            NestedExecutor = Executor,
+        };
 
     public async ValueTask<IQueryResult> ExecuteSqlAsync(string sql, CancellationToken cancellationToken = default)
     {
-        var ctx = CreateSession(cancellationToken);
+        var ctx = CreateSessionWithExecutor(cancellationToken);
         var plan = await SqlCompiler.CompileAsync(sql, Catalog, cancellationToken).ConfigureAwait(false);
         return await Executor.ExecuteAsync(plan, ctx).ConfigureAwait(false);
     }
@@ -109,7 +115,7 @@ public sealed class RainDbEngine
     public async ValueTask<IQueryResult> ExecutePhysicalAsync(IPhysicalPlan plan, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(plan);
-        var ctx = CreateSession(cancellationToken);
+        var ctx = CreateSessionWithExecutor(cancellationToken);
         return await Executor.ExecuteAsync(plan, ctx).ConfigureAwait(false);
     }
 }

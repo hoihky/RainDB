@@ -6,6 +6,7 @@ using RainDB.Query.Execution.Joining;
 using RainDB.Query.Execution.Operators;
 using RainDB.Query.Plans;
 using RainDB.Query.Results;
+using RainDB.Query.Runtime;
 using RainDB.Query.Vectorized;
 using RainDB.Logical;
 using RainDB.Schema;
@@ -24,6 +25,8 @@ public sealed class JoinOperator : Operators.IJoinOperator
 
     internal JoinOperator(QueryOperatorDependencies dependencies) =>
         _deps = dependencies ?? throw new ArgumentNullException(nameof(dependencies));
+
+    private ResolvedJoinSubqueryFilters _resolvedJoinSubqueries = ResolvedJoinSubqueryFilters.Empty;
 
     private readonly record struct RowRef(int BatchIdx, int RowIdx);
 
@@ -45,6 +48,18 @@ public sealed class JoinOperator : Operators.IJoinOperator
         Action<ColumnarBatch> emitBatch,
         int matchChunkRowCount = JoinMatchChunkEmitter.DefaultChunkRowCount)
     {
+        ExecuteStreaming(plan, probeTable, buildTable, context, emitBatch, matchChunkRowCount, ResolvedJoinSubqueryFilters.Empty);
+    }
+
+    internal void ExecuteStreaming(
+        JoinPhysicalPlan plan,
+        IColumnarTableSource probeTable,
+        IColumnarTableSource buildTable,
+        IExecutionContext context,
+        Action<ColumnarBatch> emitBatch,
+        int matchChunkRowCount,
+        ResolvedJoinSubqueryFilters subqueryFilters)
+    {
         ArgumentNullException.ThrowIfNull(plan);
         ArgumentNullException.ThrowIfNull(probeTable);
         ArgumentNullException.ThrowIfNull(buildTable);
@@ -52,6 +67,28 @@ public sealed class JoinOperator : Operators.IJoinOperator
         ArgumentNullException.ThrowIfNull(emitBatch);
         Validate(plan, probeTable, buildTable);
 
+        if (subqueryFilters.IsDenyAll)
+            return;
+
+        _resolvedJoinSubqueries = subqueryFilters;
+        try
+        {
+            RunJoinCore(plan, probeTable, buildTable, context, emitBatch, matchChunkRowCount);
+        }
+        finally
+        {
+            _resolvedJoinSubqueries = ResolvedJoinSubqueryFilters.Empty;
+        }
+    }
+
+    private void RunJoinCore(
+        JoinPhysicalPlan plan,
+        IColumnarTableSource probeTable,
+        IColumnarTableSource buildTable,
+        IExecutionContext context,
+        Action<ColumnarBatch> emitBatch,
+        int matchChunkRowCount)
+    {
         var probeSchema = probeTable.Schema;
         var buildSchema = buildTable.Schema;
         var probeBatches = probeTable.Batches;
@@ -90,19 +127,41 @@ public sealed class JoinOperator : Operators.IJoinOperator
         emitter.Flush();
     }
 
-    public ValueTask<IQueryResult> ExecuteAsync(
+    public async ValueTask<IQueryResult> ExecuteAsync(
         JoinPhysicalPlan plan,
         IColumnarTableSource probeTable,
         IColumnarTableSource buildTable,
         IExecutionContext context)
     {
+        var subFilters = await ResolveJoinSubqueryFiltersAsync(plan, context).ConfigureAwait(false);
+        if (subFilters.IsDenyAll)
+            return new ColumnarMaterializedQueryResult([_deps.JoinMaterializer.EmptyBatch(plan)]);
+
         var batches = new List<ColumnarBatch>();
-        ExecuteStreaming(plan, probeTable, buildTable, context, batches.Add);
+        ExecuteStreaming(plan, probeTable, buildTable, context, batches.Add, JoinMatchChunkEmitter.DefaultChunkRowCount, subFilters);
         if (batches.Count == 0)
             batches.Add(_deps.JoinMaterializer.EmptyBatch(plan));
 
         IQueryResult r = new ColumnarMaterializedQueryResult(batches);
-        return new ValueTask<IQueryResult>(r);
+        return r;
+    }
+
+    private static async ValueTask<ResolvedJoinSubqueryFilters> ResolveJoinSubqueryFiltersAsync(
+        JoinPhysicalPlan plan,
+        IExecutionContext context)
+    {
+        if (plan.ProbeInSubqueries is null && plan.BuildInSubqueries is null && plan.ExistsSubqueries is null)
+            return ResolvedJoinSubqueryFilters.Empty;
+
+        if (context is not RainDbExecutionContext rc || rc.NestedExecutor is not { } executor)
+            throw new InvalidOperationException("Join subquery predicates require NestedExecutor on the execution context.");
+
+        return await SubqueryFilterResolver.ResolveJoinAsync(
+            plan.ProbeInSubqueries,
+            plan.BuildInSubqueries,
+            plan.ExistsSubqueries,
+            executor,
+            context).ConfigureAwait(false);
     }
 
     private static void Validate(JoinPhysicalPlan plan, IColumnarTableSource probe, IColumnarTableSource build)
@@ -168,13 +227,30 @@ public sealed class JoinOperator : Operators.IJoinOperator
         }
     }
 
-    private bool RowPassesAll(IColumnarBatch batch, ColumnCompareFilter[]? filters, int row)
+    private bool RowPassesProbe(IColumnarBatch batch, ColumnCompareFilter[]? filters, int row) =>
+        RowPassesSide(batch, filters, _resolvedJoinSubqueries.ProbeInFilters, row);
+
+    private bool RowPassesBuild(IColumnarBatch batch, ColumnCompareFilter[]? filters, int row) =>
+        RowPassesSide(batch, filters, _resolvedJoinSubqueries.BuildInFilters, row);
+
+    private bool RowPassesSide(
+        IColumnarBatch batch,
+        ColumnCompareFilter[]? compareFilters,
+        ColumnInSetFilter[]? inFilters,
+        int row)
     {
-        if (filters is null || filters.Length == 0)
-            return true;
-        foreach (var f in filters)
+        if (compareFilters is { Length: > 0 })
         {
-            if (!_deps.Selection.RowMatchesFilter(batch.Columns[f.ColumnIndex], f, row))
+            foreach (var f in compareFilters)
+            {
+                if (!_deps.Selection.RowMatchesFilter(batch.Columns[f.ColumnIndex], f, row))
+                    return false;
+            }
+        }
+
+        if (inFilters is { Length: > 0 })
+        {
+            if (!_deps.Selection.RowMatchesInSetFilters(batch, row, inFilters))
                 return false;
         }
 
@@ -205,7 +281,7 @@ public sealed class JoinOperator : Operators.IJoinOperator
             var batch = buildBatches[bi];
             for (var row = 0; row < batch.RowCount; row++)
             {
-                if (!RowPassesAll(batch, plan.BuildSideFilters, row))
+                if (!RowPassesBuild(batch, plan.BuildSideFilters, row))
                     continue;
                 var key = _deps.GroupKeys.BuildKey(batch, row, plan.BuildKeyColumnIndices, scratch);
                 if (key.NullMask != 0)
@@ -237,7 +313,7 @@ public sealed class JoinOperator : Operators.IJoinOperator
             var batch = probeBatches[bi];
             for (var row = 0; row < batch.RowCount; row++)
             {
-                if (!RowPassesAll(batch, plan.ProbeSideFilters, row))
+                if (!RowPassesProbe(batch, plan.ProbeSideFilters, row))
                     continue;
                 var key = _deps.GroupKeys.BuildKey(batch, row, plan.ProbeKeyColumnIndices, scratch);
                 EmitHashProbeMatchesFixed(plan, emitter, bi, row, key.NullMask != 0, dict, key);
@@ -271,7 +347,7 @@ public sealed class JoinOperator : Operators.IJoinOperator
             var batch = buildBatches[bi];
             for (var row = 0; row < batch.RowCount; row++)
             {
-                if (!RowPassesAll(batch, plan.BuildSideFilters, row))
+                if (!RowPassesBuild(batch, plan.BuildSideFilters, row))
                     continue;
                 var key = _deps.CompositeJoinKeys.Build(buildSchema, batch, row, plan.BuildKeyColumnIndices);
                 if (key.NullMask != 0)
@@ -303,7 +379,7 @@ public sealed class JoinOperator : Operators.IJoinOperator
             var batch = probeBatches[bi];
             for (var row = 0; row < batch.RowCount; row++)
             {
-                if (!RowPassesAll(batch, plan.ProbeSideFilters, row))
+                if (!RowPassesProbe(batch, plan.ProbeSideFilters, row))
                     continue;
                 var key = _deps.CompositeJoinKeys.Build(probeSchema, batch, row, plan.ProbeKeyColumnIndices);
                 EmitHashProbeMatchesUtf8(plan, emitter, bi, row, key.NullMask != 0, dict, key);
@@ -374,8 +450,8 @@ public sealed class JoinOperator : Operators.IJoinOperator
         JoinMatchChunkEmitter emitter)
     {
         var comparer = new GroupKeyComparer(probeSchema, plan.ProbeKeyColumnIndices);
-        var left = FlattenNonNullFixedKeys(probeBatches, plan.ProbeKeyColumnIndices, plan.ProbeSideFilters, ct);
-        var right = FlattenNonNullFixedKeys(buildBatches, plan.BuildKeyColumnIndices, plan.BuildSideFilters, ct);
+        var left = FlattenNonNullFixedKeys(probeBatches, plan.ProbeKeyColumnIndices, plan.ProbeSideFilters, isProbeSide: true, ct);
+        var right = FlattenNonNullFixedKeys(buildBatches, plan.BuildKeyColumnIndices, plan.BuildSideFilters, isProbeSide: false, ct);
 
         left.Sort((a, b) => comparer.Compare(a.Key, b.Key));
         right.Sort((a, b) => comparer.Compare(a.Key, b.Key));
@@ -393,8 +469,8 @@ public sealed class JoinOperator : Operators.IJoinOperator
         JoinMatchChunkEmitter emitter)
     {
         var comparer = new CompositeJoinKeyComparer(probeSchema, plan.ProbeKeyColumnIndices);
-        var left = FlattenNonNullCompositeKeys(probeBatches, plan.ProbeKeyColumnIndices, plan.ProbeSideFilters, probeSchema, ct);
-        var right = FlattenNonNullCompositeKeys(buildBatches, plan.BuildKeyColumnIndices, plan.BuildSideFilters, buildSchema, ct);
+        var left = FlattenNonNullCompositeKeys(probeBatches, plan.ProbeKeyColumnIndices, plan.ProbeSideFilters, probeSchema, isProbeSide: true, ct);
+        var right = FlattenNonNullCompositeKeys(buildBatches, plan.BuildKeyColumnIndices, plan.BuildSideFilters, buildSchema, isProbeSide: false, ct);
 
         left.Sort((a, b) => comparer.Compare(a.Key, b.Key));
         right.Sort((a, b) => comparer.Compare(a.Key, b.Key));
@@ -525,6 +601,7 @@ public sealed class JoinOperator : Operators.IJoinOperator
         IReadOnlyList<IColumnarBatch> batches,
         int[] keyIndices,
         ColumnCompareFilter[]? sideFilters,
+        bool isProbeSide,
         CancellationToken ct)
     {
         var scratch = new ulong[keyIndices.Length];
@@ -535,7 +612,7 @@ public sealed class JoinOperator : Operators.IJoinOperator
             var batch = batches[bi];
             for (var row = 0; row < batch.RowCount; row++)
             {
-                if (!RowPassesAll(batch, sideFilters, row))
+                if (isProbeSide ? !RowPassesProbe(batch, sideFilters, row) : !RowPassesBuild(batch, sideFilters, row))
                     continue;
                 var key = _deps.GroupKeys.BuildKey(batch, row, keyIndices, scratch);
                 if (key.NullMask != 0)
@@ -552,6 +629,7 @@ public sealed class JoinOperator : Operators.IJoinOperator
         int[] keyIndices,
         ColumnCompareFilter[]? sideFilters,
         TableSchema schema,
+        bool isProbeSide,
         CancellationToken ct)
     {
         var list = new List<SortEntryUtf8>();
@@ -561,7 +639,7 @@ public sealed class JoinOperator : Operators.IJoinOperator
             var batch = batches[bi];
             for (var row = 0; row < batch.RowCount; row++)
             {
-                if (!RowPassesAll(batch, sideFilters, row))
+                if (isProbeSide ? !RowPassesProbe(batch, sideFilters, row) : !RowPassesBuild(batch, sideFilters, row))
                     continue;
                 var key = _deps.CompositeJoinKeys.Build(schema, batch, row, keyIndices);
                 if (key.NullMask != 0)

@@ -35,6 +35,7 @@ public sealed class LogicalParameterBinder
                 CollectFromWhere(j.WhereConjuncts, set);
                 CollectFromWhere(j.ProbeSideWhereConjuncts, set);
                 CollectFromWhere(j.BuildSideWhereConjuncts, set);
+                CollectFromSubqueryPredicates(j.SubqueryPredicates, set);
                 break;
             case LogicalUnionAll u:
                 foreach (var b in u.Branches)
@@ -43,6 +44,11 @@ public sealed class LogicalParameterBinder
                         set.Add(n);
                 }
 
+                break;
+            case LogicalDerivedTableScan d:
+                CollectFromWhere(d.WhereConjuncts, set);
+                foreach (var n in CollectParameterNames(d.Subquery.Root))
+                    set.Add(n);
                 break;
         }
 
@@ -58,11 +64,30 @@ public sealed class LogicalParameterBinder
             {
                 Branches = u.Branches.Select(b => BindRoot(b, parameters)).ToArray(),
             },
+            LogicalDerivedTableScan d => BindDerivedScan(d, parameters),
             _ => throw new InvalidOperationException($"Unsupported logical root {root.GetType().Name}."),
         };
 
     private LogicalTableScan BindTableScan(LogicalTableScan s, IReadOnlyDictionary<string, SqlParameterValue> parameters) =>
         _cloner.CloneTableScan(s, whereOverride: BindWhereList(s.WhereConjuncts, parameters));
+
+    private LogicalDerivedTableScan BindDerivedScan(
+        LogicalDerivedTableScan d,
+        IReadOnlyDictionary<string, SqlParameterValue> parameters)
+    {
+        var cloned = (LogicalDerivedTableScan)_cloner.CloneRoot(d);
+        return new LogicalDerivedTableScan
+        {
+            Alias = cloned.Alias,
+            Subquery = new LogicalSubquery { Root = BindRoot(d.Subquery.Root, parameters) },
+            Projection = cloned.Projection,
+            SelectList = cloned.SelectList,
+            WhereConjuncts = BindWhereList(d.WhereConjuncts, parameters),
+            SubqueryPredicates = cloned.SubqueryPredicates,
+            OrderBy = cloned.OrderBy,
+            Limit = cloned.Limit,
+        };
+    }
 
     private LogicalInnerJoin BindJoin(LogicalInnerJoin j, IReadOnlyDictionary<string, SqlParameterValue> parameters) =>
         _cloner.CloneJoin(
@@ -100,6 +125,19 @@ public sealed class LogicalParameterBinder
         }
 
         return list;
+    }
+
+    private void CollectFromSubqueryPredicates(
+        IReadOnlyList<LogicalUncorrelatedSubqueryPredicate>? predicates,
+        HashSet<string> names)
+    {
+        if (predicates is null)
+            return;
+        foreach (var p in predicates)
+        {
+            foreach (var n in CollectParameterNames(p.Subquery.Root))
+                names.Add(n);
+        }
     }
 
     private static void CollectFromWhere(IReadOnlyList<SimpleWhereClause>? conjuncts, HashSet<string> names)

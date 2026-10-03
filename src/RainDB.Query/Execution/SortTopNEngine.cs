@@ -8,6 +8,7 @@ using RainDB.Query.Execution.Operators;
 using RainDB.Query.Execution.Sorting;
 using RainDB.Query.Plans;
 using RainDB.Query.Results;
+using RainDB.Query.Runtime;
 using RainDB.Query.Vectorized;
 using RainDB.Schema;
 
@@ -30,7 +31,7 @@ public sealed class SortTopNOperator : Operators.ISortTopNOperator
         _deps = dependencies ?? throw new ArgumentNullException(nameof(dependencies));
     }
 
-    public ValueTask<IQueryResult> ExecuteTableAsync(
+    public async ValueTask<IQueryResult> ExecuteTableAsync(
         SortTopNPhysicalPlan plan,
         IColumnarTableSource table,
         IExecutionContext context)
@@ -43,9 +44,14 @@ public sealed class SortTopNOperator : Operators.ISortTopNOperator
         ValidateSortKeys(table.Schema, plan.SortKeys);
         ValidateOutputAndFilters(table.Schema, plan.OutputColumnIndices, plan.Filters);
 
+        var subFilters = await ResolveSubqueryFiltersAsync(plan.InSubqueries, plan.ExistsSubqueries, context)
+            .ConfigureAwait(false);
+        if (subFilters.IsDenyAll)
+            return new ColumnarMaterializedQueryResult(Array.Empty<IColumnarBatch>());
+
         var batches = table.Batches;
         var ct = context.CancellationToken;
-        var rows = CollectFilteredRows(batches, plan.Filters, ct);
+        var rows = CollectFilteredRows(batches, plan.Filters, subFilters, ct);
         var ordered = _deps.SortTopNSelection.SelectInSortOrder(
             rows,
             plan.SortKeys,
@@ -53,7 +59,19 @@ public sealed class SortTopNOperator : Operators.ISortTopNOperator
             table.Schema,
             batches);
         var batch = MaterializeRows(batches, table.Schema, ordered, plan.OutputColumnIndices);
-        return new ValueTask<IQueryResult>(new ColumnarMaterializedQueryResult([batch]));
+        return new ColumnarMaterializedQueryResult([batch]);
+    }
+
+    private static async ValueTask<ResolvedSubqueryFilters> ResolveSubqueryFiltersAsync(
+        SubqueryInPhysicalSpec[]? inSpecs,
+        SubqueryExistsPhysicalSpec[]? existsSpecs,
+        IExecutionContext context)
+    {
+        if (inSpecs is null && existsSpecs is null)
+            return ResolvedSubqueryFilters.Empty;
+        if (context is not RainDbExecutionContext { NestedExecutor: { } executor })
+            throw new InvalidOperationException("Subquery predicates require NestedExecutor on the execution context.");
+        return await SubqueryFilterResolver.ResolveAsync(inSpecs, existsSpecs, executor, context).ConfigureAwait(false);
     }
 
     public async ValueTask<IQueryResult> ExecuteJoinAsync(
@@ -121,6 +139,7 @@ public sealed class SortTopNOperator : Operators.ISortTopNOperator
     private RowLocation[] CollectFilteredRows(
         IReadOnlyList<IColumnarBatch> batches,
         ColumnCompareFilter[]? filters,
+        ResolvedSubqueryFilters subqueryFilters,
         CancellationToken ct)
     {
         var rent = ArrayPool<int>.Shared;
@@ -131,14 +150,19 @@ public sealed class SortTopNOperator : Operators.ISortTopNOperator
         try
         {
             var list = new List<RowLocation>(total);
+            var compare = filters is { Length: > 0 } ? filters.AsSpan() : ReadOnlySpan<ColumnCompareFilter>.Empty;
+            var inSpan = subqueryFilters.InFilters is { } inf
+                ? inf.AsSpan()
+                : ReadOnlySpan<ColumnInSetFilter>.Empty;
+            var hasFilters = compare.Length > 0 || inSpan.Length > 0;
             for (var bi = 0; bi < batches.Count; bi++)
             {
                 ct.ThrowIfCancellationRequested();
                 var batch = batches[bi];
                 int k;
-                if (filters is { Length: > 0 } fa)
+                if (hasFilters)
                 {
-                    k = _deps.Selection.FillSelectedRowsConjunctive(batch, fa, tmp.AsSpan(0, batch.RowCount));
+                    k = _deps.Selection.FillSelectedRowsConjunctive(batch, compare, inSpan, tmp.AsSpan(0, batch.RowCount));
                     for (var i = 0; i < k; i++)
                         list.Add(new RowLocation(bi, tmp[i]));
                 }

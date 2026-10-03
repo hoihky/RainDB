@@ -24,6 +24,9 @@ public sealed class LogicalInnerJoin : ILogicalRoot
     /// <summary>AND conjunction of predicates (fixed-width or UTF-8 with string literals).</summary>
     public IReadOnlyList<SimpleWhereClause>? WhereConjuncts { get; init; }
 
+    /// <summary>Uncorrelated subquery predicates AND-ed with <see cref="WhereConjuncts"/>.</summary>
+    public IReadOnlyList<LogicalUncorrelatedSubqueryPredicate>? SubqueryPredicates { get; init; }
+
     /// <summary>Probe-side predicates after optimizer partition (optional; supersedes mixed <see cref="WhereConjuncts"/> for the left table).</summary>
     public IReadOnlyList<SimpleWhereClause>? ProbeSideWhereConjuncts { get; init; }
 

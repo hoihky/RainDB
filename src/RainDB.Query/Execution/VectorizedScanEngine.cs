@@ -39,8 +39,24 @@ public sealed class VectorizedScanOperator : Operators.IVectorizedScanOperator
         if (plan.Aggregate is { } agg)
             return await ComputeAggregateAsync(plan, table, agg, context).ConfigureAwait(false);
 
-        var batches = await ProjectAllBatchesAsync(plan, table, context).ConfigureAwait(false);
+        var subFilters = await ResolveSubqueryFiltersAsync(plan, context).ConfigureAwait(false);
+        if (subFilters.IsDenyAll)
+            return new ColumnarMaterializedQueryResult(Array.Empty<IColumnarBatch>());
+
+        var batches = await ProjectAllBatchesAsync(plan, table, context, subFilters).ConfigureAwait(false);
         return new ColumnarMaterializedQueryResult(batches);
+    }
+
+    private static async ValueTask<ResolvedSubqueryFilters> ResolveSubqueryFiltersAsync(
+        VectorizedScanPhysicalPlan plan,
+        IExecutionContext context)
+    {
+        if (plan.InSubqueries is null && plan.ExistsSubqueries is null)
+            return ResolvedSubqueryFilters.Empty;
+        if (context is not RainDbExecutionContext { NestedExecutor: { } executor })
+            throw new InvalidOperationException("Subquery predicates require an execution context with NestedExecutor.");
+        return await SubqueryFilterResolver.ResolveAsync(plan.InSubqueries, plan.ExistsSubqueries, executor, context)
+            .ConfigureAwait(false);
     }
 
     private static void ValidatePlan(VectorizedScanPhysicalPlan plan, IColumnarTableSource table)
@@ -94,7 +110,8 @@ public sealed class VectorizedScanOperator : Operators.IVectorizedScanOperator
     private async ValueTask<IReadOnlyList<IColumnarBatch>> ProjectAllBatchesAsync(
         VectorizedScanPhysicalPlan plan,
         IColumnarTableSource table,
-        IExecutionContext context)
+        IExecutionContext context,
+        ResolvedSubqueryFilters subqueryFilters)
     {
         var batches = table.Batches;
         var n = batches.Count;
@@ -107,14 +124,14 @@ public sealed class VectorizedScanOperator : Operators.IVectorizedScanOperator
         if (dop <= 1 || n == 1)
         {
             for (var i = 0; i < n; i++)
-                outArr[i] = ProcessOneBatch(plan, batches[i], i, context);
+                outArr[i] = ProcessOneBatch(plan, batches[i], i, context, subqueryFilters);
         }
         else if (plan.Options.UseChannelScheduler)
         {
             await RunChannelMorselsAsync(
                 n,
                 dop,
-                i => outArr[i] = ProcessOneBatch(plan, batches[i], i, context),
+                i => outArr[i] = ProcessOneBatch(plan, batches[i], i, context, subqueryFilters),
                 ct).ConfigureAwait(false);
         }
         else
@@ -123,7 +140,7 @@ public sealed class VectorizedScanOperator : Operators.IVectorizedScanOperator
                 0,
                 n,
                 new ParallelOptions { MaxDegreeOfParallelism = dop, CancellationToken = ct },
-                i => outArr[i] = ProcessOneBatch(plan, batches[i], i, context));
+                i => outArr[i] = ProcessOneBatch(plan, batches[i], i, context, subqueryFilters));
         }
 
         return outArr;
@@ -174,7 +191,8 @@ public sealed class VectorizedScanOperator : Operators.IVectorizedScanOperator
         VectorizedScanPhysicalPlan plan,
         IColumnarBatch batch,
         int batchIndex,
-        IExecutionContext context)
+        IExecutionContext context,
+        ResolvedSubqueryFilters subqueryFilters)
     {
         context.CancellationToken.ThrowIfCancellationRequested();
         NotifyMappedBatch(context, plan.TableId, batchIndex);
@@ -183,9 +201,13 @@ public sealed class VectorizedScanOperator : Operators.IVectorizedScanOperator
         {
             var span = rent.AsSpan(0, batch.RowCount);
             int selected;
-            var hasFilters = plan.Filters is { Length: > 0 };
+            var compareFilters = plan.Filters is { Length: > 0 } ? plan.Filters : ReadOnlySpan<ColumnCompareFilter>.Empty;
+            var inFilters = subqueryFilters.InFilters is { } inf
+                ? inf.AsSpan()
+                : ReadOnlySpan<ColumnInSetFilter>.Empty;
+            var hasFilters = compareFilters.Length > 0 || inFilters.Length > 0;
             if (hasFilters)
-                selected = _deps.Selection.FillSelectedRowsConjunctive(batch, plan.Filters!, span);
+                selected = _deps.Selection.FillSelectedRowsConjunctive(batch, compareFilters, inFilters, span);
             else
                 selected = batch.RowCount;
 
